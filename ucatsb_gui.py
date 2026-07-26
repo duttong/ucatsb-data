@@ -43,8 +43,9 @@ D1_P_TARGET_MBARS = 140.0
 CAL_MERGE_GAP_S = 2   # bridge cal periods split by a single dropped-flag sample
 
 GASES = {
-    "CO2": {"value_col": "d1_CO2_ppm", "ylabel": "CO2 (ppm)", "title": "UCATS-B CO2 (uncalibrated) timeseries"},
-    "N2O": {"value_col": "d1_N2O_ppb", "ylabel": "N2O (ppb)", "title": "UCATS-B N2O (uncalibrated) timeseries"},
+    "CO2": {"value_col": "d1_CO2_ppm", "ylabel": "CO2 (ppm)", "title": "UCATS-B CO2 (uncalibrated) timeseries", "detector": "d1"},
+    "N2O": {"value_col": "d1_N2O_ppb", "ylabel": "N2O (ppb)", "title": "UCATS-B N2O (uncalibrated) timeseries", "detector": "d1"},
+    "CH4": {"value_col": "d2_CH4_ppb", "ylabel": "CH4 (ppb)", "title": "UCATS-B CH4 (uncalibrated) timeseries", "detector": "d2"},
 }
 
 REQUIRED_COLUMNS = [
@@ -57,14 +58,16 @@ AUX_OPTIONS = ["No Figure", "Detector Pressure", "T_gas", "oz_o3", "oz_p", "oz_t
 
 def aux_trace_info(selection: str, gas: str):
     """Return (column, ylabel) for the chosen auxiliary trace, given which
-    gas is active (Detector Pressure/T_gas come from d1 for CO2, d2 for N2O
-    -- N2O has a second channel on the d2/CO detector), or None for "No Figure".
+    detector the active gas comes from (CO2/N2O -> d1, CH4 -> d2 -- d2 used
+    to carry a redundant CO/N2O channel but now carries CH4/H2O instead), or
+    None for "No Figure".
     """
+    detector = GASES[gas]["detector"]
     if selection == "Detector Pressure":
-        col = "d1_P_mbars" if gas == "CO2" else "d2_P_mbars"
+        col = f"{detector}_P_mbars"
         return col, f"{col} (mbar)"
     if selection == "T_gas":
-        col = "d1_T_gas" if gas == "CO2" else "d2_T_gas"
+        col = f"{detector}_T_gas"
         return col, f"{col} (°C)"
     if selection == "oz_o3":
         return "oz_o3", "O3 (ppb)"
@@ -109,13 +112,27 @@ class UcatsbGui(QMainWindow):
         self.setWindowTitle(f"UCATS-B Viewer - {csv_path.name}")
         self.resize(1300, 750)
 
-        self.df = pd.read_csv(csv_path, usecols=REQUIRED_COLUMNS)
+        # Detector wiring has changed between flights (e.g. d2 used to carry
+        # a redundant CO/N2O channel, now carries CH4/H2O instead), so don't
+        # assume every column in REQUIRED_COLUMNS exists in a given file.
+        available_cols = set(pd.read_csv(csv_path, nrows=0).columns)
+        missing = [c for c in REQUIRED_COLUMNS if c not in available_cols]
+        if missing:
+            print(f"Note: {csv_path.name} is missing columns {missing}; related features unavailable.")
+        self.df = pd.read_csv(csv_path, usecols=[c for c in REQUIRED_COLUMNS if c in available_cols])
         self.df["datetime"] = pd.to_datetime(self.df["datetime"])
         self.df = drop_presync_rows(self.df)
 
+        self.available_gases = {
+            gas: info for gas, info in GASES.items() if info["value_col"] in available_cols
+        }
+        if not self.available_gases:
+            raise ValueError(f"{csv_path.name} has none of the expected gas columns: "
+                              f"{[g['value_col'] for g in GASES.values()]}")
+
         self.config_path = config_path
         self.config = load_config(config_path)
-        self.current_gas = next(iter(GASES))
+        self.current_gas = next(iter(self.available_gases))
         self.aux_selection = "No Figure"
         self._loading = False
         self._initializing = True
@@ -144,7 +161,7 @@ class UcatsbGui(QMainWindow):
         gas_box = QGroupBox("Gas")
         gas_layout = QVBoxLayout(gas_box)
         self.gas_combo = QComboBox()
-        self.gas_combo.addItems(GASES.keys())
+        self.gas_combo.addItems(self.available_gases.keys())
         self.gas_combo.currentTextChanged.connect(self.on_gas_changed)
         gas_layout.addWidget(self.gas_combo)
         vbox.addWidget(gas_box)

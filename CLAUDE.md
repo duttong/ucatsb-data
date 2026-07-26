@@ -82,21 +82,33 @@ before parsing rather than erroring — don't remove that workaround without
 checking the file's current formatting (it'll be reintroduced any time
 `cals.yaml` is re-copied from the acquisition repo).
 
-### d1 vs d2 detector routing
+### d1 vs d2 detector routing is not fixed across flights
 
-The Aeris `d1` detector measures CO2 and N2O; `d2` measures CO and a second,
-redundant N2O channel (not CH4 — the CH4 Aeris wasn't installed yet for the
-flights this tool was built against, per the CSV column set actually
-present). The main plotted trace is always `d1_*` for both gases
-(`d1_CO2_ppm`, `d1_N2O_ppb`) — `d2` is only surfaced via the optional "Trace
-Above" panel's Detector Pressure/T_gas options, and only for `d2_P_mbars`/
-`d2_T_gas` when N2O is the active gas (confirmed with the user; do not swap
-this without re-confirming, `d2` has no CO2 channel at all so there is no
-symmetric "d2 for CO2" case).
+The Aeris `d1` detector measures CO2 and N2O. `d2` is whatever the second
+Aeris head happens to be configured for, and that has already changed once:
+on the reference (Feb 2025) flight `d2` measured CO plus a redundant N2O
+channel; on the July 2026 flight (after a CH4 Aeris was installed) `d2`
+instead measures CH4/H2O and has no CO or N2O columns at all. **Don't assume
+either layout — check the actual CSV header.** `GASES[gas]["detector"]`
+records which detector each gas's main trace and its Detector
+Pressure/T_gas aux options come from (`d1` for CO2/N2O, `d2` for CH4);
+`aux_trace_info` builds the column name from that instead of a hardcoded
+per-gas branch, so adding a new gas is a matter of adding a `GASES` entry
+with the right `detector`, not touching `aux_trace_info` itself.
 
-Data is plotted **uncalibrated** (`d1_CO2_ppm`, `d1_N2O_ppb`), not the
-`*c_ppm`/`*c_ppb` calibrated columns — this was a deliberate switch; don't
-revert to the calibrated columns without being asked.
+Because the column set genuinely differs between flights,
+`UcatsbGui.__init__` reads the CSV header first (`nrows=0`) and only
+requests columns that exist, then filters `GASES` down to
+`self.available_gases` (only gases whose `value_col` is present) for the Gas
+combo box. Downstream code (`redraw`, etc.) still indexes the global `GASES`
+dict directly — that's safe because `self.current_gas` is only ever set from
+`self.available_gases`' keys, a subset of `GASES`. Don't reintroduce a bare
+`usecols=REQUIRED_COLUMNS` read; it will raise if any expected column is
+missing from a given file's schema.
+
+Data is plotted **uncalibrated** (`d1_CO2_ppm`, `d1_N2O_ppb`, `d2_CH4_ppb`),
+not the `*c_ppm`/`*c_ppb` calibrated columns — this was a deliberate switch;
+don't revert to the calibrated columns without being asked.
 
 ### GUI view-preservation (`ucatsb_gui.py` `redraw()`)
 
