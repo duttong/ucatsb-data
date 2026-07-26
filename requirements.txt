@@ -1,0 +1,4 @@
+pandas>=2.2
+matplotlib>=3.9
+PyQt5>=5.15
+PyYAML>=6.0

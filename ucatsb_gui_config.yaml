@@ -1,0 +1,18 @@
+CO2:
+  warmup_min: 30
+  pressure_tol_mbar: 3.0
+  cal1_window_s:
+  - -8
+  - -1
+  cal2_window_s:
+  - -8
+  - -1
+N2O:
+  warmup_min: 20
+  pressure_tol_mbar: 3.0
+  cal1_window_s:
+  - -15
+  - -1
+  cal2_window_s:
+  - -15
+  - -1

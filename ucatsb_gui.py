@@ -1,0 +1,456 @@
+#!/usr/bin/env python3
+"""Interactive UCATS-B timeseries viewer with adjustable data-masking controls.
+
+Left panel: gas selector (CO2/N2O) and masking controls (warm-up exclusion,
+detector pressure filter, and per-bottle calibration mean windows).
+Right panel: the resulting figure.
+
+Usage: python3 ucatsb_gui.py <csv_file>
+"""
+import copy
+import sys
+from pathlib import Path
+
+import pandas as pd
+import yaml
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
+    QGroupBox, QComboBox, QDoubleSpinBox, QSpinBox, QLabel,
+    QButtonGroup, QRadioButton,
+)
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg, NavigationToolbar2QT as NavigationToolbar
+from matplotlib.figure import Figure
+import matplotlib.dates as mdates
+
+from plot_co2_timeseries import (
+    drop_presync_rows, find_intervals, merge_close_intervals,
+    shade_intervals, cal_mean_points, load_cal_bottles, most_common_serial,
+    mean_std_label, CALS_YAML_PATH,
+)
+
+LINE_COLOR = "#2a78d6"
+CAL_SHADE_COLOR = "#898781"
+PRESSURE_EXCLUDE_COLOR = "#d03b3b"
+WARMUP_EXCLUDE_COLOR = "#ffa64d"   # light orange
+CAL0_COLOR = "#eda100"   # golden
+CAL1_COLOR = "#0d366b"   # dark blue
+GRID_COLOR = "#e1e0d9"
+AXIS_COLOR = "#c3c2b7"
+TEXT_COLOR = "#0b0b0b"
+MUTED_COLOR = "#52514e"
+
+D1_P_TARGET_MBARS = 140.0
+CAL_MERGE_GAP_S = 2   # bridge cal periods split by a single dropped-flag sample
+
+GASES = {
+    "CO2": {"value_col": "d1_CO2_ppm", "ylabel": "CO2 (ppm)", "title": "UCATS-B CO2 (uncalibrated) timeseries"},
+    "N2O": {"value_col": "d1_N2O_ppb", "ylabel": "N2O (ppb)", "title": "UCATS-B N2O (uncalibrated) timeseries"},
+}
+
+REQUIRED_COLUMNS = [
+    "datetime", "d1_P_mbars", "d2_P_mbars", "d1_T_gas", "d2_T_gas",
+    "oz_o3", "oz_p", "oz_t", "j_sol_cals", "j_sol_aircal",
+] + [g["value_col"] for g in GASES.values()]
+
+AUX_OPTIONS = ["No Figure", "Detector Pressure", "T_gas", "oz_o3", "oz_p", "oz_t"]
+
+
+def aux_trace_info(selection: str, gas: str):
+    """Return (column, ylabel) for the chosen auxiliary trace, given which
+    gas is active (Detector Pressure/T_gas come from d1 for CO2, d2 for N2O
+    -- N2O has a second channel on the d2/CO detector), or None for "No Figure".
+    """
+    if selection == "Detector Pressure":
+        col = "d1_P_mbars" if gas == "CO2" else "d2_P_mbars"
+        return col, f"{col} (mbar)"
+    if selection == "T_gas":
+        col = "d1_T_gas" if gas == "CO2" else "d2_T_gas"
+        return col, f"{col} (°C)"
+    if selection == "oz_o3":
+        return "oz_o3", "O3 (ppb)"
+    if selection == "oz_p":
+        return "oz_p", "Ozone P (mbar)"
+    if selection == "oz_t":
+        return "oz_t", "Ozone T (°C)"
+    return None
+
+DEFAULT_CONFIG_PATH = Path(__file__).parent / "ucatsb_gui_config.yaml"
+
+DEFAULT_GAS_SETTINGS = {
+    "warmup_min": 30,
+    "pressure_tol_mbar": 10.0,
+    "cal1_window_s": [-15, -1],
+    "cal2_window_s": [-15, -1],
+}
+
+
+def load_config(path: Path) -> dict:
+    """Load per-gas control settings, filling in defaults for anything missing."""
+    config = {gas: copy.deepcopy(DEFAULT_GAS_SETTINGS) for gas in GASES}
+    if path.exists():
+        try:
+            loaded = yaml.safe_load(path.read_text()) or {}
+        except (yaml.YAMLError, OSError) as e:
+            print(f"Warning: could not read {path}: {e}")
+            loaded = {}
+        for gas in GASES:
+            if isinstance(loaded.get(gas), dict):
+                config[gas].update(loaded[gas])
+    return config
+
+
+def save_config(path: Path, config: dict):
+    path.write_text(yaml.safe_dump(config, sort_keys=False))
+
+
+class UcatsbGui(QMainWindow):
+    def __init__(self, csv_path: Path, config_path: Path = DEFAULT_CONFIG_PATH):
+        super().__init__()
+        self.setWindowTitle(f"UCATS-B Viewer - {csv_path.name}")
+        self.resize(1300, 750)
+
+        self.df = pd.read_csv(csv_path, usecols=REQUIRED_COLUMNS)
+        self.df["datetime"] = pd.to_datetime(self.df["datetime"])
+        self.df = drop_presync_rows(self.df)
+
+        self.config_path = config_path
+        self.config = load_config(config_path)
+        self.current_gas = next(iter(GASES))
+        self.aux_selection = "No Figure"
+        self._loading = False
+        self._initializing = True
+        self.cal_bottles = load_cal_bottles(CALS_YAML_PATH)
+        self.ax = None
+        self.ax_aux = None
+        self._had_aux_panel = None
+        self._last_aux_selection = None
+
+        central = QWidget()
+        self.setCentralWidget(central)
+        layout = QHBoxLayout(central)
+
+        layout.addWidget(self._build_controls(), 0)
+        layout.addWidget(self._build_canvas(), 1)
+
+        self._apply_settings_to_controls(self.config[self.current_gas])
+        self._initializing = False
+        self.redraw()
+
+    def _build_controls(self):
+        panel = QWidget()
+        panel.setFixedWidth(300)
+        vbox = QVBoxLayout(panel)
+
+        gas_box = QGroupBox("Gas")
+        gas_layout = QVBoxLayout(gas_box)
+        self.gas_combo = QComboBox()
+        self.gas_combo.addItems(GASES.keys())
+        self.gas_combo.currentTextChanged.connect(self.on_gas_changed)
+        gas_layout.addWidget(self.gas_combo)
+        vbox.addWidget(gas_box)
+
+        aux_box = QGroupBox("Trace Above")
+        aux_layout = QVBoxLayout(aux_box)
+        self.aux_group = QButtonGroup(aux_box)
+        self.aux_radios = {}
+        for name in AUX_OPTIONS:
+            rb = QRadioButton(name)
+            if name == "No Figure":
+                rb.setChecked(True)
+            rb.toggled.connect(self.on_aux_changed)
+            self.aux_group.addButton(rb)
+            aux_layout.addWidget(rb)
+            self.aux_radios[name] = rb
+        vbox.addWidget(aux_box)
+
+        mask_box = QGroupBox("Data Masking")
+        mask_form = QFormLayout(mask_box)
+
+        self.warmup_spin = QSpinBox()
+        self.warmup_spin.setRange(0, 120)
+        self.warmup_spin.setSingleStep(1)
+        self.warmup_spin.setSuffix(" min")
+        self.warmup_spin.valueChanged.connect(self.on_control_changed)
+        mask_form.addRow("Warm-up exclude:", self.warmup_spin)
+
+        self.pressure_tol_spin = QDoubleSpinBox()
+        self.pressure_tol_spin.setRange(0.0, 10.0)
+        self.pressure_tol_spin.setSingleStep(0.05)
+        self.pressure_tol_spin.setDecimals(2)
+        self.pressure_tol_spin.setSuffix(" mbar")
+        self.pressure_tol_spin.setMinimumWidth(130)
+        self.pressure_tol_spin.valueChanged.connect(self.on_control_changed)
+        mask_form.addRow(f"Pressure tol\n(±{D1_P_TARGET_MBARS:.0f} mbar target):", self.pressure_tol_spin)
+
+        vbox.addWidget(mask_box)
+
+        # Visual order swapped: the 100% bottle box appears above the 50% one.
+        self.cal2_box, self.cal2_start_spin, self.cal2_end_spin = self._add_cal_window_box(
+            vbox, "Cal 2 Mean Window"
+        )
+        self.cal1_box, self.cal1_start_spin, self.cal1_end_spin = self._add_cal_window_box(
+            vbox, "Cal 1 Mean Window"
+        )
+
+        vbox.addWidget(QLabel(
+            "Cal windows are relative to the last\n"
+            "point in a cal period (Cal_p), e.g.\n"
+            "-15 s to -1 s = [Cal_p-15s, Cal_p-1s].\n"
+            "Settings are saved per-gas."
+        ))
+
+        vbox.addStretch(1)
+        return panel
+
+    def _add_cal_window_box(self, vbox, title):
+        box = QGroupBox(title)
+        form = QFormLayout(box)
+
+        start_spin = QSpinBox()
+        start_spin.setRange(-60, 0)
+        start_spin.setSuffix(" s")
+        start_spin.valueChanged.connect(self.on_control_changed)
+        form.addRow("Start:", start_spin)
+
+        end_spin = QSpinBox()
+        end_spin.setRange(-60, 0)
+        end_spin.setSuffix(" s")
+        end_spin.valueChanged.connect(self.on_control_changed)
+        form.addRow("End:", end_spin)
+
+        vbox.addWidget(box)
+        return box, start_spin, end_spin
+
+    def _cal_box_title(self, label, fallback):
+        """Title a cal-window box as "<info> Cal (<serial>)" (e.g. "50% Cal
+        (CB09960)") using cals.yaml's info field, if the serial was matched
+        and cals.yaml has an info string for it; otherwise fall back."""
+        info = self.cal_bottles.get(label, {}).get("info") if label else None
+        if info:
+            return f"{info} Cal ({label})"
+        return fallback
+
+    def _build_canvas(self):
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        self.figure = Figure(constrained_layout=True)
+        self.canvas = FigureCanvasQTAgg(self.figure)
+        self.toolbar = NavigationToolbar(self.canvas, self)
+        layout.addWidget(self.toolbar)
+        layout.addWidget(self.canvas)
+        return container
+
+    def _apply_settings_to_controls(self, settings: dict):
+        """Populate the controls from a per-gas settings dict without
+        triggering on_control_changed (and re-saving/redrawing) per field."""
+        self._loading = True
+        self.warmup_spin.setValue(settings["warmup_min"])
+        self.pressure_tol_spin.setValue(settings["pressure_tol_mbar"])
+        self.cal1_start_spin.setValue(settings["cal1_window_s"][0])
+        self.cal1_end_spin.setValue(settings["cal1_window_s"][1])
+        self.cal2_start_spin.setValue(settings["cal2_window_s"][0])
+        self.cal2_end_spin.setValue(settings["cal2_window_s"][1])
+        self._loading = False
+
+    def _controls_to_settings(self) -> dict:
+        return {
+            "warmup_min": self.warmup_spin.value(),
+            "pressure_tol_mbar": self.pressure_tol_spin.value(),
+            "cal1_window_s": [self.cal1_start_spin.value(), self.cal1_end_spin.value()],
+            "cal2_window_s": [self.cal2_start_spin.value(), self.cal2_end_spin.value()],
+        }
+
+    def on_gas_changed(self, new_gas: str):
+        self.current_gas = new_gas
+        self._apply_settings_to_controls(self.config[new_gas])
+        if self._initializing:
+            return
+        self.redraw()
+
+    def on_control_changed(self):
+        if self._loading or self._initializing:
+            return
+        self.config[self.current_gas] = self._controls_to_settings()
+        save_config(self.config_path, self.config)
+        self.redraw(preserve_view=True)
+
+    def on_aux_changed(self, checked: bool):
+        if not checked:
+            return
+        for name, rb in self.aux_radios.items():
+            if rb.isChecked():
+                self.aux_selection = name
+                break
+        if self._initializing:
+            return
+        self.redraw(preserve_view=True)
+
+    def redraw(self, preserve_view=False):
+        gas = GASES[self.current_gas]
+        value_col = gas["value_col"]
+        warmup_minutes = self.warmup_spin.value()
+        pressure_tol = self.pressure_tol_spin.value()
+        cal0_window = (self.cal1_start_spin.value(), self.cal1_end_spin.value())
+        cal1_window = (self.cal2_start_spin.value(), self.cal2_end_spin.value())
+
+        df = self.df
+
+        aux_info = aux_trace_info(self.aux_selection, self.current_gas)
+        has_aux_panel = aux_info is not None
+
+        # Capture the current view before tearing down the old Axes, so a
+        # masking/averaging control change -- or switching/adding/removing
+        # the upper trace -- can redraw without rescaling the main plot.
+        # The aux panel's own y-range is only worth preserving if it's
+        # still showing the same trace (its scale means something different
+        # for a different trace, so let that one re-autoscale).
+        old_main_view = None
+        old_aux_ylim = None
+        if preserve_view and self.ax is not None:
+            old_main_view = (self.ax.get_xlim(), self.ax.get_ylim())
+            if (self.ax_aux is not None and has_aux_panel
+                    and self._last_aux_selection == self.aux_selection):
+                old_aux_ylim = self.ax_aux.get_ylim()
+
+        self.figure.clear()
+        if has_aux_panel:
+            gs = self.figure.add_gridspec(2, 1, height_ratios=[1, 3])
+            ax_aux = self.figure.add_subplot(gs[0])
+            ax = self.figure.add_subplot(gs[1], sharex=ax_aux)
+        else:
+            ax_aux = None
+            ax = self.figure.add_subplot(111)
+        ax.set_facecolor("#fcfcfb")
+
+        cal = (df["j_sol_cals"].fillna(0).astype(bool)
+               | df["j_sol_aircal"].fillna(0).astype(bool))
+        shade_intervals(ax, df["datetime"], cal, CAL_SHADE_COLOR, alpha=0.3)
+
+        cal_intervals = merge_close_intervals(
+            find_intervals(df["datetime"], cal), pd.Timedelta(seconds=CAL_MERGE_GAP_S)
+        )
+
+        bad_pressure = (df["d1_P_mbars"] - D1_P_TARGET_MBARS).abs() > pressure_tol
+        bad_pressure = bad_pressure.fillna(False)
+
+        warmup_end = df["datetime"].iloc[0] + pd.Timedelta(minutes=warmup_minutes)
+        warmup = df["datetime"] < warmup_end
+
+        shade_intervals(ax, df["datetime"], warmup, WARMUP_EXCLUDE_COLOR, alpha=0.15)
+        shade_intervals(ax, df["datetime"], bad_pressure, PRESSURE_EXCLUDE_COLOR, alpha=0.15)
+
+        # Cal means are estimated from the raw data with these masks applied
+        # -- a cal point can be dropped entirely if its window has no valid data.
+        exclude_mask = bad_pressure | warmup
+        cal_points = cal_mean_points(
+            df, cal_intervals, value_col, cal0_window, cal1_window,
+            cal_bottles=self.cal_bottles, gas_key=self.current_gas,
+            exclude_mask=exclude_mask,
+        )
+
+        plot_data = df[["datetime", value_col]].dropna()
+        line, = ax.plot(plot_data["datetime"], plot_data[value_col], color=LINE_COLOR, linewidth=1.2)
+
+        cal0_pts = [(t, v) for t, v, state, serial in cal_points if state == 0]
+        cal1_pts = [(t, v) for t, v, state, serial in cal_points if state == 1]
+        cal0_label = most_common_serial(cal_points, 0) or "Cal 1"
+        cal1_label = most_common_serial(cal_points, 1) or "Cal 2"
+        self.cal1_box.setTitle(self._cal_box_title(cal0_label, "Cal 1 Mean Window"))
+        self.cal2_box.setTitle(self._cal_box_title(cal1_label, "Cal 2 Mean Window"))
+
+        handles = [line]
+        labels = [f"{gas['ylabel']} (ambient)"]
+        if cal0_pts:
+            xs, ys = zip(*cal0_pts)
+            handles.append(ax.scatter(xs, ys, color=CAL0_COLOR, s=40, zorder=5, edgecolors="none"))
+            labels.append(f"{cal0_label}: {mean_std_label(ys)}")
+        if cal1_pts:
+            xs, ys = zip(*cal1_pts)
+            handles.append(ax.scatter(xs, ys, color=CAL1_COLOR, s=40, zorder=5, edgecolors="none"))
+            labels.append(f"{cal1_label}: {mean_std_label(ys)}")
+
+        ax.set_ylabel(gas["ylabel"], color=TEXT_COLOR)
+        ax.set_title(gas["title"], color=TEXT_COLOR, loc="left")
+
+        date_str = plot_data["datetime"].iloc[0].strftime("%Y-%m-%d") if not plot_data.empty else ""
+        ax.set_xlabel(f"Time (UTC-ish, {date_str})", color=MUTED_COLOR)
+
+        ax.xaxis.set_major_locator(mdates.AutoDateLocator())
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+
+        ax.grid(True, color=GRID_COLOR, linewidth=0.8)
+        for spine in ax.spines.values():
+            spine.set_color(AXIS_COLOR)
+        ax.tick_params(colors=MUTED_COLOR)
+        for label in ax.get_xticklabels():
+            label.set_rotation(45)
+            label.set_horizontalalignment("right")
+
+        ax.legend(handles, labels, loc="lower right", fontsize=9, framealpha=0.9)
+
+        notes = []
+        if cal.any():
+            notes.append("gray = calibration/cal-air (j_sol_cals, j_sol_aircal)")
+        if warmup.any():
+            notes.append(f"orange = excluded (first {warmup_minutes} min warm-up)")
+        if bad_pressure.any():
+            notes.append(
+                f"light red = excluded (d1_P_mbars outside {D1_P_TARGET_MBARS:.0f}±{pressure_tol:.2f} mbar)"
+            )
+        if notes:
+            ax.text(
+                0.01, 0.98, "\n".join(notes),
+                transform=ax.transAxes, ha="left", va="top",
+                color=MUTED_COLOR, fontsize=9,
+            )
+
+        if ax_aux is not None:
+            aux_col, aux_ylabel = aux_info
+            ax_aux.set_facecolor("#fcfcfb")
+            shade_intervals(ax_aux, df["datetime"], warmup, WARMUP_EXCLUDE_COLOR, alpha=0.15)
+            shade_intervals(ax_aux, df["datetime"], bad_pressure, PRESSURE_EXCLUDE_COLOR, alpha=0.15)
+
+            aux_data = df[["datetime", aux_col]].dropna()
+            ax_aux.plot(aux_data["datetime"], aux_data[aux_col], color=LINE_COLOR, linewidth=1.0)
+
+            ax_aux.set_ylabel(aux_ylabel, color=TEXT_COLOR, fontsize=9)
+            ax_aux.set_title(self.aux_selection, color=TEXT_COLOR, loc="left", fontsize=10)
+            ax_aux.grid(True, color=GRID_COLOR, linewidth=0.6)
+            for spine in ax_aux.spines.values():
+                spine.set_color(AXIS_COLOR)
+            ax_aux.tick_params(colors=MUTED_COLOR, labelsize=8, labelbottom=False)
+
+        # The new Axes were just built and auto-scaled to the full data
+        # range -- reset the toolbar's view stack so Home returns to *this*
+        # full-scale view, then (optionally) re-apply the pre-redraw zoom on
+        # top of it, without pushing that onto the stack.
+        self.toolbar.update()
+        self.toolbar.push_current()
+        if old_main_view is not None:
+            ax.set_xlim(old_main_view[0])
+            ax.set_ylim(old_main_view[1])
+        if old_aux_ylim is not None and ax_aux is not None:
+            ax_aux.set_ylim(old_aux_ylim)
+
+        self.ax = ax
+        self.ax_aux = ax_aux
+        self._had_aux_panel = has_aux_panel
+        self._last_aux_selection = self.aux_selection
+
+        self.canvas.draw()
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: python3 ucatsb_gui.py <csv_file>", file=sys.stderr)
+        sys.exit(1)
+    csv_path = Path(sys.argv[1])
+
+    app = QApplication(sys.argv)
+    window = UcatsbGui(csv_path)
+    window.show()
+    sys.exit(app.exec_())
+
+
+if __name__ == "__main__":
+    main()
