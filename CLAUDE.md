@@ -63,12 +63,14 @@ behavior belongs in that shared module so both stay in sync.
 ### Cal bottle identity is matched by concentration, not trusted from config
 
 `j_sol_cals` is a raw digital solenoid state (0 or 1) — it is **not** a
-reliable bottle identifier. `~/code/ucats-b/cals.yaml` maps `cal0`/`cal1` to
-serials (e.g. `cal0: CC302489`), but that key order does not necessarily
-match which serial is actually plumbed to which digital state on a given
-flight (confirmed empirically: on the reference flight, `j_sol_cals==0`
-measured ~217 ppm CO2, matching `CB09960`'s nominal 206.51 ppm, not
-`CC302489`'s 418.95 ppm — the reverse of the naive `cal0`→digital-0 reading).
+reliable bottle identifier. `cals.yaml` (a local copy of
+`~/code/ucats-b/cals.yaml` — resync by hand if the acquisition repo's
+bottles/serials change) maps `cal0`/`cal1` to serials (e.g.
+`cal0: CC302489`), but that key order does not necessarily match which
+serial is actually plumbed to which digital state on a given flight
+(confirmed empirically: on the reference flight, `j_sol_cals==0` measured
+~217 ppm CO2, matching `CB09960`'s nominal 206.51 ppm, not `CC302489`'s
+418.95 ppm — the reverse of the naive `cal0`→digital-0 reading).
 `match_cal_serial` instead picks whichever serial's nominal concentration
 (for the active gas) is closest to the measured window mean. This is
 self-correcting if bottles are swapped between flights — do not "fix" it to
@@ -77,7 +79,8 @@ use the `cals.yaml` key order directly.
 `cals.yaml` also contains literal tab characters as `key:\tvalue` separators,
 which are invalid YAML syntax. `load_cal_bottles` blanks tabs to spaces
 before parsing rather than erroring — don't remove that workaround without
-checking the file's current formatting.
+checking the file's current formatting (it'll be reintroduced any time
+`cals.yaml` is re-copied from the acquisition repo).
 
 ### d1 vs d2 detector routing
 

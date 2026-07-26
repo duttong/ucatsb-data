@@ -56,9 +56,11 @@ this logger, not real data).
 
 Calibration bottle identity (which serial number is flowing at a given
 `j_sol_cals` state) is determined by matching the measured concentration
-against the nominal values in `~/code/ucats-b/cals.yaml`, not by trusting any
-assumed digital-state-to-serial mapping — this is self-correcting if bottles
-are swapped between flights.
+against the nominal values in `cals.yaml`, not by trusting any assumed
+digital-state-to-serial mapping — this is self-correcting if bottles are
+swapped between flights. `cals.yaml` here is a local copy of
+`~/code/ucats-b/cals.yaml`; update it by hand if the acquisition repo's
+bottles/serials change.
 
 ## Files
 
@@ -67,3 +69,4 @@ are swapped between flights.
 | `ucatsb_gui.py` | PyQt5 interactive viewer |
 | `plot_co2_timeseries.py` | Shared masking/cal-detection logic + standalone static-figure CLI |
 | `ucatsb_gui_config.yaml` | Per-gas masking/averaging settings, auto-saved by the GUI |
+| `cals.yaml` | Cal bottle serials and nominal concentrations (local copy of `~/code/ucats-b/cals.yaml`) |

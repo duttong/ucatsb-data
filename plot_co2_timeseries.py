@@ -26,7 +26,7 @@ D1_P_TOLERANCE_MBARS = 10.0
 WARMUP_MINUTES = 30
 CAL_MEAN_WINDOW_S = 15
 CAL_MERGE_GAP_S = 2   # bridge cal periods split by a single dropped-flag sample
-CALS_YAML_PATH = Path.home() / "code" / "ucats-b" / "cals.yaml"
+CALS_YAML_PATH = Path(__file__).parent / "cals.yaml"
 
 
 def drop_presync_rows(df: pd.DataFrame, jump_threshold_s: float = 60.0) -> pd.DataFrame:
@@ -90,8 +90,9 @@ def bottle_for_interval(df, start, end):
 
 def load_cal_bottles(path: Path):
     """Load cal bottle serials and their nominal gas concentrations from a
-    cals.yaml file (see ~/code/ucats-b/cals.yaml). Returns
-    {serial: {"CO2": ..., "N2O": ..., ...}}, or {} if unavailable.
+    cals.yaml file (a local copy of ~/code/ucats-b/cals.yaml -- resync it by
+    hand if bottles change). Returns {serial: {"CO2": ..., "N2O": ..., ...}},
+    or {} if unavailable.
     """
     import yaml
     if not path.exists():
