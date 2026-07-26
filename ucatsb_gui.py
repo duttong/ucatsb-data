@@ -212,7 +212,8 @@ class UcatsbGui(QMainWindow):
         vbox.addWidget(QLabel(
             "Cal windows are relative to the last\n"
             "point in a cal period (Cal_p), e.g.\n"
-            "-15 s to -1 s = [Cal_p-15s, Cal_p-1s].\n"
+            "-10 s to 2 s = [Cal_p-10s, Cal_p+2s].\n"
+            "Positive values reach past Cal_p.\n"
             "Settings are saved per-gas."
         ))
 
@@ -224,13 +225,13 @@ class UcatsbGui(QMainWindow):
         form = QFormLayout(box)
 
         start_spin = QSpinBox()
-        start_spin.setRange(-60, 0)
+        start_spin.setRange(-60, 60)
         start_spin.setSuffix(" s")
         start_spin.valueChanged.connect(self.on_control_changed)
         form.addRow("Start:", start_spin)
 
         end_spin = QSpinBox()
-        end_spin.setRange(-60, 0)
+        end_spin.setRange(-60, 60)
         end_spin.setSuffix(" s")
         end_spin.valueChanged.connect(self.on_control_changed)
         form.addRow("End:", end_spin)
