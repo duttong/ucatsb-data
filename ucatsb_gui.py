@@ -239,13 +239,20 @@ class UcatsbGui(QMainWindow):
         return box, start_spin, end_spin
 
     def _cal_box_title(self, label, fallback):
-        """Title a cal-window box as "<info> Cal (<serial>)" (e.g. "50% Cal
-        (CB09960)") using cals.yaml's info field, if the serial was matched
-        and cals.yaml has an info string for it; otherwise fall back."""
-        info = self.cal_bottles.get(label, {}).get("info") if label else None
-        if info:
-            return f"{info} Cal ({label})"
-        return fallback
+        """Title a cal-window box as "<info> Cal (<serial>) <mole fraction>"
+        (e.g. "50% Cal (CB09960) 206.51 ppm") using cals.yaml's info field
+        and its assigned value for the active gas, if the serial was matched
+        and cals.yaml has those; otherwise fall back."""
+        nominal = self.cal_bottles.get(label, {}) if label else {}
+        info = nominal.get("info")
+        if not info:
+            return fallback
+        title = f"{info} Cal ({label})"
+        value = nominal.get(self.current_gas)
+        if value is not None:
+            unit = GASES[self.current_gas]["ylabel"].split("(")[-1].rstrip(")")
+            title += f" {value:g} {unit}"
+        return title
 
     def _build_canvas(self):
         container = QWidget()
