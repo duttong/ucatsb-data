@@ -241,13 +241,16 @@ class UcatsbGui(QMainWindow):
     def _cal_box_title(self, label, fallback):
         """Title a cal-window box as "<info> Cal (<serial>) <mole fraction>"
         (e.g. "50% Cal (CB09960) 206.51 ppm") using cals.yaml's info field
-        and its assigned value for the active gas, if the serial was matched
-        and cals.yaml has those; otherwise fall back."""
+        and its assigned value for the active gas, if the serial was
+        matched; otherwise fall back. `info` (the rough-percentage label) is
+        optional -- not every tank in the roster has one -- so the mole
+        fraction still shows up without it rather than losing the title
+        entirely."""
         nominal = self.cal_bottles.get(label, {}) if label else {}
-        info = nominal.get("info")
-        if not info:
+        if not nominal:
             return fallback
-        title = f"{info} Cal ({label})"
+        info = nominal.get("info")
+        title = f"{info} Cal ({label})" if info else f"Cal ({label})"
         value = nominal.get(self.current_gas)
         if value is not None:
             unit = GASES[self.current_gas]["ylabel"].split("(")[-1].rstrip(")")

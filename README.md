@@ -37,7 +37,7 @@ Left panel:
 - **Gas** — switch the main plot between CO2 (`d1_CO2_ppm`), N2O (`d1_N2O_ppb`), and CH4 (`d2_CH4_ppb`), all uncalibrated. Only gases whose column exists in the loaded CSV are offered.
 - **Trace Above** — optionally add a smaller panel above the main plot: Detector Pressure, T_gas, oz_o3, oz_p, or oz_t. Detector Pressure/T_gas pull from whichever detector the active gas comes from (`d1` for CO2/N2O, `d2` for CH4). "No Figure" returns to the single full-size plot.
 - **Data Masking** — warm-up exclusion (minutes from the start of the record) and detector pressure tolerance (±mbar around 140 mbar). Both are applied to the raw data *before* cal means are computed, not just drawn as bands — a cal point can disappear entirely if its averaging window has no valid data left.
-- **Cal Mean Windows** — one box per cal bottle (titled dynamically from `cals.yaml`, e.g. "100% Cal (CC302489)"), each with a start/end offset in seconds relative to the last point in that calibration period (`Cal_p`). Settings are saved per-gas to `ucatsb_gui_config.yaml` and reloaded on next launch.
+- **Cal Mean Windows** — one box per cal bottle (titled dynamically from `cals.yaml`, e.g. "100% Cal (CC302489) 418.947 ppm" — the mole fraction shown is that tank's assigned value for whichever gas is currently active), each with a start/end offset in seconds relative to the last point in that calibration period (`Cal_p`). Settings are saved per-gas to `ucatsb_gui_config.yaml` and reloaded on next launch.
 
 Zooming/panning (via the matplotlib toolbar) is preserved across masking, averaging, and upper-trace changes — only the Home button resets to full scale.
 
@@ -62,13 +62,18 @@ datalogger's clock synced (a burst of rows with a too-late timestamp,
 followed by a large backward jump to the true time — a known artifact of
 this logger, not real data).
 
-Calibration bottle identity (which serial number is flowing at a given
-`j_sol_cals` state) is determined by matching the measured concentration
-against the nominal values in `cals.yaml`, not by trusting any assumed
-digital-state-to-serial mapping — this is self-correcting if bottles are
-swapped between flights. `cals.yaml` here is a local copy of
-`~/code/ucats-b/cals.yaml`; update it by hand if the acquisition repo's
-bottles/serials change.
+`cals.yaml` holds the full tank roster (every cal tank ever used, with its
+assigned mole fractions and uncertainties per gas), plus a `cals:` block
+naming which two of those tanks (`cal0`/`cal1`) are actually plumbed in for
+the current run -- update that block by hand when tanks are swapped between
+flights. Only the two assigned tanks are used for matching; calibration
+bottle identity (which serial number is flowing at a given `j_sol_cals`
+state) is determined by matching the measured concentration against those
+two tanks' nominal values, not by trusting any assumed digital-state-to-
+serial mapping -- this is self-correcting if the two get swapped without
+updating `cals:`. `cals.yaml` here is a local copy of
+`~/code/ucats-b/cals.yaml`; resync it by hand if the acquisition repo's
+roster changes.
 
 ## Files
 
@@ -77,4 +82,4 @@ bottles/serials change.
 | `ucatsb_gui.py` | PyQt5 interactive viewer |
 | `plot_co2_timeseries.py` | Shared masking/cal-detection logic + standalone static-figure CLI |
 | `ucatsb_gui_config.yaml` | Per-gas masking/averaging settings, auto-saved by the GUI |
-| `cals.yaml` | Cal bottle serials and nominal concentrations (local copy of `~/code/ucats-b/cals.yaml`) |
+| `cals.yaml` | Full cal tank roster + which two are assigned for the current run (local copy of `~/code/ucats-b/cals.yaml`) |
