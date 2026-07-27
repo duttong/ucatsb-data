@@ -267,6 +267,8 @@ class UcatsbGui(QMainWindow):
         self.right_axis_column = None
 
         self.setWindowTitle(f"UCATS-B Viewer - {csv_path.name}")
+        self.file_label.setText(csv_path.name)
+        self.file_label.setToolTip(str(csv_path))
 
         was_initializing = self._initializing
         self._initializing = True
@@ -317,6 +319,12 @@ class UcatsbGui(QMainWindow):
         load_button = QPushButton("Load Data")
         load_button.clicked.connect(self.on_load_data_clicked)
         vbox.addWidget(load_button)
+
+        # Just the name -- the panel is 300 px wide and a full path would
+        # either clip or force the panel wider. The full path is the tooltip.
+        self.file_label = QLabel("No file loaded")
+        self.file_label.setStyleSheet(f"color: {MUTED_COLOR};")
+        vbox.addWidget(self.file_label)
 
         gas_box = QGroupBox("Gas")
         gas_layout = QVBoxLayout(gas_box)
@@ -426,24 +434,24 @@ class UcatsbGui(QMainWindow):
     )
 
     def _add_cal_window_box(self, vbox, title):
+        """Start/End on one row -- two form rows per box cost more vertical
+        space than the control panel can spare on a laptop screen."""
         box = QGroupBox(title)
         box.setToolTip(self.CAL_WINDOW_HELP)
-        form = QFormLayout(box)
+        row = QHBoxLayout(box)
 
-        start_spin = QSpinBox()
-        start_spin.setRange(-60, 60)
-        start_spin.setSuffix(" s")
-        start_spin.valueChanged.connect(self.on_control_changed)
-        form.addRow("Start:", start_spin)
-
-        end_spin = QSpinBox()
-        end_spin.setRange(-60, 60)
-        end_spin.setSuffix(" s")
-        end_spin.valueChanged.connect(self.on_control_changed)
-        form.addRow("End:", end_spin)
+        spins = []
+        for label in ("Start:", "End:"):
+            spin = QSpinBox()
+            spin.setRange(-60, 60)
+            spin.setSuffix(" s")
+            spin.valueChanged.connect(self.on_control_changed)
+            row.addWidget(QLabel(label))
+            row.addWidget(spin, 1)
+            spins.append(spin)
 
         vbox.addWidget(box)
-        return box, start_spin, end_spin
+        return box, spins[0], spins[1]
 
     def _cal_box_title(self, label, fallback):
         """Title a cal-window box as "<info> Cal (<serial>) <mole fraction>"
