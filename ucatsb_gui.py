@@ -161,6 +161,7 @@ class UcatsbGui(QMainWindow):
         self.right_axis_column = None
         self._loading = False
         self._initializing = True
+        self._analysis = None
         self.cal_bottles = load_cal_bottles(CALS_YAML_PATH)
         self.ax = None
         self.ax_aux = None
@@ -256,7 +257,7 @@ class UcatsbGui(QMainWindow):
         self._select_gas(self.current_gas)
         self._initializing = was_initializing
         if not self._initializing:
-            self.redraw()
+            self.refresh()
 
     def on_load_data_clicked(self):
         start_dir = str(self.csv_path.parent) if self.csv_path else str(Path.cwd())
@@ -443,14 +444,14 @@ class UcatsbGui(QMainWindow):
         self._select_gas(new_gas)
         if self._initializing:
             return
-        self.redraw()
+        self.refresh()
 
     def on_control_changed(self):
         if self._loading or self._initializing or self.current_gas is None:
             return
         self.config[self.current_gas] = self._controls_to_settings()
         save_config(self.config_path, self.config)
-        self.redraw(preserve_view=True)
+        self.refresh(preserve_view=True)
 
     def on_aux_changed(self, checked: bool):
         if not checked:
@@ -465,30 +466,100 @@ class UcatsbGui(QMainWindow):
         self.right_axis_combo.setEnabled(self.aux_selection != "No Figure")
         if self._initializing:
             return
-        self.redraw(preserve_view=True)
+        self.refresh(preserve_view=True)
 
     def on_other_changed(self, text: str):
         self.other_column = text or None
         if self._initializing or self.aux_selection != "Other":
             return
-        self.redraw(preserve_view=True)
+        self.refresh(preserve_view=True)
 
     def on_right_axis_changed(self, text: str):
         self.right_axis_column = None if text in ("", "(none)") else text
         if self._initializing:
             return
-        self.redraw(preserve_view=True)
+        self.refresh(preserve_view=True)
 
-    def redraw(self, preserve_view=False):
+    def refresh(self, preserve_view=False):
+        """Invalidate the cached analysis and redraw.
+
+        The single entry point for every state change, so the cache has
+        exactly one invalidation site. Deliberately invalidates
+        unconditionally rather than comparing a composite key of
+        (file, gas, warm-up, tolerance, cal windows, ...): such a key is easy
+        to get subtly wrong and then serves a stale plot, whereas
+        invalidate-everything cannot. The recompute is milliseconds.
+        """
+        self._analysis = None
+        self.redraw(preserve_view=preserve_view)
+
+    def _get_analysis(self):
+        """Masks, cal intervals and per-injection cal means for the current
+        file, gas and control settings.
+
+        Cached because more than one view reads the same numbers and they
+        must not disagree; see refresh() for how the cache is invalidated.
+        Returns None when no file is loaded.
+        """
         if self.df is None:
-            return
+            return None
+        if self._analysis is not None:
+            return self._analysis
+
         gas = GASES[self.current_gas]
-        value_col = gas["value_col"]
+        df = self.df
         has_masking = gas.get("has_masking", True)
         warmup_minutes = self.warmup_spin.value()
         pressure_tol = self.pressure_tol_spin.value()
-        cal0_window = (self.cal1_start_spin.value(), self.cal1_end_spin.value())
-        cal1_window = (self.cal2_start_spin.value(), self.cal2_end_spin.value())
+
+        # bad_pressure/warmup are computed unconditionally -- even for a gas
+        # with no masking of its own (Ozone), the aux panel can still show
+        # an Aeris trace (e.g. Detector Pressure) that these masks apply to.
+        # Only their use on the *main* plot (shading/notes/cal exclusion) is
+        # gated on has_masking by the caller.
+        cal = (df["j_sol_cals"].fillna(0).astype(bool)
+               | df["j_sol_aircal"].fillna(0).astype(bool))
+
+        bad_pressure = (df["d1_P_mbars"] - D1_P_TARGET_MBARS).abs() > pressure_tol
+        bad_pressure = bad_pressure.fillna(False)
+
+        warmup_end = df["datetime"].iloc[0] + pd.Timedelta(minutes=warmup_minutes)
+        warmup = df["datetime"] < warmup_end
+
+        cal_intervals, cal_points = [], []
+        if has_masking:
+            cal_intervals = merge_close_intervals(
+                find_intervals(df["datetime"], cal), pd.Timedelta(seconds=CAL_MERGE_GAP_S)
+            )
+            # Cal means are estimated from the raw data with these masks
+            # applied -- a cal point can be dropped entirely if its window
+            # has no valid data.
+            cal_points = cal_mean_points(
+                df, cal_intervals, gas["value_col"],
+                (self.cal1_start_spin.value(), self.cal1_end_spin.value()),
+                (self.cal2_start_spin.value(), self.cal2_end_spin.value()),
+                cal_bottles=self.cal_bottles, gas_key=self.current_gas,
+                exclude_mask=bad_pressure | warmup,
+            )
+
+        self._analysis = {
+            "cal": cal, "warmup": warmup, "bad_pressure": bad_pressure,
+            "exclude_mask": bad_pressure | warmup,
+            "cal_intervals": cal_intervals, "cal_points": cal_points,
+            "has_masking": has_masking,
+            "warmup_minutes": warmup_minutes, "pressure_tol": pressure_tol,
+        }
+        return self._analysis
+
+    def redraw(self, preserve_view=False):
+        analysis = self._get_analysis()
+        if analysis is None:
+            return
+        gas = GASES[self.current_gas]
+        value_col = gas["value_col"]
+        has_masking = analysis["has_masking"]
+        warmup_minutes = analysis["warmup_minutes"]
+        pressure_tol = analysis["pressure_tol"]
 
         df = self.df
 
@@ -531,39 +602,15 @@ class UcatsbGui(QMainWindow):
             ax = self.figure.add_subplot(111)
         ax.set_facecolor("#fcfcfb")
 
-        # bad_pressure/warmup are computed unconditionally -- even for a gas
-        # with no masking of its own (Ozone), the aux panel can still show
-        # an Aeris trace (e.g. Detector Pressure) that these masks apply to.
-        # Only their use on the *main* plot (shading/notes/cal exclusion) is
-        # gated on has_masking below.
-        cal = (df["j_sol_cals"].fillna(0).astype(bool)
-               | df["j_sol_aircal"].fillna(0).astype(bool))
-
-        bad_pressure = (df["d1_P_mbars"] - D1_P_TARGET_MBARS).abs() > pressure_tol
-        bad_pressure = bad_pressure.fillna(False)
-
-        warmup_end = df["datetime"].iloc[0] + pd.Timedelta(minutes=warmup_minutes)
-        warmup = df["datetime"] < warmup_end
+        cal = analysis["cal"]
+        warmup = analysis["warmup"]
+        bad_pressure = analysis["bad_pressure"]
+        cal_points = analysis["cal_points"]
 
         if has_masking:
             shade_intervals(ax, df["datetime"], cal, CAL_SHADE_COLOR, alpha=0.3)
             shade_intervals(ax, df["datetime"], warmup, WARMUP_EXCLUDE_COLOR, alpha=0.15)
             shade_intervals(ax, df["datetime"], bad_pressure, PRESSURE_EXCLUDE_COLOR, alpha=0.15)
-
-            cal_intervals = merge_close_intervals(
-                find_intervals(df["datetime"], cal), pd.Timedelta(seconds=CAL_MERGE_GAP_S)
-            )
-            # Cal means are estimated from the raw data with these masks
-            # applied -- a cal point can be dropped entirely if its window
-            # has no valid data.
-            exclude_mask = bad_pressure | warmup
-            cal_points = cal_mean_points(
-                df, cal_intervals, value_col, cal0_window, cal1_window,
-                cal_bottles=self.cal_bottles, gas_key=self.current_gas,
-                exclude_mask=exclude_mask,
-            )
-        else:
-            cal_points = []
 
         plot_data = df[["datetime", value_col]].dropna()
         line, = ax.plot(plot_data["datetime"], plot_data[value_col], color=LINE_COLOR, linewidth=1.2)
