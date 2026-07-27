@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """Interactive UCATS-B timeseries viewer with adjustable data-masking controls.
 
-Left panel: gas selector (CO2/N2O) and masking controls (warm-up exclusion,
-detector pressure filter, and per-bottle calibration mean windows).
-Right panel: the resulting figure.
+Left panel: a Load Data button, gas selector (CO2/N2O), and masking controls
+(warm-up exclusion, detector pressure filter, and per-bottle calibration mean
+windows). Right panel: the resulting figure.
 
-Usage: python3 ucatsb_gui.py <csv_file>
+Usage: python3 ucatsb_gui.py [csv_file]
+
+The CSV can also be picked (or swapped out) from within the GUI via the
+"Load Data" button, so the CLI argument is optional -- run with no argument
+to start empty and load a file from the file browser.
 """
 import copy
 import sys
@@ -16,7 +20,7 @@ import yaml
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
     QGroupBox, QComboBox, QDoubleSpinBox, QSpinBox, QLabel,
-    QButtonGroup, QRadioButton,
+    QButtonGroup, QRadioButton, QPushButton, QFileDialog, QMessageBox,
 )
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg, NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
@@ -109,40 +113,19 @@ def save_config(path: Path, config: dict):
 
 
 class UcatsbGui(QMainWindow):
-    def __init__(self, csv_path: Path, config_path: Path = DEFAULT_CONFIG_PATH):
+    def __init__(self, csv_path: Path = None, config_path: Path = DEFAULT_CONFIG_PATH):
         super().__init__()
-        self.setWindowTitle(f"UCATS-B Viewer - {csv_path.name}")
+        self.setWindowTitle("UCATS-B Viewer")
         self.resize(1300, 750)
 
-        # Detector wiring has changed between flights (e.g. d2 used to carry
-        # a redundant CO/N2O channel, now carries CH4/H2O instead), so don't
-        # assume every column in REQUIRED_COLUMNS exists in a given file.
-        available_cols = set(pd.read_csv(csv_path, nrows=0).columns)
-        missing = [c for c in REQUIRED_COLUMNS if c not in available_cols]
-        if missing:
-            print(f"Note: {csv_path.name} is missing columns {missing}; related features unavailable.")
-        # Read every column, not just REQUIRED_COLUMNS, so the "Other" aux
-        # trace catch-all has the full remaining roster of CSV fields to
-        # offer regardless of what any given flight's schema contains.
-        self.df = pd.read_csv(csv_path)
-        self.df["datetime"] = pd.to_datetime(self.df["datetime"])
-        self.df = drop_presync_rows(self.df)
-
-        self.available_gases = {
-            gas: info for gas, info in GASES.items() if info["value_col"] in available_cols
-        }
-        if not self.available_gases:
-            raise ValueError(f"{csv_path.name} has none of the expected gas columns: "
-                              f"{[g['value_col'] for g in GASES.values()]}")
-
-        # Columns not already exposed via a named control (gas traces, the
-        # named aux options, or masking columns) -- offered through the
-        # "Other" catch-all combo box.
-        self.other_columns = sorted(c for c in self.df.columns if c not in set(REQUIRED_COLUMNS))
+        self.csv_path = None
+        self.df = None
+        self.available_gases = {}
+        self.other_columns = []
 
         self.config_path = config_path
         self.config = load_config(config_path)
-        self.current_gas = next(iter(self.available_gases))
+        self.current_gas = None
         self.aux_selection = "No Figure"
         self.other_column = None
         self._loading = False
@@ -160,14 +143,100 @@ class UcatsbGui(QMainWindow):
         layout.addWidget(self._build_controls(), 0)
         layout.addWidget(self._build_canvas(), 1)
 
-        self._apply_settings_to_controls(self.config[self.current_gas])
         self._initializing = False
-        self.redraw()
+
+        if csv_path is not None:
+            self.load_csv(Path(csv_path))
+
+    def load_csv(self, csv_path: Path):
+        """Load (or replace) the dataset being viewed, refreshing every
+        control that depends on which columns/gases this file has. Raises
+        before touching any existing state if the file can't be read or has
+        none of the expected gas columns, so a bad pick from the file
+        browser leaves whatever was already loaded intact.
+        """
+        csv_path = Path(csv_path)
+
+        # Detector wiring has changed between flights (e.g. d2 used to carry
+        # a redundant CO/N2O channel, now carries CH4/H2O instead), so don't
+        # assume every column in REQUIRED_COLUMNS exists in a given file.
+        available_cols = set(pd.read_csv(csv_path, nrows=0).columns)
+        missing = [c for c in REQUIRED_COLUMNS if c not in available_cols]
+        if missing:
+            print(f"Note: {csv_path.name} is missing columns {missing}; related features unavailable.")
+
+        available_gases = {
+            gas: info for gas, info in GASES.items() if info["value_col"] in available_cols
+        }
+        if not available_gases:
+            raise ValueError(f"{csv_path.name} has none of the expected gas columns: "
+                              f"{[g['value_col'] for g in GASES.values()]}")
+
+        # Read every column, not just REQUIRED_COLUMNS, so the "Other" aux
+        # trace catch-all has the full remaining roster of CSV fields to
+        # offer regardless of what any given flight's schema contains.
+        df = pd.read_csv(csv_path)
+        df["datetime"] = pd.to_datetime(df["datetime"])
+        df = drop_presync_rows(df)
+
+        # Columns not already exposed via a named control (gas traces, the
+        # named aux options, or masking columns) -- offered through the
+        # "Other" catch-all combo box.
+        other_columns = sorted(c for c in df.columns if c not in set(REQUIRED_COLUMNS))
+
+        # Validation above passed -- safe to commit the new dataset now.
+        self.csv_path = csv_path
+        self.df = df
+        self.available_gases = available_gases
+        self.other_columns = other_columns
+        self.current_gas = next(iter(available_gases))
+        self.aux_selection = "No Figure"
+        self.other_column = other_columns[0] if other_columns else None
+
+        self.setWindowTitle(f"UCATS-B Viewer - {csv_path.name}")
+
+        was_initializing = self._initializing
+        self._initializing = True
+
+        self.gas_combo.blockSignals(True)
+        self.gas_combo.clear()
+        self.gas_combo.addItems(available_gases.keys())
+        self.gas_combo.blockSignals(False)
+
+        for name, rb in self.aux_radios.items():
+            rb.setChecked(name == "No Figure")
+        self.other_combo.setEnabled(False)
+
+        self.other_combo.blockSignals(True)
+        self.other_combo.clear()
+        self.other_combo.addItems(other_columns)
+        self.other_combo.blockSignals(False)
+
+        self._apply_settings_to_controls(self.config[self.current_gas])
+        self._initializing = was_initializing
+        if not self._initializing:
+            self.redraw()
+
+    def on_load_data_clicked(self):
+        start_dir = str(self.csv_path.parent) if self.csv_path else str(Path.cwd())
+        path_str, _ = QFileDialog.getOpenFileName(
+            self, "Load UCATS-B CSV", start_dir, "CSV Files (*.csv);;All Files (*)"
+        )
+        if not path_str:
+            return
+        try:
+            self.load_csv(Path(path_str))
+        except (OSError, ValueError, pd.errors.ParserError) as e:
+            QMessageBox.warning(self, "Load Data", f"Could not load {Path(path_str).name}:\n{e}")
 
     def _build_controls(self):
         panel = QWidget()
         panel.setFixedWidth(300)
         vbox = QVBoxLayout(panel)
+
+        load_button = QPushButton("Load Data")
+        load_button.clicked.connect(self.on_load_data_clicked)
+        vbox.addWidget(load_button)
 
         gas_box = QGroupBox("Gas")
         gas_layout = QVBoxLayout(gas_box)
@@ -307,6 +376,8 @@ class UcatsbGui(QMainWindow):
         }
 
     def on_gas_changed(self, new_gas: str):
+        if not new_gas:
+            return
         self.current_gas = new_gas
         self._apply_settings_to_controls(self.config[new_gas])
         if self._initializing:
@@ -314,7 +385,7 @@ class UcatsbGui(QMainWindow):
         self.redraw()
 
     def on_control_changed(self):
-        if self._loading or self._initializing:
+        if self._loading or self._initializing or self.current_gas is None:
             return
         self.config[self.current_gas] = self._controls_to_settings()
         save_config(self.config_path, self.config)
@@ -339,6 +410,8 @@ class UcatsbGui(QMainWindow):
         self.redraw(preserve_view=True)
 
     def redraw(self, preserve_view=False):
+        if self.df is None:
+            return
         gas = GASES[self.current_gas]
         value_col = gas["value_col"]
         warmup_minutes = self.warmup_spin.value()
@@ -498,10 +571,7 @@ class UcatsbGui(QMainWindow):
 
 
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: python3 ucatsb_gui.py <csv_file>", file=sys.stderr)
-        sys.exit(1)
-    csv_path = Path(sys.argv[1])
+    csv_path = Path(sys.argv[1]) if len(sys.argv) > 1 else None
 
     app = QApplication(sys.argv)
     window = UcatsbGui(csv_path)

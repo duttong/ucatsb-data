@@ -8,8 +8,8 @@ Post-flight analysis tools for UCATS-B CSV logs. This is the analysis-side
 companion to `~/code/ucats-b`, which runs on the aircraft and produces
 `ucatsb-YYYYMMDDHH.csv` files (documented in that repo's `config-plot.yaml`
 comment block). This repo does not acquire data — it only reads CSVs already
-on disk, from any flight, passed as a CLI argument (never hardcode a specific
-flight's filename or date).
+on disk, from any flight, passed as a CLI argument or picked via the GUI's
+"Load Data" button (never hardcode a specific flight's filename or date).
 
 ## Requirements
 
@@ -18,7 +18,10 @@ See `requirements.txt`.
 
 ## Running
 
-- `python3 ucatsb_gui.py <csv_file>` — interactive PyQt5 viewer
+- `python3 ucatsb_gui.py [csv_file]` — interactive PyQt5 viewer. The CSV
+  argument is optional; a file can also be (re)picked at any time from
+  within the GUI via the "Load Data" button, so the app can start with no
+  argument at all.
 - `python3 plot_co2_timeseries.py <csv_file>` — static PNG, no GUI
 
 No test suite or CI. Both scripts are read-verified by importing the module
