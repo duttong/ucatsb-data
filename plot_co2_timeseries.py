@@ -15,6 +15,7 @@ RIGHT_AXIS_COLOR = "#8e44ad"   # purple, distinct from the red/orange masking sh
 CAL_SHADE_COLOR = "#898781"
 PRESSURE_EXCLUDE_COLOR = "#d03b3b"
 WARMUP_EXCLUDE_COLOR = "#ffa64d"   # light orange
+POST_CAL_FLUSH_COLOR = "#2fa88a"   # teal, distinct from the warm-up/pressure shades
 CAL0_COLOR = "#eda100"   # golden
 CAL1_COLOR = "#0d366b"   # dark blue
 GRID_COLOR = "#e1e0d9"
@@ -71,6 +72,33 @@ def merge_close_intervals(intervals, gap):
         else:
             merged.append((start, end))
     return merged
+
+
+def post_cal_flush_mask(datetimes, cal_intervals, flush_s, cal_mask=None):
+    """Flag ambient rows within `flush_s` seconds after each cal period ends.
+
+    The detector cells still hold cal gas when the solenoid switches back to
+    ambient, so the air data immediately after an injection reads toward the
+    tank rather than the atmosphere. The width is instrument behaviour, not
+    something derivable from the file, so it is a user control.
+
+    Rows inside a cal period are never flagged, even when one injection
+    follows another closely enough for the flush window to reach into it --
+    those rows are already cal, and double-flagging them would shade the same
+    span twice and confuse the "air we threw away" note.
+
+    Returns an all-False Series (not a scalar) when flush_s is 0, so callers
+    can use it unconditionally.
+    """
+    flagged = pd.Series(False, index=datetimes.index)
+    if not flush_s or not cal_intervals:
+        return flagged
+    width = pd.Timedelta(seconds=flush_s)
+    for _, end in cal_intervals:
+        flagged |= (datetimes > end) & (datetimes <= end + width)
+    if cal_mask is not None:
+        flagged &= ~cal_mask
+    return flagged
 
 
 def shade_intervals(ax, datetimes, mask, color, alpha):
@@ -410,7 +438,7 @@ def cal_mismatch_notes(bottles, gas_key, roster, rel_threshold=0.01):
 
 def calibrate_series(df, value_col, cal_points, cal_bottles, gas_key,
                      model="linear", smooth_window=CAL_DEFAULT_SMOOTH_EVENTS,
-                     roster=None):
+                     roster=None, flush_mask=None, cal_mask=None):
     """Build a time-varying two-point calibration from the per-injection cal
     means and apply it to every row of df[value_col].
 
@@ -428,10 +456,22 @@ def calibrate_series(df, value_col, cal_points, cal_bottles, gas_key,
       slope, intercept, calibrated      -- Series on df.index, NaN where undefined
       extrapolated  Series[bool]        -- outside the INTERSECTION of the two
                                            bottles' node spans, or in a long gap
+      flushed       Series[bool]        -- post-cal flush rows
+      in_cal        Series[bool]        -- rows inside a cal period
+      non_ambient   Series[bool]        -- flushed | in_cal; NaN in
+                                           `calibrated` (see below)
       residuals     [(time, state, closure, loo)]
       loo_rms       {state: float}      -- QC scatter, gas units
       span_gain     float|None
       warnings      [str]
+
+    `calibrated` is the calibrated *ambient* record: `cal_mask` (rows inside a
+    cal period) and `flush_mask` (post_cal_flush_mask) are both blanked from
+    it, as the last step. Neither affects the calibration itself -- the nodes,
+    slope, intercept and residuals are all derived before this point, from the
+    cal-period data `cal_mask` marks. Removing them here rather than in each
+    caller keeps the plotted trace and the exported CSV from ever disagreeing
+    about which rows count as air.
     """
     import statistics
 
@@ -443,7 +483,9 @@ def calibrate_series(df, value_col, cal_points, cal_bottles, gas_key,
             "ok": False, "reason": reason, "mode": None, "bottles": {},
             "low_state": None, "high_state": None,
             "slope": nan_series, "intercept": nan_series, "calibrated": nan_series,
-            "extrapolated": false_series, "residuals": [], "loo_rms": {},
+            "extrapolated": false_series, "flushed": false_series,
+            "in_cal": false_series, "non_ambient": false_series,
+            "residuals": [], "loo_rms": {},
             "span_gain": None, "warnings": [],
         }
 
@@ -541,11 +583,33 @@ def calibrate_series(df, value_col, cal_points, cal_bottles, gas_key,
             "Data is kept, not discarded -- check the tank assignment."
         )
 
+    # Applied last, and only to the output series: `calibrated` is the
+    # calibrated *ambient* record, so everything that isn't atmosphere is
+    # blanked -- the cal gas itself, and the flush behind it while the cells
+    # still hold it. Nothing is lost by this: slope/intercept are still on
+    # every row, so a consumer who wants the calibrated value of a cal period
+    # (to check closure, say) can recompute it.
+    #
+    # The rows stay in the frame as NaN rather than being dropped, so the
+    # trace breaks visibly instead of interpolating over the removed stretch.
+    def _align(mask):
+        if mask is None:
+            return false_series
+        return mask.reindex(df.index).fillna(False).astype(bool)
+
+    flushed = _align(flush_mask)
+    in_cal = _align(cal_mask)
+    non_ambient = flushed | in_cal
+    if non_ambient.any():
+        calibrated = calibrated.mask(non_ambient)
+
     return {
         "ok": True, "reason": None, "mode": mode, "bottles": bottles,
         "low_state": low_state, "high_state": high_state,
         "slope": slope, "intercept": intercept, "calibrated": calibrated,
-        "extrapolated": extrapolated, "residuals": residuals, "loo_rms": loo_rms,
+        "extrapolated": extrapolated, "flushed": flushed,
+        "in_cal": in_cal, "non_ambient": non_ambient,
+        "residuals": residuals, "loo_rms": loo_rms,
         "span_gain": span_gain, "warnings": warnings,
     }
 
@@ -584,6 +648,22 @@ def export_calibrated_csv(path, df, result, value_col, gas_key,
         lines.append(f"# WARNING: {warning}")
     lines.append("# is_extrapolated=True means the calibration was held flat "
                  "past the last cal event of a bottle, or spans a long gap.")
+    flushed = result.get("flushed")
+    in_cal = result.get("in_cal")
+    lines.append(f"# {value_col}_cal is the calibrated AMBIENT record. It is blank "
+                 f"wherever the instrument was not sampling air (is_cal_period or "
+                 f"is_post_cal_flush), and also wherever the raw {value_col} is "
+                 f"itself missing or the calibration is undefined. The raw "
+                 f"{value_col} is left untouched on every row, and cal_slope/"
+                 f"cal_intercept are given for every row, so the calibrated "
+                 f"value of a blanked row can be recomputed if it is wanted.")
+    if in_cal is not None and in_cal.any():
+        lines.append(f"# is_cal_period=True: cal gas was flowing "
+                     f"({int(in_cal.sum())} rows), so it is not air.")
+    if flushed is not None and flushed.any():
+        lines.append(f"# is_post_cal_flush=True: within the post-cal flush window "
+                     f"({int(flushed.sum())} rows) -- the detector was still "
+                     f"clearing cal gas, so the air reading is not yet the atmosphere.")
 
     out = pd.DataFrame({
         "datetime": df["datetime"],
@@ -593,8 +673,14 @@ def export_calibrated_csv(path, df, result, value_col, gas_key,
         "cal_intercept": result["intercept"],
         "is_extrapolated": result["extrapolated"],
     })
+    if flushed is not None:
+        out["is_post_cal_flush"] = flushed
+    # is_cal_period comes from the calibration result rather than the analysis
+    # so it is present even without one -- the header explains a blank
+    # <col>_cal in terms of this column, so it must not be able to go missing.
+    if in_cal is not None:
+        out["is_cal_period"] = in_cal
     if analysis is not None:
-        out["is_cal_period"] = analysis["cal"]
         out["is_masked"] = analysis["exclude_mask"]
 
     with open(path, "w") as fh:

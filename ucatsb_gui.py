@@ -30,9 +30,10 @@ import matplotlib.dates as mdates
 from plot_co2_timeseries import (
     drop_presync_rows, find_intervals, merge_close_intervals,
     shade_intervals, cal_mean_points, load_cal_bottles, load_cal_roster,
-    most_common_serial, mean_std_label, calibrate_series,
+    most_common_serial, mean_std_label, calibrate_series, post_cal_flush_mask,
     plot_calibration_panels, export_calibrated_csv,
     CALS_YAML_PATH, CAL_DRIFT_MODELS, CAL_DEFAULT_SMOOTH_EVENTS,
+    POST_CAL_FLUSH_COLOR,
 )
 
 LINE_COLOR = "#2a78d6"
@@ -65,7 +66,7 @@ GASES = {
 
 REQUIRED_COLUMNS = [
     "datetime", "d1_P_mbars", "d2_P_mbars", "d1_T_gas", "d2_T_gas",
-    "oz_o3", "j_sol_cals", "j_sol_aircal",
+    "j_sol_cals", "j_sol_aircal",
 ] + [g["value_col"] for g in GASES.values()]
 
 # Columns already exposed via a specific named control (gas traces, the
@@ -74,11 +75,13 @@ REQUIRED_COLUMNS = [
 # REQUIRED_COLUMNS: j_sol_cals/j_sol_aircal are required for cal-interval
 # detection but aren't plotted anywhere by name, so they stay selectable
 # via "Other" (e.g. to sanity-check the raw digital flag against a trace).
+# oz_o3 is likewise not a named control -- it's reached through "Other" like
+# any other raw column (the Ozone *gas* trace is oz_o3best, which is named).
 NAMED_TRACE_COLUMNS = {
-    "d1_P_mbars", "d2_P_mbars", "d1_T_gas", "d2_T_gas", "oz_o3",
+    "d1_P_mbars", "d2_P_mbars", "d1_T_gas", "d2_T_gas",
 } | {g["value_col"] for g in GASES.values()}
 
-AUX_OPTIONS = ["No Figure", "Detector Pressure", "T_gas", "oz_o3", "Other"]
+AUX_OPTIONS = ["No Figure", "Detector Pressure", "T_gas", "Other"]
 
 
 def aux_trace_info(selection: str, gas: str, other_column: str = None):
@@ -102,8 +105,6 @@ def aux_trace_info(selection: str, gas: str, other_column: str = None):
             return None
         col = f"{detector}_T_gas"
         return col, f"{col} (°C)"
-    if selection == "oz_o3":
-        return "oz_o3", "O3 (ppb)"
     if selection == "Other":
         if other_column is None:
             return None
@@ -115,6 +116,7 @@ DEFAULT_CONFIG_PATH = Path(__file__).parent / "ucatsb_gui_config.yaml"
 DEFAULT_GAS_SETTINGS = {
     "warmup_min": 30,
     "pressure_tol_mbar": 10.0,
+    "flag_air_s": 0,
     "cal1_window_s": [-15, -1],
     "cal2_window_s": [-15, -1],
     "drift_model": CAL_DRIFT_MODELS[0],
@@ -382,6 +384,24 @@ class UcatsbGui(QMainWindow):
         self.pressure_tol_spin.valueChanged.connect(self.on_control_changed)
         mask_form.addRow(f"Pressure tol\n(±{D1_P_TARGET_MBARS:.0f} mbar target):", self.pressure_tol_spin)
 
+        # Unlike the two masks above, this one does not touch the cal means
+        # (the flush window is ambient by definition, never inside a cal
+        # period) -- it only blanks the calibrated product. Defaults to 0 so
+        # an existing config's output doesn't change until it is asked for.
+        self.flag_air_spin = QSpinBox()
+        # Upper limit is 90 s, not 30: on the Jul 2026 flight the cells were
+        # still ~1 ppm low at 30 s and took ~45 s to settle within 0.2 ppm.
+        self.flag_air_spin.setRange(0, 90)
+        self.flag_air_spin.setSuffix(" s")
+        self.flag_air_spin.setToolTip(
+            "Air data immediately after a cal injection still reads toward the\n"
+            "tank while the detector cells flush. This many seconds after each\n"
+            "cal period end are dropped from the calibrated series and the\n"
+            "export; the raw trace keeps them. 0 disables it."
+        )
+        self.flag_air_spin.valueChanged.connect(self.on_control_changed)
+        mask_form.addRow("Flag Air\n(after cal):", self.flag_air_spin)
+
         vbox.addWidget(self.mask_box)
 
         # Visual order swapped: the 100% bottle box appears above the 50% one.
@@ -502,6 +522,7 @@ class UcatsbGui(QMainWindow):
         self._loading = True
         self.warmup_spin.setValue(settings["warmup_min"])
         self.pressure_tol_spin.setValue(settings["pressure_tol_mbar"])
+        self.flag_air_spin.setValue(settings["flag_air_s"])
         self.cal1_start_spin.setValue(settings["cal1_window_s"][0])
         self.cal1_end_spin.setValue(settings["cal1_window_s"][1])
         self.cal2_start_spin.setValue(settings["cal2_window_s"][0])
@@ -520,6 +541,7 @@ class UcatsbGui(QMainWindow):
         return {
             "warmup_min": self.warmup_spin.value(),
             "pressure_tol_mbar": self.pressure_tol_spin.value(),
+            "flag_air_s": self.flag_air_spin.value(),
             "cal1_window_s": [self.cal1_start_spin.value(), self.cal1_end_spin.value()],
             "cal2_window_s": [self.cal2_start_spin.value(), self.cal2_end_spin.value()],
             "drift_model": self.drift_combo.currentText(),
@@ -678,6 +700,7 @@ class UcatsbGui(QMainWindow):
         has_masking = gas.get("has_masking", True)
         warmup_minutes = self.warmup_spin.value()
         pressure_tol = self.pressure_tol_spin.value()
+        flag_air_s = self.flag_air_spin.value()
 
         # bad_pressure/warmup are computed unconditionally -- even for a gas
         # with no masking of its own (Ozone), the aux panel can still show
@@ -694,9 +717,17 @@ class UcatsbGui(QMainWindow):
         warmup = df["datetime"] < warmup_end
 
         cal_intervals, cal_points = [], []
+        post_cal_flush = pd.Series(False, index=df.index)
         if has_masking:
             cal_intervals = merge_close_intervals(
                 find_intervals(df["datetime"], cal), pd.Timedelta(seconds=CAL_MERGE_GAP_S)
+            )
+            # Deliberately not folded into exclude_mask: this flags *ambient*
+            # rows after an injection, which is disjoint from the cal windows
+            # the means are computed over, and folding it in would suggest it
+            # can drop a cal point (it cannot).
+            post_cal_flush = post_cal_flush_mask(
+                df["datetime"], cal_intervals, flag_air_s, cal_mask=cal
             )
             # Cal means are estimated from the raw data with these masks
             # applied -- a cal point can be dropped entirely if its window
@@ -713,8 +744,10 @@ class UcatsbGui(QMainWindow):
             "cal": cal, "warmup": warmup, "bad_pressure": bad_pressure,
             "exclude_mask": bad_pressure | warmup,
             "cal_intervals": cal_intervals, "cal_points": cal_points,
+            "post_cal_flush": post_cal_flush,
             "has_masking": has_masking,
             "warmup_minutes": warmup_minutes, "pressure_tol": pressure_tol,
+            "flag_air_s": flag_air_s,
         }
         return self._analysis
 
@@ -773,11 +806,15 @@ class UcatsbGui(QMainWindow):
         warmup = analysis["warmup"]
         bad_pressure = analysis["bad_pressure"]
         cal_points = analysis["cal_points"]
+        post_cal_flush = analysis["post_cal_flush"]
 
         if has_masking:
             shade_intervals(ax, df["datetime"], cal, CAL_SHADE_COLOR, alpha=0.3)
             shade_intervals(ax, df["datetime"], warmup, WARMUP_EXCLUDE_COLOR, alpha=0.15)
             shade_intervals(ax, df["datetime"], bad_pressure, PRESSURE_EXCLUDE_COLOR, alpha=0.15)
+            # Shaded whether or not the calibrated trace is showing: the band
+            # is how you find out these rows exist before turning it on.
+            shade_intervals(ax, df["datetime"], post_cal_flush, POST_CAL_FLUSH_COLOR, alpha=0.22)
 
         # The calibrated trace is opt-in; the raw trace stays visible
         # underneath it (faded) so the correction being applied is always
@@ -793,8 +830,15 @@ class UcatsbGui(QMainWindow):
 
         cal_line = None
         if show_cal:
-            cal_df = pd.DataFrame({"datetime": df["datetime"],
-                                   "v": calibration["calibrated"]}).dropna()
+            # The calibrated trace is the *air* record: cal periods and the
+            # flush behind them are blanked by calibrate_series. Those rows are
+            # kept as NaN instead of being dropped, so the line breaks over
+            # them; dropping them would draw a straight segment across each gap
+            # and hide the removal.
+            calibrated = calibration["calibrated"]
+            keep = calibrated.notna() | calibration["non_ambient"]
+            cal_df = pd.DataFrame({"datetime": df["datetime"][keep],
+                                   "v": calibrated[keep]})
             cal_line, = ax.plot(cal_df["datetime"], cal_df["v"],
                                 color=LINE_COLOR, linewidth=1.2)
             for start, end in find_intervals(df["datetime"], calibration["extrapolated"]):
@@ -861,6 +905,14 @@ class UcatsbGui(QMainWindow):
                 notes.append(
                     f"light red = excluded (d1_P_mbars outside {D1_P_TARGET_MBARS:.0f}±{pressure_tol:.2f} mbar)"
                 )
+            if post_cal_flush.any():
+                notes.append(
+                    f"teal = air dropped from calibrated only "
+                    f"({analysis['flag_air_s']} s detector flush after each cal)"
+                )
+            if show_cal:
+                notes.append("calibrated trace = ambient air only "
+                             "(cal periods and flush blanked)")
         if notes:
             ax.text(
                 0.01, 0.98, "\n".join(notes),
@@ -959,7 +1011,8 @@ class UcatsbGui(QMainWindow):
             self.df, GASES[self.current_gas]["value_col"], analysis["cal_points"],
             self.cal_bottles, self.current_gas,
             model=self.drift_model, smooth_window=self.drift_smooth_events,
-            roster=self.cal_roster,
+            roster=self.cal_roster, flush_mask=analysis["post_cal_flush"],
+            cal_mask=analysis["cal"],
         )
         return self._calibration
 

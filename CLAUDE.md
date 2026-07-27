@@ -63,6 +63,34 @@ module so both stay in sync.
 4. `cal_mean_points` averages each cal window (offset in seconds relative to
    the interval's last timestamp, independently configurable per bottle) and
    identifies which physical bottle was flowing.
+5. `post_cal_flush_mask` ("Flag Air") flags the first N seconds of *ambient*
+   data after each cal interval ends — the detector cells are still clearing
+   cal gas, so those rows read toward the tank rather than the atmosphere.
+
+**`calibrate_series`' `calibrated` output is the calibrated AMBIENT record.**
+Both `cal_mask` (rows inside a cal period) and `flush_mask` are blanked from
+it as the very last step, so the calibrated trace and the exported
+`<col>_cal` column contain air and nothing else. Nothing is lost by this:
+`cal_slope`/`cal_intercept` are still emitted on every row, so the calibrated
+value of a cal period can be recomputed by anyone who wants it (to check
+closure, say).
+
+**Neither mask is part of `exclude_mask`, and neither may become part of it.**
+`exclude_mask` feeds `cal_mean_points`; these two are applied *after* the
+calibration is fully derived and touch only the output series. Folding either
+in would corrupt the calibration itself — obviously so for `cal_mask` (the cal
+data *is* the calibration's input), and for the flush because a cal window
+configured to reach past `Cal_p` would then start losing points. Verify after
+touching this: `cal_points`, `loo_rms` and `span_gain` must be identical with
+the flush at 0 s and at 30 s.
+
+Blanked rows stay in the frame as NaN rather than being dropped: `redraw()`
+keeps them (`keep = calibrated.notna() | non_ambient`) precisely so the
+calibrated line **breaks** over each gap. Dropping them would make matplotlib
+draw a straight segment across the removal and hide it. The raw trace keeps
+everything — that contrast is the point of the feature — and the teal flush
+band is shaded whether or not "Show calibrated" is on, since the band is how
+the user finds out those rows exist before turning the overlay on.
 
 Both views read these through `UcatsbGui._get_analysis()`, a cache whose sole
 invalidation site is `refresh()` — the entry point every state change calls.
@@ -248,7 +276,7 @@ never-drawn pane stuck at a stale scale when first opened. The cal tab's own
 ### Config persistence
 
 `ucatsb_gui_config.yaml` (loaded/saved by `load_config`/`save_config`) holds
-one settings block per gas (`warmup_min`, `pressure_tol_mbar`,
+one settings block per gas (`warmup_min`, `pressure_tol_mbar`, `flag_air_s`,
 `cal1_window_s`, `cal2_window_s`, `drift_model`, `drift_smooth_events`),
 auto-saved on every control change via `on_control_changed`.
 `_initializing`/`_loading` flags exist specifically to suppress redraw/save
@@ -263,7 +291,15 @@ silently dropped from the file on the next control change, even though
 `load_config`'s `.update()` appeared to preserve it. Touch all of:
 `DEFAULT_GAS_SETTINGS`, `_controls_to_settings()`,
 `_apply_settings_to_controls()`, and the `setEnabled(has_masking)` list in
-`_select_gas()`.
+`_select_gas()`. (A control added *inside* an existing group box — as
+`flag_air_spin` was, inside `mask_box` — inherits that box's `setEnabled`, so
+only the first three apply; adding a new group box is what requires the
+fourth.)
+
+New masking settings default to a **no-op value** (`flag_air_s: 0`) rather
+than a physically plausible one. `load_config` fills missing keys from
+`DEFAULT_GAS_SETTINGS`, so a non-zero default would silently change the
+output of every already-saved config on first launch after the upgrade.
 
 **Verification scripts must pass `config_path=` to a scratch file.**
 `UcatsbGui` writes the real `ucatsb_gui_config.yaml` on any programmatic
