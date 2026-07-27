@@ -33,6 +33,7 @@ from plot_co2_timeseries import (
 )
 
 LINE_COLOR = "#2a78d6"
+RIGHT_AXIS_COLOR = "#8e44ad"   # purple, distinct from the red/orange masking shades
 CAL_SHADE_COLOR = "#898781"
 PRESSURE_EXCLUDE_COLOR = "#d03b3b"
 WARMUP_EXCLUDE_COLOR = "#ffa64d"   # light orange
@@ -138,13 +139,16 @@ class UcatsbGui(QMainWindow):
         self.current_gas = None
         self.aux_selection = "No Figure"
         self.other_column = None
+        self.right_axis_column = None
         self._loading = False
         self._initializing = True
         self.cal_bottles = load_cal_bottles(CALS_YAML_PATH)
         self.ax = None
         self.ax_aux = None
+        self.ax_aux2 = None
         self._had_aux_panel = None
         self._last_aux_key = None
+        self._last_right_axis_key = None
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -202,6 +206,7 @@ class UcatsbGui(QMainWindow):
         self.current_gas = next(iter(available_gases))
         self.aux_selection = "No Figure"
         self.other_column = other_columns[0] if other_columns else None
+        self.right_axis_column = None
 
         self.setWindowTitle(f"UCATS-B Viewer - {csv_path.name}")
 
@@ -216,11 +221,18 @@ class UcatsbGui(QMainWindow):
         for name, rb in self.aux_radios.items():
             rb.setChecked(name == "No Figure")
         self.other_combo.setEnabled(False)
+        self.right_axis_combo.setEnabled(False)
 
         self.other_combo.blockSignals(True)
         self.other_combo.clear()
         self.other_combo.addItems(other_columns)
         self.other_combo.blockSignals(False)
+
+        self.right_axis_combo.blockSignals(True)
+        self.right_axis_combo.clear()
+        self.right_axis_combo.addItem("(none)")
+        self.right_axis_combo.addItems(other_columns)
+        self.right_axis_combo.blockSignals(False)
 
         self._apply_settings_to_controls(self.config[self.current_gas])
         self._initializing = was_initializing
@@ -274,6 +286,14 @@ class UcatsbGui(QMainWindow):
         self.other_combo.setEnabled(False)
         self.other_combo.currentTextChanged.connect(self.on_other_changed)
         aux_layout.addWidget(self.other_combo)
+
+        aux_layout.addWidget(QLabel("Right axis:"))
+        self.right_axis_combo = QComboBox()
+        self.right_axis_combo.addItem("(none)")
+        self.right_axis_combo.addItems(self.other_columns)
+        self.right_axis_combo.setEnabled(False)
+        self.right_axis_combo.currentTextChanged.connect(self.on_right_axis_changed)
+        aux_layout.addWidget(self.right_axis_combo)
 
         vbox.addWidget(aux_box)
 
@@ -409,6 +429,9 @@ class UcatsbGui(QMainWindow):
                 self.aux_selection = name
                 break
         self.other_combo.setEnabled(self.aux_selection == "Other")
+        # The right-axis trace twins whatever's on the aux panel, so it only
+        # makes sense once that panel exists at all.
+        self.right_axis_combo.setEnabled(self.aux_selection != "No Figure")
         if self._initializing:
             return
         self.redraw(preserve_view=True)
@@ -416,6 +439,12 @@ class UcatsbGui(QMainWindow):
     def on_other_changed(self, text: str):
         self.other_column = text or None
         if self._initializing or self.aux_selection != "Other":
+            return
+        self.redraw(preserve_view=True)
+
+    def on_right_axis_changed(self, text: str):
+        self.right_axis_column = None if text in ("", "(none)") else text
+        if self._initializing:
             return
         self.redraw(preserve_view=True)
 
@@ -434,6 +463,10 @@ class UcatsbGui(QMainWindow):
         aux_info = aux_trace_info(self.aux_selection, self.current_gas, self.other_column)
         has_aux_panel = aux_info is not None
         aux_key = (self.aux_selection, self.other_column)
+        # The right-axis trace twins the aux panel, so it can only appear
+        # alongside one.
+        has_right_axis = has_aux_panel and self.right_axis_column is not None
+        right_axis_key = self.right_axis_column if has_right_axis else None
 
         # Capture the current view before tearing down the old Axes, so a
         # masking/averaging control change -- or switching/adding/removing
@@ -442,14 +475,19 @@ class UcatsbGui(QMainWindow):
         # still showing the same trace (its scale means something different
         # for a different trace, so let that one re-autoscale) -- for
         # "Other" that also means the same catch-all column, not just the
-        # same radio button.
+        # same radio button. The right-axis trace is tracked independently
+        # since it can change without the left trace changing (or vice versa).
         old_main_view = None
         old_aux_ylim = None
+        old_right_ylim = None
         if preserve_view and self.ax is not None:
             old_main_view = (self.ax.get_xlim(), self.ax.get_ylim())
             if (self.ax_aux is not None and has_aux_panel
                     and self._last_aux_key == aux_key):
                 old_aux_ylim = self.ax_aux.get_ylim()
+            if (self.ax_aux2 is not None and has_right_axis
+                    and self._last_right_axis_key == right_axis_key):
+                old_right_ylim = self.ax_aux2.get_ylim()
 
         self.figure.clear()
         if has_aux_panel:
@@ -543,6 +581,7 @@ class UcatsbGui(QMainWindow):
                 color=MUTED_COLOR, fontsize=9,
             )
 
+        ax_aux2 = None
         if ax_aux is not None:
             aux_col, aux_ylabel = aux_info
             ax_aux.set_facecolor("#fcfcfb")
@@ -550,7 +589,7 @@ class UcatsbGui(QMainWindow):
             shade_intervals(ax_aux, df["datetime"], bad_pressure, PRESSURE_EXCLUDE_COLOR, alpha=0.15)
 
             aux_data = df[["datetime", aux_col]].dropna()
-            ax_aux.plot(aux_data["datetime"], aux_data[aux_col], color=LINE_COLOR, linewidth=1.0)
+            aux_line, = ax_aux.plot(aux_data["datetime"], aux_data[aux_col], color=LINE_COLOR, linewidth=1.0)
 
             ax_aux.set_ylabel(aux_ylabel, color=TEXT_COLOR, fontsize=9)
             aux_title = self.other_column if self.aux_selection == "Other" else self.aux_selection
@@ -559,6 +598,24 @@ class UcatsbGui(QMainWindow):
             for spine in ax_aux.spines.values():
                 spine.set_color(AXIS_COLOR)
             ax_aux.tick_params(colors=MUTED_COLOR, labelsize=8, labelbottom=False)
+
+            aux_handles = [aux_line]
+            aux_labels = [aux_col]
+            if has_right_axis:
+                ax_aux2 = ax_aux.twinx()
+                right_data = df[["datetime", self.right_axis_column]].dropna()
+                right_line, = ax_aux2.plot(
+                    right_data["datetime"], right_data[self.right_axis_column],
+                    color=RIGHT_AXIS_COLOR, linewidth=1.0,
+                )
+                ax_aux2.set_ylabel(self.right_axis_column, color=RIGHT_AXIS_COLOR, fontsize=9)
+                ax_aux2.spines["right"].set_color(RIGHT_AXIS_COLOR)
+                ax_aux2.tick_params(axis="y", colors=RIGHT_AXIS_COLOR, labelsize=8)
+                aux_handles.append(right_line)
+                aux_labels.append(self.right_axis_column)
+
+            if has_right_axis:
+                ax_aux.legend(aux_handles, aux_labels, loc="upper right", fontsize=8, framealpha=0.9)
 
         # The new Axes were just built and auto-scaled to the full data
         # range -- reset the toolbar's view stack so Home returns to *this*
@@ -571,11 +628,15 @@ class UcatsbGui(QMainWindow):
             ax.set_ylim(old_main_view[1])
         if old_aux_ylim is not None and ax_aux is not None:
             ax_aux.set_ylim(old_aux_ylim)
+        if old_right_ylim is not None and ax_aux2 is not None:
+            ax_aux2.set_ylim(old_right_ylim)
 
         self.ax = ax
         self.ax_aux = ax_aux
+        self.ax_aux2 = ax_aux2
         self._had_aux_panel = has_aux_panel
         self._last_aux_key = aux_key
+        self._last_right_axis_key = right_axis_key
 
         self.canvas.draw()
 
