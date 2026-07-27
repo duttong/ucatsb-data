@@ -50,17 +50,19 @@ GASES = {
 
 REQUIRED_COLUMNS = [
     "datetime", "d1_P_mbars", "d2_P_mbars", "d1_T_gas", "d2_T_gas",
-    "oz_o3", "oz_p", "oz_t", "j_sol_cals", "j_sol_aircal",
+    "oz_o3", "j_sol_cals", "j_sol_aircal",
 ] + [g["value_col"] for g in GASES.values()]
 
-AUX_OPTIONS = ["No Figure", "Detector Pressure", "T_gas", "oz_o3", "oz_p", "oz_t"]
+AUX_OPTIONS = ["No Figure", "Detector Pressure", "T_gas", "oz_o3", "Other"]
 
 
-def aux_trace_info(selection: str, gas: str):
+def aux_trace_info(selection: str, gas: str, other_column: str = None):
     """Return (column, ylabel) for the chosen auxiliary trace, given which
     detector the active gas comes from (CO2/N2O -> d1, CH4 -> d2 -- d2 used
     to carry a redundant CO/N2O channel but now carries CH4/H2O instead), or
-    None for "No Figure".
+    None for "No Figure". "Other" plots whatever column the catch-all combo
+    box is set to (its units are unknown, so the column name doubles as the
+    ylabel); None if no column is selected yet.
     """
     detector = GASES[gas]["detector"]
     if selection == "Detector Pressure":
@@ -71,10 +73,10 @@ def aux_trace_info(selection: str, gas: str):
         return col, f"{col} (°C)"
     if selection == "oz_o3":
         return "oz_o3", "O3 (ppb)"
-    if selection == "oz_p":
-        return "oz_p", "Ozone P (mbar)"
-    if selection == "oz_t":
-        return "oz_t", "Ozone T (°C)"
+    if selection == "Other":
+        if other_column is None:
+            return None
+        return other_column, other_column
     return None
 
 DEFAULT_CONFIG_PATH = Path(__file__).parent / "ucatsb_gui_config.yaml"
@@ -119,7 +121,10 @@ class UcatsbGui(QMainWindow):
         missing = [c for c in REQUIRED_COLUMNS if c not in available_cols]
         if missing:
             print(f"Note: {csv_path.name} is missing columns {missing}; related features unavailable.")
-        self.df = pd.read_csv(csv_path, usecols=[c for c in REQUIRED_COLUMNS if c in available_cols])
+        # Read every column, not just REQUIRED_COLUMNS, so the "Other" aux
+        # trace catch-all has the full remaining roster of CSV fields to
+        # offer regardless of what any given flight's schema contains.
+        self.df = pd.read_csv(csv_path)
         self.df["datetime"] = pd.to_datetime(self.df["datetime"])
         self.df = drop_presync_rows(self.df)
 
@@ -130,17 +135,23 @@ class UcatsbGui(QMainWindow):
             raise ValueError(f"{csv_path.name} has none of the expected gas columns: "
                               f"{[g['value_col'] for g in GASES.values()]}")
 
+        # Columns not already exposed via a named control (gas traces, the
+        # named aux options, or masking columns) -- offered through the
+        # "Other" catch-all combo box.
+        self.other_columns = sorted(c for c in self.df.columns if c not in set(REQUIRED_COLUMNS))
+
         self.config_path = config_path
         self.config = load_config(config_path)
         self.current_gas = next(iter(self.available_gases))
         self.aux_selection = "No Figure"
+        self.other_column = None
         self._loading = False
         self._initializing = True
         self.cal_bottles = load_cal_bottles(CALS_YAML_PATH)
         self.ax = None
         self.ax_aux = None
         self._had_aux_panel = None
-        self._last_aux_selection = None
+        self._last_aux_key = None
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -178,6 +189,13 @@ class UcatsbGui(QMainWindow):
             self.aux_group.addButton(rb)
             aux_layout.addWidget(rb)
             self.aux_radios[name] = rb
+
+        self.other_combo = QComboBox()
+        self.other_combo.addItems(self.other_columns)
+        self.other_combo.setEnabled(False)
+        self.other_combo.currentTextChanged.connect(self.on_other_changed)
+        aux_layout.addWidget(self.other_combo)
+
         vbox.addWidget(aux_box)
 
         mask_box = QGroupBox("Data Masking")
@@ -309,7 +327,14 @@ class UcatsbGui(QMainWindow):
             if rb.isChecked():
                 self.aux_selection = name
                 break
+        self.other_combo.setEnabled(self.aux_selection == "Other")
         if self._initializing:
+            return
+        self.redraw(preserve_view=True)
+
+    def on_other_changed(self, text: str):
+        self.other_column = text or None
+        if self._initializing or self.aux_selection != "Other":
             return
         self.redraw(preserve_view=True)
 
@@ -323,21 +348,24 @@ class UcatsbGui(QMainWindow):
 
         df = self.df
 
-        aux_info = aux_trace_info(self.aux_selection, self.current_gas)
+        aux_info = aux_trace_info(self.aux_selection, self.current_gas, self.other_column)
         has_aux_panel = aux_info is not None
+        aux_key = (self.aux_selection, self.other_column)
 
         # Capture the current view before tearing down the old Axes, so a
         # masking/averaging control change -- or switching/adding/removing
         # the upper trace -- can redraw without rescaling the main plot.
         # The aux panel's own y-range is only worth preserving if it's
         # still showing the same trace (its scale means something different
-        # for a different trace, so let that one re-autoscale).
+        # for a different trace, so let that one re-autoscale) -- for
+        # "Other" that also means the same catch-all column, not just the
+        # same radio button.
         old_main_view = None
         old_aux_ylim = None
         if preserve_view and self.ax is not None:
             old_main_view = (self.ax.get_xlim(), self.ax.get_ylim())
             if (self.ax_aux is not None and has_aux_panel
-                    and self._last_aux_selection == self.aux_selection):
+                    and self._last_aux_key == aux_key):
                 old_aux_ylim = self.ax_aux.get_ylim()
 
         self.figure.clear()
@@ -442,7 +470,8 @@ class UcatsbGui(QMainWindow):
             ax_aux.plot(aux_data["datetime"], aux_data[aux_col], color=LINE_COLOR, linewidth=1.0)
 
             ax_aux.set_ylabel(aux_ylabel, color=TEXT_COLOR, fontsize=9)
-            ax_aux.set_title(self.aux_selection, color=TEXT_COLOR, loc="left", fontsize=10)
+            aux_title = self.other_column if self.aux_selection == "Other" else self.aux_selection
+            ax_aux.set_title(aux_title, color=TEXT_COLOR, loc="left", fontsize=10)
             ax_aux.grid(True, color=GRID_COLOR, linewidth=0.6)
             for spine in ax_aux.spines.values():
                 spine.set_color(AXIS_COLOR)
@@ -463,7 +492,7 @@ class UcatsbGui(QMainWindow):
         self.ax = ax
         self.ax_aux = ax_aux
         self._had_aux_panel = has_aux_panel
-        self._last_aux_selection = self.aux_selection
+        self._last_aux_key = aux_key
 
         self.canvas.draw()
 
