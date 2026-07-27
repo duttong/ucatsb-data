@@ -57,6 +57,16 @@ REQUIRED_COLUMNS = [
     "oz_o3", "j_sol_cals", "j_sol_aircal",
 ] + [g["value_col"] for g in GASES.values()]
 
+# Columns already exposed via a specific named control (gas traces, the
+# named aux radio options) -- excluded from the "Other" catch-all combo box
+# since picking them there would be redundant. This is a narrower set than
+# REQUIRED_COLUMNS: j_sol_cals/j_sol_aircal are required for cal-interval
+# detection but aren't plotted anywhere by name, so they stay selectable
+# via "Other" (e.g. to sanity-check the raw digital flag against a trace).
+NAMED_TRACE_COLUMNS = {
+    "d1_P_mbars", "d2_P_mbars", "d1_T_gas", "d2_T_gas", "oz_o3",
+} | {g["value_col"] for g in GASES.values()}
+
 AUX_OPTIONS = ["No Figure", "Detector Pressure", "T_gas", "oz_o3", "Other"]
 
 
@@ -179,10 +189,10 @@ class UcatsbGui(QMainWindow):
         df["datetime"] = pd.to_datetime(df["datetime"])
         df = drop_presync_rows(df)
 
-        # Columns not already exposed via a named control (gas traces, the
-        # named aux options, or masking columns) -- offered through the
-        # "Other" catch-all combo box.
-        other_columns = sorted(c for c in df.columns if c not in set(REQUIRED_COLUMNS))
+        # Columns not already exposed via a named control -- offered through
+        # the "Other" catch-all combo box. "datetime" is excluded too since
+        # it's never a meaningful y-trace.
+        other_columns = sorted(c for c in df.columns if c not in NAMED_TRACE_COLUMNS and c != "datetime")
 
         # Validation above passed -- safe to commit the new dataset now.
         self.csv_path = csv_path
