@@ -550,6 +550,59 @@ def calibrate_series(df, value_col, cal_points, cal_bottles, gas_key,
     }
 
 
+def export_calibrated_csv(path, df, result, value_col, gas_key,
+                          source_path=None, settings=None, analysis=None):
+    """Write the calibrated series with its provenance and per-row flags.
+
+    Every row is written, flagged, rather than pre-filtering to ambient: the
+    consumer can filter, but silently dropping rows from a calibration
+    product would hide what was excluded and why. The leading `#` comment
+    block records what produced the numbers -- read it back with
+    pd.read_csv(path, comment="#").
+    """
+    import datetime as _dt
+
+    lines = [
+        f"# UCATS-B calibrated {gas_key}",
+        f"# generated: {_dt.datetime.now().isoformat(timespec='seconds')}",
+        f"# source: {source_path or 'unknown'}",
+        f"# column: {value_col}  mode: {result['mode']}",
+    ]
+    for state, info in sorted(result["bottles"].items()):
+        lines.append(
+            f"# cal state {state}: serial={info['serial']} "
+            f"assigned={info['assigned']} unc={info['assigned_unc']} "
+            f"events={len(info['times'])} rejected={len(info['rejected'])}"
+        )
+    if result.get("span_gain") is not None:
+        lines.append(f"# span gain: {result['span_gain']:.6f}")
+    for state, rms in sorted(result.get("loo_rms", {}).items()):
+        lines.append(f"# leave-one-out RMS, state {state}: {rms:.6f}")
+    if settings:
+        lines.append("# settings: " + ", ".join(f"{k}={v}" for k, v in sorted(settings.items())))
+    for warning in result.get("warnings", []):
+        lines.append(f"# WARNING: {warning}")
+    lines.append("# is_extrapolated=True means the calibration was held flat "
+                 "past the last cal event of a bottle, or spans a long gap.")
+
+    out = pd.DataFrame({
+        "datetime": df["datetime"],
+        value_col: df[value_col],
+        f"{value_col}_cal": result["calibrated"],
+        "cal_slope": result["slope"],
+        "cal_intercept": result["intercept"],
+        "is_extrapolated": result["extrapolated"],
+    })
+    if analysis is not None:
+        out["is_cal_period"] = analysis["cal"]
+        out["is_masked"] = analysis["exclude_mask"]
+
+    with open(path, "w") as fh:
+        fh.write("\n".join(lines) + "\n")
+        out.to_csv(fh, index=False)
+    return path
+
+
 def _shade_flagged(ax, datetimes, mask, color=CAL_SHADE_COLOR):
     """Hatch-shade extrapolated/untrustworthy spans. Hatching (rather than a
     plain fill) keeps these visually distinct from the timeseries plot's

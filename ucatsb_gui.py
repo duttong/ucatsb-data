@@ -21,7 +21,7 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
     QGroupBox, QComboBox, QDoubleSpinBox, QSpinBox, QLabel,
     QButtonGroup, QRadioButton, QPushButton, QFileDialog, QMessageBox,
-    QTabWidget,
+    QTabWidget, QCheckBox,
 )
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg, NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
@@ -31,7 +31,7 @@ from plot_co2_timeseries import (
     drop_presync_rows, find_intervals, merge_close_intervals,
     shade_intervals, cal_mean_points, load_cal_bottles, load_cal_roster,
     most_common_serial, mean_std_label, calibrate_series,
-    plot_calibration_panels,
+    plot_calibration_panels, export_calibrated_csv,
     CALS_YAML_PATH, CAL_DRIFT_MODELS, CAL_DEFAULT_SMOOTH_EVENTS,
 )
 
@@ -194,6 +194,7 @@ class UcatsbGui(QMainWindow):
         self._calibration = None
         self.drift_model = DEFAULT_GAS_SETTINGS["drift_model"]
         self.drift_smooth_events = DEFAULT_GAS_SETTINGS["drift_smooth_events"]
+        self.show_calibrated = False
         self._dirty = {"main": True, "cal": True}
         self._preserve = {"main": False, "cal": False}
         self.cal_bottles = load_cal_bottles(CALS_YAML_PATH)
@@ -383,6 +384,35 @@ class UcatsbGui(QMainWindow):
             vbox, "Cal 1 Mean Window"
         )
 
+        self.cal_box = QGroupBox("Calibration")
+        cal_form = QFormLayout(self.cal_box)
+
+        self.drift_combo = QComboBox()
+        self.drift_combo.addItems(CAL_DRIFT_MODELS)
+        self.drift_combo.currentTextChanged.connect(self.on_control_changed)
+        cal_form.addRow("Drift model:", self.drift_combo)
+
+        self.smooth_spin = QSpinBox()
+        self.smooth_spin.setRange(2, 21)
+        self.smooth_spin.setSuffix(" events")
+        self.smooth_spin.valueChanged.connect(self.on_control_changed)
+        cal_form.addRow("Smooth over:", self.smooth_spin)
+
+        # Session-only, deliberately not persisted and off by default: the
+        # timeseries is documented as showing uncalibrated data, and a
+        # remembered toggle would let the app start up showing calibrated
+        # data with no visible reason why.
+        self.calibrated_check = QCheckBox("Show calibrated on main plot")
+        self.calibrated_check.toggled.connect(self.on_calibrated_toggled)
+        cal_form.addRow(self.calibrated_check)
+
+        self.export_button = QPushButton("Export calibrated CSV…")
+        self.export_button.clicked.connect(self.on_export_clicked)
+        self.export_button.setEnabled(False)
+        cal_form.addRow(self.export_button)
+
+        vbox.addWidget(self.cal_box)
+
         vbox.addWidget(QLabel(
             "Cal windows are relative to the last\n"
             "point in a cal period (Cal_p), e.g.\n"
@@ -466,14 +496,24 @@ class UcatsbGui(QMainWindow):
         self.cal1_end_spin.setValue(settings["cal1_window_s"][1])
         self.cal2_start_spin.setValue(settings["cal2_window_s"][0])
         self.cal2_end_spin.setValue(settings["cal2_window_s"][1])
+        self.drift_combo.setCurrentText(settings["drift_model"])
+        self.smooth_spin.setValue(settings["drift_smooth_events"])
+        self.drift_model = settings["drift_model"]
+        self.drift_smooth_events = settings["drift_smooth_events"]
+        self.smooth_spin.setEnabled(settings["drift_model"] == "smooth")
         self._loading = False
 
     def _controls_to_settings(self) -> dict:
+        """Every persisted setting must be listed here: on_control_changed
+        assigns this dict wholesale, so anything missing is silently dropped
+        from the config on the next control change."""
         return {
             "warmup_min": self.warmup_spin.value(),
             "pressure_tol_mbar": self.pressure_tol_spin.value(),
             "cal1_window_s": [self.cal1_start_spin.value(), self.cal1_end_spin.value()],
             "cal2_window_s": [self.cal2_start_spin.value(), self.cal2_end_spin.value()],
+            "drift_model": self.drift_combo.currentText(),
+            "drift_smooth_events": self.smooth_spin.value(),
         }
 
     def _select_gas(self, gas: str):
@@ -486,6 +526,7 @@ class UcatsbGui(QMainWindow):
         self.mask_box.setEnabled(has_masking)
         self.cal1_box.setEnabled(has_masking)
         self.cal2_box.setEnabled(has_masking)
+        self.cal_box.setEnabled(has_masking)
         if has_masking:
             self._apply_settings_to_controls(self.config[gas])
 
@@ -500,9 +541,43 @@ class UcatsbGui(QMainWindow):
     def on_control_changed(self):
         if self._loading or self._initializing or self.current_gas is None:
             return
-        self.config[self.current_gas] = self._controls_to_settings()
+        settings = self._controls_to_settings()
+        self.config[self.current_gas] = settings
+        self.drift_model = settings["drift_model"]
+        self.drift_smooth_events = settings["drift_smooth_events"]
+        self.smooth_spin.setEnabled(self.drift_model == "smooth")
         save_config(self.config_path, self.config)
         self.refresh(preserve_view=True)
+
+    def on_calibrated_toggled(self, checked):
+        self.show_calibrated = checked
+        if self._loading or self._initializing:
+            return
+        self.refresh(preserve_view=True)
+
+    def on_export_clicked(self):
+        result = self._get_calibration()
+        if not (result and result.get("ok")):
+            return
+        default = ""
+        if self.csv_path:
+            default = str(self.csv_path.with_name(
+                f"{self.csv_path.stem}_{self.current_gas}_calibrated.csv"))
+        path_str, _ = QFileDialog.getSaveFileName(
+            self, "Export calibrated CSV", default, "CSV Files (*.csv);;All Files (*)")
+        if not path_str:
+            return
+        try:
+            export_calibrated_csv(
+                Path(path_str), self.df, result,
+                GASES[self.current_gas]["value_col"], self.current_gas,
+                self.csv_path, self._controls_to_settings(),
+                analysis=self._get_analysis(),
+            )
+        except OSError as e:
+            QMessageBox.warning(self, "Export", f"Could not write {path_str}:\n{e}")
+        else:
+            QMessageBox.information(self, "Export", f"Wrote {path_str}")
 
     def on_aux_changed(self, checked: bool):
         if not checked:
@@ -694,8 +769,27 @@ class UcatsbGui(QMainWindow):
             shade_intervals(ax, df["datetime"], warmup, WARMUP_EXCLUDE_COLOR, alpha=0.15)
             shade_intervals(ax, df["datetime"], bad_pressure, PRESSURE_EXCLUDE_COLOR, alpha=0.15)
 
+        # The calibrated trace is opt-in; the raw trace stays visible
+        # underneath it (faded) so the correction being applied is always
+        # legible rather than silently swapped in.
+        calibration = self._get_calibration() if self.show_calibrated else None
+        show_cal = bool(calibration and calibration.get("ok"))
+        self.export_button.setEnabled(bool(
+            (self._get_calibration() or {}).get("ok") if has_masking else False))
+
         plot_data = df[["datetime", value_col]].dropna()
-        line, = ax.plot(plot_data["datetime"], plot_data[value_col], color=LINE_COLOR, linewidth=1.2)
+        line, = ax.plot(plot_data["datetime"], plot_data[value_col], color=LINE_COLOR,
+                        linewidth=1.2, alpha=0.35 if show_cal else 1.0)
+
+        cal_line = None
+        if show_cal:
+            cal_df = pd.DataFrame({"datetime": df["datetime"],
+                                   "v": calibration["calibrated"]}).dropna()
+            cal_line, = ax.plot(cal_df["datetime"], cal_df["v"],
+                                color=LINE_COLOR, linewidth=1.2)
+            for start, end in find_intervals(df["datetime"], calibration["extrapolated"]):
+                ax.axvspan(start, end, facecolor="none", edgecolor=CAL_SHADE_COLOR,
+                           hatch="///", alpha=0.30, linewidth=0)
 
         # cal0_pts/cal1_pts are guaranteed empty when has_masking is False
         # (cal_points == []), so cal0_label/cal1_label are never read below
@@ -709,7 +803,12 @@ class UcatsbGui(QMainWindow):
             self.cal2_box.setTitle(self._cal_box_title(cal1_label, "Cal 2 Mean Window"))
 
         handles = [line]
-        labels = [f"{gas['ylabel']} (ambient)"]
+        # Kept short when both traces are shown -- the y-axis already names
+        # the gas, and a four-entry legend clips against the axes edge.
+        labels = ["raw (ambient)" if show_cal else f"{gas['ylabel']} (ambient)"]
+        if cal_line is not None:
+            handles.append(cal_line)
+            labels.append(f"calibrated ({calibration['mode']})")
         if cal0_pts:
             xs, ys = zip(*cal0_pts)
             handles.append(ax.scatter(xs, ys, color=CAL0_COLOR, s=40, zorder=5, edgecolors="none"))
@@ -720,7 +819,11 @@ class UcatsbGui(QMainWindow):
             labels.append(f"{cal1_label}: {mean_std_label(ys)}")
 
         ax.set_ylabel(gas["ylabel"], color=TEXT_COLOR)
-        ax.set_title(gas["title"], color=TEXT_COLOR, loc="left")
+        # Substituted, not appended: the stock title already says
+        # "(uncalibrated)", which would otherwise contradict the suffix.
+        title = gas["title"].replace("(uncalibrated)", "(calibrated)") if show_cal \
+            else gas["title"]
+        ax.set_title(title, color=TEXT_COLOR, loc="left")
 
         date_str = plot_data["datetime"].iloc[0].strftime("%Y-%m-%d") if not plot_data.empty else ""
         ax.set_xlabel(f"Time (UTC-ish, {date_str})", color=MUTED_COLOR)
