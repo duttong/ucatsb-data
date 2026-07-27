@@ -37,8 +37,9 @@ name/CLI, its functions are gas-agnostic) and also a standalone CLI producing
 one fixed CO2 figure. `ucatsb_gui.py` imports from it rather than
 duplicating: `drop_presync_rows`, `find_intervals`, `merge_close_intervals`,
 `shade_intervals`, `cal_mean_points`, `load_cal_bottles`, `most_common_serial`,
-`mean_std_label`, `CALS_YAML_PATH`. Any change to masking/cal-detection
-behavior belongs in that shared module so both stay in sync.
+`mean_std_label`, `CALS_YAML_PATH`, plus the calibration functions below. Any
+change to masking/cal-detection/calibration behavior belongs in that shared
+module so both stay in sync.
 
 ### Data pipeline (per redraw)
 
@@ -62,6 +63,73 @@ behavior belongs in that shared module so both stay in sync.
 4. `cal_mean_points` averages each cal window (offset in seconds relative to
    the interval's last timestamp, independently configurable per bottle) and
    identifies which physical bottle was flowing.
+
+Both views read these through `UcatsbGui._get_analysis()`, a cache whose sole
+invalidation site is `refresh()` — the entry point every state change calls.
+It invalidates unconditionally rather than comparing a composite key of
+(file, gas, warm-up, tolerance, cal windows, drift model): such a key is easy
+to get subtly wrong and then serves a stale plot. The recompute is
+milliseconds against ~100 ms of rendering.
+
+### Calibration: drift removal and calibration are ONE step
+
+`calibrate_series` builds a time-varying two-point calibration from the
+per-injection means `cal_mean_points` already produces (it does **not**
+re-average, and the 4-tuple those come back as is load-bearing — four unpack
+sites depend on it). Each bottle's *measured response* is interpolated in
+time, and at every ambient timestamp:
+
+    slope(t)     = (A_hi - A_lo) / (R_hi(t) - R_lo(t))
+    intercept(t) = A_lo - slope(t) * R_lo(t)
+    calibrated   = slope(t) * measured(t) + intercept(t)
+
+Slow drift falls out automatically because the cal responses themselves carry
+it — there is no separate detrending pass, and adding one would double-count.
+A two-point (slope + intercept) form is required rather than a simple offset:
+the measured span error is several percent (span gain 0.96 on the Jul 2026
+flight, 1.06 on Feb 2025), so gain must be corrected too.
+
+Non-obvious properties, each of which has bitten a plausible implementation:
+
+- **QC scatter is leave-one-out, not residual-about-the-model.** The default
+  `linear` drift model interpolates *through* every node, so its residual at
+  each node is identically zero — useless as a quality metric. `loo_residuals`
+  predicts each node from that bottle's *other* nodes instead, which also
+  cancels genuine slow drift (both neighbours share it). The plain closure
+  residual is still computed and plotted, but as a self-consistency check
+  that should read ~0 under `linear`; a non-zero value there is a bug signal.
+- **The trustworthy region is the INTERSECTION of the two bottles' node
+  spans**, not "first to last cal event". A bottle can lose points to masking
+  while the other keeps going. In the partial-overlap region one bottle
+  interpolates while the other is flat-held, so it is flagged `extrapolated`
+  along with the true edges and any anomalously long node gap.
+- **Nodes are filtered for serial consistency.** `cal_bottle_series` rejects a
+  point whose matched serial disagrees with its state's consensus: its window
+  straddled a solenoid transition and it measured the *other* tank. This is
+  real — a 374.66 ppm point tagged to the ~206 ppm bottle appears in the Feb
+  2025 file with masking off, and would corrupt the calibration either side.
+- **`interp_hold` reindexes via a union index** because the datetime column
+  contains duplicate timestamps (1435 in one test file). Building a Series
+  *from* a duplicated label set raises; reindexing *by* one is fine.
+- **numpy is deliberately not used.** The full interpolation is ~9 ms, next to
+  ~100 ms of rendering. The pandas path handles the datetime index, duplicate
+  labels and the edge-hold policy declaratively.
+
+`cal_mismatch_notes` is **advisory only and must never auto-substitute a
+tank.** `cals.yaml` describes the *current* run, so applying it to an older
+flight can silently use the wrong tank — it correctly flags `CC302489` on the
+Feb 2025 flight. But the same nearest-roster-tank heuristic misfires where the
+offset is real gain error (it names `DT0040700` on Jul 2026), so `span_gain`
+is reported beside it and the wording only ever asks the reader to check.
+`load_cal_roster` (all tanks) exists solely to feed this; bottle *matching*
+still uses `load_cal_bottles` (the two plumbed tanks) for the reason in the
+section below.
+
+Gases with `has_masking=False` (Ozone) short-circuit to `ok=False` with a
+displayable `reason` before any pandas work, as do "no cal events survive the
+current masking" and "no assigned value for this gas". A flight with only one
+usable bottle degrades to an offset-only correction (`mode="offset"`,
+`slope≡1`) rather than refusing, but says so in the header and the legend.
 
 ### cals.yaml: full tank roster + a per-run cal0/cal1 assignment
 
@@ -131,7 +199,11 @@ missing from a given file's schema.
 
 Data is plotted **uncalibrated** (`d1_CO2_ppm`, `d1_N2O_ppb`, `d2_CH4_ppb`),
 not the `*c_ppm`/`*c_ppb` calibrated columns — this was a deliberate switch;
-don't revert to the calibrated columns without being asked.
+don't revert to the calibrated columns without being asked. The "Show
+calibrated on main plot" toggle does **not** change this: it overlays the
+result of *this repo's* `calibrate_series`, keeping the raw trace visible
+underneath at `alpha=0.35`. It is session-only and defaults off, precisely so
+the app never starts up showing calibrated data without the user asking.
 
 ### GUI view-preservation (`ucatsb_gui.py` `redraw()`)
 
@@ -146,21 +218,55 @@ resetting on every masking/averaging tweak or aux-trace change:
   applies even across aux-panel add/remove/switch, since the user asked for
   the lower plot specifically to hold still through upper-panel changes.
 - The **aux panel's** y-limits are only preserved if it's still showing the
-  *same* trace as before (tracked via `_last_aux_selection`) — a different
+  *same* trace as before (tracked via `_last_aux_key`) — a different
   trace has a meaningless old y-range, so it re-autoscales.
-- `self.toolbar.update()` + `self.toolbar.push_current()` reset the
+- `PlotPane.reset_nav()` (`toolbar.update()` + `push_current()`) resets the
   NavigationToolbar's Home target to the newly-built full-scale view (its
   nav stack otherwise still references the just-destroyed Axes objects).
   Only `on_gas_changed` skips `preserve_view` — switching species changes
   the y-range meaning entirely, so a full rescale there is correct.
 
+### Tabs (`PlotPane`, `refresh()` dirty dispatch)
+
+The two views are `PlotPane` instances (Figure + canvas + toolbar) in a
+`QTabWidget`. `self.figure`/`self.canvas`/`self.toolbar` stay **bound to the
+timeseries pane** rather than being renamed, so `redraw()`'s body needs no
+changes; don't rename them while also changing behavior, or a rendering
+regression becomes indistinguishable from a refactor slip.
+
+The controls panel deliberately stays **outside** the tabs — every control
+affects both views, so moving it inside would mean duplicating the gas
+selector or making one tab depend on state invisible from the other.
+
+`refresh()` redraws only the visible pane and marks the other dirty, so a
+spinbox drag doesn't render a pane nobody is looking at. The `_preserve`
+latch matters: a requested full rescale must survive until it is actually
+honoured, or changing gas and then nudging a spinbox would leave the
+never-drawn pane stuck at a stale scale when first opened. The cal tab's own
+"same content" key is `(gas, drift_model, smooth_events)`.
+
 ### Config persistence
 
 `ucatsb_gui_config.yaml` (loaded/saved by `load_config`/`save_config`) holds
 one settings block per gas (`warmup_min`, `pressure_tol_mbar`,
-`cal1_window_s`, `cal2_window_s`), auto-saved on every control change via
-`on_control_changed`. `_initializing`/`_loading` flags exist specifically to
-suppress redraw/save during programmatic widget setup (e.g. `setChecked` on
-a freshly-constructed radio button fires its signal immediately, before
-sibling widgets it might depend on exist yet) — keep that guard pattern when
-adding new controls.
+`cal1_window_s`, `cal2_window_s`, `drift_model`, `drift_smooth_events`),
+auto-saved on every control change via `on_control_changed`.
+`_initializing`/`_loading` flags exist specifically to suppress redraw/save
+during programmatic widget setup (e.g. `setChecked` on a freshly-constructed
+radio button fires its signal immediately, before sibling widgets it might
+depend on exist yet) — keep that guard pattern when adding new controls.
+
+**Adding a persisted setting requires four edits, not one.**
+`on_control_changed` assigns `self.config[gas] = self._controls_to_settings()`
+— a *fresh* dict — so a key missing from `_controls_to_settings()` is
+silently dropped from the file on the next control change, even though
+`load_config`'s `.update()` appeared to preserve it. Touch all of:
+`DEFAULT_GAS_SETTINGS`, `_controls_to_settings()`,
+`_apply_settings_to_controls()`, and the `setEnabled(has_masking)` list in
+`_select_gas()`.
+
+**Verification scripts must pass `config_path=` to a scratch file.**
+`UcatsbGui` writes the real `ucatsb_gui_config.yaml` on any programmatic
+`setValue`, so an offscreen test that drives controls will otherwise silently
+overwrite the user's saved settings — and then the numbers in the next run
+won't match, which is confusing to debug.
