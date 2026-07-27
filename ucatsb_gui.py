@@ -31,6 +31,7 @@ from plot_co2_timeseries import (
     drop_presync_rows, find_intervals, merge_close_intervals,
     shade_intervals, cal_mean_points, load_cal_bottles, load_cal_roster,
     most_common_serial, mean_std_label, calibrate_series,
+    plot_calibration_panels,
     CALS_YAML_PATH, CAL_DRIFT_MODELS, CAL_DEFAULT_SMOOTH_EVENTS,
 )
 
@@ -116,6 +117,8 @@ DEFAULT_GAS_SETTINGS = {
     "pressure_tol_mbar": 10.0,
     "cal1_window_s": [-15, -1],
     "cal2_window_s": [-15, -1],
+    "drift_model": CAL_DRIFT_MODELS[0],
+    "drift_smooth_events": CAL_DEFAULT_SMOOTH_EVENTS,
 }
 
 
@@ -189,6 +192,8 @@ class UcatsbGui(QMainWindow):
         self._initializing = True
         self._analysis = None
         self._calibration = None
+        self.drift_model = DEFAULT_GAS_SETTINGS["drift_model"]
+        self.drift_smooth_events = DEFAULT_GAS_SETTINGS["drift_smooth_events"]
         self._dirty = {"main": True, "cal": True}
         self._preserve = {"main": False, "cal": False}
         self.cal_bottles = load_cal_bottles(CALS_YAML_PATH)
@@ -808,16 +813,73 @@ class UcatsbGui(QMainWindow):
 
         self.canvas.draw()
 
+    def _get_calibration(self):
+        """The calibration for the current analysis and drift-model settings.
+
+        Cached and computed lazily, so a gas with no cal system, or a session
+        that never opens the Calibration tab, never pays for it. Invalidated
+        alongside the analysis in refresh().
+        """
+        analysis = self._get_analysis()
+        if analysis is None:
+            return None
+        if self._calibration is not None:
+            return self._calibration
+
+        if not analysis["has_masking"]:
+            self._calibration = {
+                "ok": False,
+                "reason": f"{self.current_gas} is not run through the cal-bottle "
+                          f"system, so there is nothing to calibrate against.",
+            }
+            return self._calibration
+        if not analysis["cal_points"]:
+            self._calibration = {
+                "ok": False,
+                "reason": (f"No cal events survive the current masking "
+                           f"({analysis['warmup_minutes']} min warm-up, "
+                           f"±{analysis['pressure_tol']:.2f} mbar)."),
+            }
+            return self._calibration
+
+        self._calibration = calibrate_series(
+            self.df, GASES[self.current_gas]["value_col"], analysis["cal_points"],
+            self.cal_bottles, self.current_gas,
+            model=self.drift_model, smooth_window=self.drift_smooth_events,
+            roster=self.cal_roster,
+        )
+        return self._calibration
+
     def redraw_cal(self, preserve_view=False):
-        """Draw the Calibration tab. Placeholder until the panels land."""
-        fig = self.cal_pane.figure
-        fig.clear()
-        ax = fig.add_subplot(111)
-        ax.set_axis_off()
-        ax.text(0.5, 0.5, "Calibration view", ha="center", va="center",
-                color=MUTED_COLOR, fontsize=12, transform=ax.transAxes)
+        """Draw the Calibration tab."""
+        result = self._get_calibration()
+        if result is None:
+            return
+        gas = GASES[self.current_gas]
+        unit = gas["ylabel"].split("(")[-1].rstrip(")")
+
+        # Only the response/coefficient/residual y-ranges are worth holding,
+        # and only while they still mean the same thing -- a different gas or
+        # drift model changes that entirely, so let those re-autoscale.
+        cal_key = (self.current_gas, self.drift_model, self.drift_smooth_events)
+        old_ylims = None
+        if (preserve_view and self._cal_ax and self._last_cal_key == cal_key):
+            old_ylims = [ax.get_ylim() for ax in self._cal_ax]
+            old_xlim = self._cal_ax[0].get_xlim()
+
+        axes = plot_calibration_panels(
+            self.cal_pane.figure, result, self.current_gas, gas["ylabel"],
+            self.df["datetime"], unit=unit,
+        )
+
         self.cal_pane.reset_nav()
-        self._cal_ax = ax
+        if old_ylims is not None and len(old_ylims) == len(axes):
+            for ax, ylim in zip(axes, old_ylims):
+                ax.set_ylim(ylim)
+            axes[0].set_xlim(old_xlim)
+
+        self._cal_ax = axes
+        self._last_cal_key = cal_key
         self.cal_pane.canvas.draw()
 
 

@@ -11,6 +11,7 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 
 LINE_COLOR = "#2a78d6"
+RIGHT_AXIS_COLOR = "#8e44ad"   # purple, distinct from the red/orange masking shades
 CAL_SHADE_COLOR = "#898781"
 PRESSURE_EXCLUDE_COLOR = "#d03b3b"
 WARMUP_EXCLUDE_COLOR = "#ffa64d"   # light orange
@@ -547,6 +548,152 @@ def calibrate_series(df, value_col, cal_points, cal_bottles, gas_key,
         "extrapolated": extrapolated, "residuals": residuals, "loo_rms": loo_rms,
         "span_gain": span_gain, "warnings": warnings,
     }
+
+
+def _shade_flagged(ax, datetimes, mask, color=CAL_SHADE_COLOR):
+    """Hatch-shade extrapolated/untrustworthy spans. Hatching (rather than a
+    plain fill) keeps these visually distinct from the timeseries plot's
+    cal-period shading, which uses the same colour for a different meaning."""
+    for start, end in find_intervals(datetimes, mask):
+        ax.axvspan(start, end, facecolor="none", edgecolor=color,
+                   hatch="///", alpha=0.35, linewidth=0)
+
+
+def plot_calibration_panels(fig, result, gas_key, ylabel, datetimes, unit=""):
+    """Draw the calibration diagnostics onto `fig`.
+
+    Three stacked panels sharing a time axis: bottle response against
+    assigned values, the derived slope/intercept, and residuals.
+    """
+    fig.clear()
+    if not result.get("ok"):
+        ax = fig.add_subplot(111)
+        ax.set_axis_off()
+        ax.text(0.5, 0.5, result.get("reason") or "No calibration available.",
+                ha="center", va="center", color=MUTED_COLOR, fontsize=11,
+                wrap=True, transform=ax.transAxes)
+        return [ax]
+
+    gs = fig.add_gridspec(3, 1, height_ratios=[2, 2, 1.5])
+    ax_resp = fig.add_subplot(gs[0])
+    ax_coef = fig.add_subplot(gs[1], sharex=ax_resp)
+    ax_res = fig.add_subplot(gs[2], sharex=ax_resp)
+    extrap = result["extrapolated"]
+
+    state_colors = {result["low_state"]: CAL0_COLOR, result["high_state"]: CAL1_COLOR}
+
+    # --- Panel 1: bottle response as a deviation from assigned ------------
+    # Plotted as (measured - assigned) rather than absolute mole fraction:
+    # the two tanks sit ~200 ppm apart, so on a shared absolute axis each
+    # bottle's drift -- the whole point of this panel, and a couple of ppm at
+    # most -- collapses to a flat line. Against zero, drift and event scatter
+    # are legible and a wrong-tank offset shows up as a whole series sitting
+    # far off the line. Absolute values stay in the legend.
+    ax_resp.axhline(0.0, color=MUTED_COLOR, linestyle="--", linewidth=1.0)
+    for state, info in sorted(result["bottles"].items()):
+        color = state_colors.get(state, MUTED_COLOR)
+        if not info["times"] or info["assigned"] is None:
+            continue
+        assigned = info["assigned"]
+        measured = sum(info["values"]) / len(info["values"])
+        delta = measured - assigned
+        label = (f"{info['serial'] or f'state {state}'}  R={measured:.2f}  "
+                 f"A={assigned:.3f}  d={delta:+.2f} ({delta / assigned:+.2%})")
+        ax_resp.scatter(info["times"], [v - assigned for v in info["values"]],
+                        color=color, s=28, zorder=5, edgecolors="none", label=label)
+        node_t, node_v = info.get("nodes", ([], []))
+        if len(node_t):
+            ax_resp.plot(node_t, [v - assigned for v in node_v], color=color,
+                         linewidth=1.2, zorder=4)
+        for t, value, serial in info["rejected"]:
+            ax_resp.scatter([t], [value - assigned], facecolors="none",
+                            edgecolors=color, marker="X", s=55, zorder=6,
+                            linewidths=1.2)
+    ax_resp.set_ylabel(f"measured - assigned ({unit})" if unit else "measured - assigned",
+                       color=TEXT_COLOR, fontsize=9)
+    ax_resp.set_title("Cal bottle response, as deviation from assigned value",
+                      color=TEXT_COLOR, loc="left", fontsize=10)
+    ax_resp.legend(loc="lower right", fontsize=7, framealpha=0.9)
+
+    # --- Panel 2: derived coefficients -----------------------------------
+    _shade_flagged(ax_coef, datetimes, extrap)
+    ax_coef.plot(datetimes, result["slope"], color=LINE_COLOR, linewidth=1.2)
+    ax_coef.axhline(1.0, color=MUTED_COLOR, linestyle=":", linewidth=0.9)
+    ax_coef.set_ylabel("slope", color=LINE_COLOR, fontsize=9)
+    ax_coef.tick_params(axis="y", colors=LINE_COLOR, labelsize=8)
+    ax_icept = ax_coef.twinx()
+    ax_icept.plot(datetimes, result["intercept"], color=RIGHT_AXIS_COLOR, linewidth=1.2)
+    ax_icept.set_ylabel(f"intercept ({unit})" if unit else "intercept",
+                        color=RIGHT_AXIS_COLOR, fontsize=9)
+    ax_icept.tick_params(axis="y", colors=RIGHT_AXIS_COLOR, labelsize=8)
+    ax_icept.spines["right"].set_color(RIGHT_AXIS_COLOR)
+    ax_coef.set_title("Calibration coefficients (hatched = extrapolated)",
+                      color=TEXT_COLOR, loc="left", fontsize=10)
+
+    # --- Panel 3: residuals ----------------------------------------------
+    ax_res.axhline(0.0, color=MUTED_COLOR, linewidth=0.9)
+    for state, info in sorted(result["bottles"].items()):
+        color = state_colors.get(state, MUTED_COLOR)
+        pts = [(t, closure, loo) for t, s, closure, loo in result["residuals"] if s == state]
+        if not pts:
+            continue
+        times = [p[0] for p in pts]
+        rms = result["loo_rms"].get(state)
+        ax_res.scatter(times, [p[1] for p in pts], color=color, s=18,
+                       zorder=5, edgecolors="none", label=f"{info['serial']} closure")
+        ax_res.scatter(times, [p[2] for p in pts], facecolors="none",
+                       edgecolors=color, s=26, zorder=4, linewidths=1.0,
+                       label=f"{info['serial']} leave-one-out"
+                             + (f"  RMS={rms:.3f}" if rms is not None else ""))
+        if info.get("assigned_unc"):
+            ax_res.axhspan(-info["assigned_unc"], info["assigned_unc"],
+                           color=color, alpha=0.15, linewidth=0)
+    ax_res.set_ylabel(f"residual ({unit})" if unit else "residual",
+                      color=TEXT_COLOR, fontsize=9)
+    ax_res.set_title("Residuals: closure (filled) vs leave-one-out (hollow)",
+                     color=TEXT_COLOR, loc="left", fontsize=10)
+    ax_res.legend(loc="upper right", fontsize=7, framealpha=0.9, ncol=2)
+
+    # --- Header block ------------------------------------------------------
+    # Drawn as a figure suptitle rather than inside an Axes: these lines are
+    # long enough to collide with the traces and legends at any in-axes anchor.
+    import textwrap
+
+    head = [f"{gas_key}  |  mode: {result['mode']}"]
+    if result.get("span_gain") is not None:
+        head[0] += f"  |  span gain: {result['span_gain']:.4f}"
+    head[0] += f"  |  extrapolated: {100 * extrap.mean():.0f}% of record"
+    head.append(", ".join(
+        f"{info['serial'] or f'state {s}'}: {len(info['times'])} events"
+        + (f", {len(info['rejected'])} rejected" if info["rejected"] else "")
+        for s, info in sorted(result["bottles"].items())
+    ))
+    for warning in result["warnings"]:
+        head.extend(textwrap.wrap(warning, width=110))
+    # No explicit y: constrained_layout only reserves room for the suptitle
+    # when it positions it itself, and this block runs to several lines.
+    fig.suptitle("\n".join(head), color=MUTED_COLOR, fontsize=8,
+                 ha="left", x=0.01, linespacing=1.4)
+    if result["warnings"]:
+        # Colour the whole block as a warning -- matplotlib has no per-line
+        # colouring in a suptitle, and a visible flag matters more than
+        # keeping the neutral lines neutral.
+        fig.texts[-1].set_color(PRESSURE_EXCLUDE_COLOR)
+
+    for ax in (ax_resp, ax_coef, ax_res):
+        ax.set_facecolor("#fcfcfb")
+        ax.grid(True, color=GRID_COLOR, linewidth=0.6)
+        for spine in ax.spines.values():
+            spine.set_color(AXIS_COLOR)
+        ax.tick_params(colors=MUTED_COLOR, labelsize=8)
+    ax_resp.tick_params(labelbottom=False)
+    ax_coef.tick_params(labelbottom=False)
+    ax_res.xaxis.set_major_locator(mdates.AutoDateLocator())
+    ax_res.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+    for label in ax_res.get_xticklabels():
+        label.set_rotation(45)
+        label.set_horizontalalignment("right")
+    return [ax_resp, ax_coef, ax_res, ax_icept]
 
 
 def plot_co2_timeseries(csv_path: Path, out_path: Path):
