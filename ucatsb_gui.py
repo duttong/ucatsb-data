@@ -12,35 +12,45 @@ The CSV can also be picked (or swapped out) from within the GUI via the
 to start empty and load a file from the file browser.
 """
 import copy
+import functools
 import sys
 from pathlib import Path
 
 import pandas as pd
 import yaml
+from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
     QGroupBox, QComboBox, QDoubleSpinBox, QSpinBox, QLabel,
     QButtonGroup, QRadioButton, QPushButton, QFileDialog, QMessageBox,
-    QTabWidget, QCheckBox,
+    QTabWidget, QCheckBox, QAction,
 )
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg, NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
+from matplotlib.widgets import RectangleSelector
 import matplotlib.dates as mdates
 
 from plot_co2_timeseries import (
     drop_presync_rows, find_intervals, merge_close_intervals,
     shade_intervals, cal_mean_points, load_cal_bottles, load_cal_roster,
     most_common_serial, mean_std_label, calibrate_series, post_cal_flush_mask,
+    box_stats,
     plot_calibration_panels, export_calibrated_csv,
     CALS_YAML_PATH, CAL_DRIFT_MODELS, CAL_DEFAULT_SMOOTH_EVENTS,
     POST_CAL_FLUSH_COLOR,
 )
 
 LINE_COLOR = "#2a78d6"
+# The calibrated overlay gets its own colour rather than reusing LINE_COLOR:
+# the raw trace stays blue when the overlay is on, so the two are told apart
+# by hue, not by which one happens to be faded. Darker/more saturated than the
+# 15%-alpha PRESSURE_EXCLUDE_COLOR band so it doesn't read as shading.
+CALIBRATED_COLOR = "#c0392b"
 RIGHT_AXIS_COLOR = "#8e44ad"   # purple, distinct from the red/orange masking shades
 CAL_SHADE_COLOR = "#898781"
 PRESSURE_EXCLUDE_COLOR = "#d03b3b"
 WARMUP_EXCLUDE_COLOR = "#ffa64d"   # light orange
+STATS_BOX_COLOR = "#111111"
 CAL0_COLOR = "#eda100"   # golden
 CAL1_COLOR = "#0d366b"   # dark blue
 GRID_COLOR = "#e1e0d9"
@@ -163,14 +173,169 @@ class PlotPane(QWidget):
         self.figure = Figure(constrained_layout=True)
         self.canvas = FigureCanvasQTAgg(self.figure)
         self.toolbar = NavigationToolbar(self.canvas, self)
+
+        # Appended to the stock toolbar rather than declared through
+        # NavigationToolbar.toolitems: toolitems entries have to name a method
+        # on the toolbar class, which would mean subclassing it just to reach
+        # back into the pane.
+        self.toolbar.addSeparator()
+        self.stats_action = QAction("Stats", self.toolbar)
+        self.stats_action.setCheckable(True)
+        self.stats_action.setToolTip(
+            "Drag a box over the data to get n / mean / std of the points\n"
+            "inside it. Cal periods, masked data and post-cal flush are\n"
+            "excluded from the statistics and reported separately."
+        )
+        self.stats_action.toggled.connect(self._on_stats_toggled)
+        self.toolbar.addAction(self.stats_action)
+
+        readout = QHBoxLayout()
+        self.stats_combo = QComboBox()
+        self.stats_combo.setMinimumWidth(190)
+        self.stats_combo.setToolTip("Which plotted trace the box statistics apply to")
+        self.stats_combo.currentIndexChanged.connect(self._on_trace_changed)
+        self.stats_label = QLabel("")
+        # Selectable so the numbers can be dragged out even without the button;
+        # wrapped rather than elided, since the line is long enough to lose its
+        # tail on a narrow window and the tail is where the caveats are.
+        self.stats_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.stats_label.setWordWrap(True)
+        self.stats_copy_button = QPushButton("Copy")
+        self.stats_copy_button.setMaximumWidth(60)
+        self.stats_copy_button.clicked.connect(self._copy_stats)
+        readout.addWidget(self.stats_combo)
+        readout.addWidget(self.stats_label, 1)
+        readout.addWidget(self.stats_copy_button)
+        self._set_readout_visible(False)
+
         layout.addWidget(self.toolbar)
+        layout.addLayout(readout)
         layout.addWidget(self.canvas)
+
+        # on_box is set by the owner; the selectors themselves are rebuilt on
+        # every draw (see attach_stats_selectors).
+        self.on_box = None
+        self.selectors = []
+        # (axes, extents) of the live box -- only one exists at a time, in
+        # whichever panel it was drawn in.
+        self._box = None
+        self._loading_traces = False
 
     def reset_nav(self):
         """Point the toolbar's Home at the newly-built full-scale view; its
         nav stack otherwise still references the just-destroyed Axes."""
         self.toolbar.update()
         self.toolbar.push_current()
+
+    def _set_readout_visible(self, visible):
+        self.stats_combo.setVisible(visible)
+        self.stats_label.setVisible(visible)
+        self.stats_copy_button.setVisible(visible)
+
+    def _copy_stats(self):
+        QApplication.clipboard().setText(self.stats_label.text())
+
+    def _on_stats_toggled(self, checked):
+        if checked:
+            # Pan/zoom hold the canvas widgetlock, and _SelectorWidget.ignore()
+            # drops every event while it is held -- the tool would look dead.
+            # (The reverse needs no handling: clicking pan later just makes the
+            # selector inert until pan is switched off again.)
+            mode = str(self.toolbar.mode)
+            if "pan" in mode:
+                self.toolbar.pan()
+            elif "zoom" in mode:
+                self.toolbar.zoom()
+        for i, sel in enumerate(self.selectors):
+            sel.set_active(checked)
+            sel.set_visible(checked and self._box is not None and i == self._box[0])
+        self.canvas.draw_idle()
+        self._set_readout_visible(checked and bool(self.stats_label.text()))
+
+    def set_stats_text(self, text):
+        self.stats_label.setText(text)
+        self._set_readout_visible(bool(text) and self.stats_action.isChecked())
+
+    def current_trace_key(self):
+        return self.stats_combo.currentData()
+
+    def set_stats_traces(self, traces):
+        """Populate the trace selector with [(key, label), ...] for whatever is
+        currently plotted, keeping the previous choice when it still exists."""
+        previous = self.current_trace_key()
+        self._loading_traces = True
+        self.stats_combo.clear()
+        for key, label in traces:
+            self.stats_combo.addItem(label, key)
+        if previous is not None:
+            index = self.stats_combo.findData(previous)
+            if index >= 0:
+                self.stats_combo.setCurrentIndex(index)
+        self._loading_traces = False
+
+    def _on_trace_changed(self, _index):
+        """Recompute against the box already on screen -- switching trace
+        shouldn't require redrawing the box."""
+        if self._loading_traces or self._box is None or self.on_box is None:
+            return
+        index, extents = self._box
+        self.on_box(self.selectors[index].ax, *extents)
+
+    def attach_stats_selectors(self, axes):
+        """(Re)bind one box selector per panel in `axes`.
+
+        Must be called after every draw: the panes rebuild their Figure from
+        scratch, so a selector from the previous draw holds a dead Axes and
+        silently stops responding. The live box is carried across so a
+        selection survives a masking tweak instead of vanishing.
+        """
+        for sel in self.selectors:
+            try:
+                sel.set_active(False)
+                sel.disconnect_events()
+            except Exception:
+                pass
+        self.selectors = []
+
+        # Identity is stale after a redraw (the old Axes are destroyed), so the
+        # box is restored by position in the axes list rather than by object.
+        box_index, box_extents = (None, None)
+        if self._box is not None:
+            box_index, box_extents = self._box[0], self._box[1]
+        self._box = None
+
+        live = [ax for ax in axes if ax is not None]
+        active = self.stats_action.isChecked()
+        for i, ax in enumerate(live):
+            sel = RectangleSelector(
+                ax, functools.partial(self._on_select, ax), useblit=True,
+                interactive=True, button=[1], minspanx=3, minspany=3,
+                spancoords="pixels",
+                props=dict(facecolor="none", edgecolor=STATS_BOX_COLOR,
+                           linewidth=1.4, linestyle="--"),
+            )
+            sel.set_active(active)
+            if i == box_index and box_extents is not None:
+                try:
+                    sel.extents = box_extents
+                    self._box = (i, box_extents)
+                except Exception:
+                    pass
+            sel.set_visible(active and i == box_index and self._box is not None)
+            self.selectors.append(sel)
+
+    def _on_select(self, ax, eclick, erelease):
+        for sel in self.selectors:
+            if sel.ax is ax:
+                self._box = (self.selectors.index(sel), sel.extents)
+            else:
+                # Only one box at a time: dragging in the other panel clears
+                # the previous one, so the readout always refers to a box that
+                # is actually on screen.
+                sel.set_visible(False)
+        self.canvas.draw_idle()
+        if self.on_box is not None and self._box is not None:
+            self.on_box(ax, *self._box[1])
 
 
 class UcatsbGui(QMainWindow):
@@ -194,6 +359,9 @@ class UcatsbGui(QMainWindow):
         self._initializing = True
         self._analysis = None
         self._calibration = None
+        # Rebuilt by every redraw(); initialised here so on_stats_box is safe
+        # to reach before the first draw.
+        self._stats_traces = {}
         self.drift_model = DEFAULT_GAS_SETTINGS["drift_model"]
         self.drift_smooth_events = DEFAULT_GAS_SETTINGS["drift_smooth_events"]
         self.show_calibrated = False
@@ -502,6 +670,11 @@ class UcatsbGui(QMainWindow):
         """
         self.main_pane = PlotPane()
         self.cal_pane = PlotPane()
+        self.main_pane.on_box = self.on_stats_box
+        # The Calibration tab's three panels each mean something different
+        # (response deviation, coefficients, residuals), so a single box-stats
+        # readout there would be ambiguous -- Timeseries only for now.
+        self.cal_pane.stats_action.setVisible(False)
         # Keep the historical attribute names bound to the timeseries pane so
         # redraw()'s existing body needs no changes.
         self.figure = self.main_pane.figure
@@ -580,6 +753,50 @@ class UcatsbGui(QMainWindow):
         self.smooth_spin.setEnabled(self.drift_model == "smooth")
         save_config(self.config_path, self.config)
         self.refresh(preserve_view=True)
+
+    def on_stats_box(self, ax, x0, x1, y0, y1):
+        """Report n/mean/std for the points inside a dragged box, for whichever
+        plotted trace the readout's combo box names.
+
+        A plain selection tool: no masking is applied. The box IS the user's
+        statement of which data they mean, and its vertical bounds already
+        exclude the cal dives when it is drawn around the ambient band.
+
+        The y-bounds only apply when the chosen trace lives on the Axes the box
+        was drawn in. Selecting a trace from the other panel (or the calibrated
+        overlay, which sits an intercept away from the raw trace) makes the
+        box's y-range meaningless for it, so the selection falls back to the
+        time span alone and the readout says so.
+        """
+        trace = self._stats_traces.get(self.main_pane.current_trace_key())
+        if trace is None:
+            return
+        t0, t1 = (pd.Timestamp(mdates.num2date(x)).tz_localize(None)
+                  for x in sorted((x0, x1)))
+
+        same_axes = trace["axes"] is ax
+        stats = box_stats(trace["x"], trace["y"], t0, t1,
+                          *( (y0, y1) if same_axes else (None, None) ))
+
+        span = f"{t0:%H:%M:%S}–{t1:%H:%M:%S}"
+        if not stats["n"]:
+            self.main_pane.set_stats_text(
+                f"{span}   {trace['label']}: no points in box")
+            return
+
+        unit = f" {trace['unit']}" if trace["unit"] else ""
+        if stats["std"] is None:
+            body = f"mean {stats['mean']:.4g}{unit}  (std n/a, n=1)"
+        else:
+            body = f"mean {stats['mean']:.4g} ± {stats['std']:.4g}{unit}"
+        parts = [span, trace["label"], f"n={stats['n']}", body,
+                 f"min {stats['vmin']:.4g}  max {stats['vmax']:.4g}"]
+
+        if not same_axes:
+            parts.append("(time span only — trace is on another axis)")
+        elif stats["n_clipped"]:
+            parts.append(f"({stats['n_clipped']} in span, outside box vertically)")
+        self.main_pane.set_stats_text("   ".join(parts))
 
     def on_calibrated_toggled(self, checked):
         self.show_calibrated = checked
@@ -824,23 +1041,36 @@ class UcatsbGui(QMainWindow):
         self.export_button.setEnabled(bool(
             (self._get_calibration() or {}).get("ok") if has_masking else False))
 
+        # Registered as they are plotted rather than scraped back off the Axes
+        # afterwards: the artists carry no units and no stable identity, and a
+        # trace that is conditionally drawn would be easy to miss.
+        self._stats_traces = {}
+        gas_unit = gas["ylabel"].split("(")[-1].rstrip(")") if "(" in gas["ylabel"] else ""
+        self._register_stats_trace(
+            "main:raw", f"{self.current_gas} (raw)", ax, df["datetime"],
+            df[value_col], gas_unit)
+
         plot_data = df[["datetime", value_col]].dropna()
         line, = ax.plot(plot_data["datetime"], plot_data[value_col], color=LINE_COLOR,
-                        linewidth=1.2, alpha=0.35 if show_cal else 1.0)
+                        linewidth=1.2, alpha=0.55 if show_cal else 1.0)
 
         cal_line = None
         if show_cal:
-            # The calibrated trace is the *air* record: cal periods and the
-            # flush behind them are blanked by calibrate_series. Those rows are
-            # kept as NaN instead of being dropped, so the line breaks over
-            # them; dropping them would draw a straight segment across each gap
-            # and hide the removal.
+            # The calibrated trace is the *good air* record: cal periods, the
+            # flush behind them, and the warm-up/bad-pressure masks are all
+            # blanked by calibrate_series. Those rows are kept as NaN instead
+            # of being dropped, so the line breaks over them; dropping them
+            # would draw a straight segment across each gap and hide the
+            # removal.
             calibrated = calibration["calibrated"]
-            keep = calibrated.notna() | calibration["non_ambient"]
+            self._register_stats_trace(
+                "main:cal", f"{self.current_gas} (calibrated)", ax,
+                df["datetime"], calibrated, gas_unit)
+            keep = calibrated.notna() | calibration["blanked"]
             cal_df = pd.DataFrame({"datetime": df["datetime"][keep],
                                    "v": calibrated[keep]})
             cal_line, = ax.plot(cal_df["datetime"], cal_df["v"],
-                                color=LINE_COLOR, linewidth=1.2)
+                                color=CALIBRATED_COLOR, linewidth=1.2)
             for start, end in find_intervals(df["datetime"], calibration["extrapolated"]):
                 ax.axvspan(start, end, facecolor="none", edgecolor=CAL_SHADE_COLOR,
                            hatch="///", alpha=0.30, linewidth=0)
@@ -911,8 +1141,9 @@ class UcatsbGui(QMainWindow):
                     f"({analysis['flag_air_s']} s detector flush after each cal)"
                 )
             if show_cal:
-                notes.append("calibrated trace = ambient air only "
-                             "(cal periods and flush blanked)")
+                notes.append("red = calibrated, blue = raw; calibrated shows "
+                             "good air only (cal periods, flush and masked "
+                             "spans blanked)")
         if notes:
             ax.text(
                 0.01, 0.98, "\n".join(notes),
@@ -926,6 +1157,10 @@ class UcatsbGui(QMainWindow):
             ax_aux.set_facecolor("#fcfcfb")
             shade_intervals(ax_aux, df["datetime"], warmup, WARMUP_EXCLUDE_COLOR, alpha=0.15)
             shade_intervals(ax_aux, df["datetime"], bad_pressure, PRESSURE_EXCLUDE_COLOR, alpha=0.15)
+
+            aux_unit = aux_ylabel.split("(")[-1].rstrip(")") if "(" in aux_ylabel else ""
+            self._register_stats_trace("aux:left", f"{aux_col} (above, left)",
+                                       ax_aux, df["datetime"], df[aux_col], aux_unit)
 
             aux_data = df[["datetime", aux_col]].dropna()
             aux_line, = ax_aux.plot(aux_data["datetime"], aux_data[aux_col], color=LINE_COLOR, linewidth=1.0)
@@ -942,6 +1177,9 @@ class UcatsbGui(QMainWindow):
             aux_labels = [aux_col]
             if has_right_axis:
                 ax_aux2 = ax_aux.twinx()
+                self._register_stats_trace(
+                    "aux:right", f"{self.right_axis_column} (above, right)",
+                    ax_aux2, df["datetime"], df[self.right_axis_column], "")
                 right_data = df[["datetime", self.right_axis_column]].dropna()
                 right_line, = ax_aux2.plot(
                     right_data["datetime"], right_data[self.right_axis_column],
@@ -976,7 +1214,21 @@ class UcatsbGui(QMainWindow):
         self._last_aux_key = aux_key
         self._last_right_axis_key = right_axis_key
 
+        # Must happen on every draw: the Figure was cleared above, so any
+        # selector from the previous draw is holding a destroyed Axes and
+        # would silently stop responding. The aux panel gets its own selector,
+        # so a box can be drawn in either.
+        self.main_pane.set_stats_traces(
+            [(key, t["label"]) for key, t in self._stats_traces.items()])
+        self.main_pane.attach_stats_selectors([ax, ax_aux])
+
         self.canvas.draw()
+
+    def _register_stats_trace(self, key, label, axes, x, y, unit):
+        """Record a plotted trace so the box-stats combo can offer it."""
+        self._stats_traces[key] = {
+            "label": label, "axes": axes, "x": x, "y": y, "unit": unit,
+        }
 
     def _get_calibration(self):
         """The calibration for the current analysis and drift-model settings.
@@ -1013,6 +1265,10 @@ class UcatsbGui(QMainWindow):
             model=self.drift_model, smooth_window=self.drift_smooth_events,
             roster=self.cal_roster, flush_mask=analysis["post_cal_flush"],
             cal_mask=analysis["cal"],
+            # Blanks warm-up/bad-pressure rows from the *output* only. The
+            # same mask separately fed cal_mean_points above, which is what
+            # affects the calibration; this use cannot.
+            exclude_mask=analysis["exclude_mask"],
         )
         return self._calibration
 

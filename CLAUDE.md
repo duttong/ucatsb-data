@@ -59,7 +59,10 @@ module so both stay in sync.
    `cal_mean_points`) — not just drawn as bands. A cal point can disappear
    entirely if its averaging window has no unmasked data left. This was a
    deliberate correction: the masks used to be purely visual annotations
-   that didn't affect the computed means, which was silently wrong.
+   that didn't affect the computed means, which was silently wrong. The same
+   mask is separately handed to `calibrate_series`, where it blanks those
+   rows from the calibrated *output* (see below) — so the calibrated trace
+   shows only good air.
 4. `cal_mean_points` averages each cal window (offset in seconds relative to
    the interval's last timestamp, independently configurable per bottle) and
    identifies which physical bottle was flowing.
@@ -67,30 +70,38 @@ module so both stay in sync.
    data after each cal interval ends — the detector cells are still clearing
    cal gas, so those rows read toward the tank rather than the atmosphere.
 
-**`calibrate_series`' `calibrated` output is the calibrated AMBIENT record.**
-Both `cal_mask` (rows inside a cal period) and `flush_mask` are blanked from
-it as the very last step, so the calibrated trace and the exported
-`<col>_cal` column contain air and nothing else. Nothing is lost by this:
-`cal_slope`/`cal_intercept` are still emitted on every row, so the calibrated
-value of a cal period can be recomputed by anyone who wants it (to check
-closure, say).
+**`calibrate_series`' `calibrated` output is the calibrated GOOD AMBIENT
+record.** Three masks are blanked from it as the very last step — `cal_mask`
+(rows inside a cal period), `flush_mask`, and `exclude_mask` (warm-up +
+out-of-spec detector pressure) — so the calibrated trace and the exported
+`<col>_cal` column contain good air and nothing else. Nothing is lost by
+this: `cal_slope`/`cal_intercept` are still emitted on every row, so the
+calibrated value of a blanked row can be recomputed by anyone who wants it
+(to check closure, say), and the raw column is untouched. The result exposes
+`in_cal`/`flushed`/`excluded` separately, `non_ambient` (= `in_cal | flushed`)
+and `blanked` (all three, i.e. exactly the NaN'd rows).
 
-**Neither mask is part of `exclude_mask`, and neither may become part of it.**
-`exclude_mask` feeds `cal_mean_points`; these two are applied *after* the
-calibration is fully derived and touch only the output series. Folding either
-in would corrupt the calibration itself — obviously so for `cal_mask` (the cal
-data *is* the calibration's input), and for the flush because a cal window
-configured to reach past `Cal_p` would then start losing points. Verify after
-touching this: `cal_points`, `loo_rms` and `span_gain` must be identical with
-the flush at 0 s and at 30 s.
+**Blanking is output-only; it must never feed back into the calibration.**
+`exclude_mask` has *two independent uses*, and conflating them is the trap
+here: passed to `cal_mean_points` it drops raw rows before the cal means are
+estimated (so it can remove a cal point), while passed to `calibrate_series`
+it only blanks rows of the finished output. `cal_mask` and `flush_mask` have
+the output use only — folding either into the `cal_mean_points` call would
+corrupt the calibration, obviously so for `cal_mask` (the cal data *is* the
+calibration's input), and for the flush because a cal window configured to
+reach past `Cal_p` would then start losing points. Verify after touching any
+of this, in both directions: `cal_points`, `loo_rms` and `span_gain` must be
+identical with the flush at 0 s and at 30 s, **and** identical whether or not
+`exclude_mask=` is passed to `calibrate_series`.
 
 Blanked rows stay in the frame as NaN rather than being dropped: `redraw()`
-keeps them (`keep = calibrated.notna() | non_ambient`) precisely so the
+keeps them (`keep = calibrated.notna() | blanked`) precisely so the
 calibrated line **breaks** over each gap. Dropping them would make matplotlib
 draw a straight segment across the removal and hide it. The raw trace keeps
 everything — that contrast is the point of the feature — and the teal flush
-band is shaded whether or not "Show calibrated" is on, since the band is how
-the user finds out those rows exist before turning the overlay on.
+band (like the orange/red masking bands) is shaded whether or not "Show
+calibrated" is on, since the band is how the user finds out those rows exist
+before turning the overlay on.
 
 Both views read these through `UcatsbGui._get_analysis()`, a cache whose sole
 invalidation site is `refresh()` — the entry point every state change calls.
@@ -229,8 +240,11 @@ Data is plotted **uncalibrated** (`d1_CO2_ppm`, `d1_N2O_ppb`, `d2_CH4_ppb`),
 not the `*c_ppm`/`*c_ppb` calibrated columns — this was a deliberate switch;
 don't revert to the calibrated columns without being asked. The "Show
 calibrated on main plot" toggle does **not** change this: it overlays the
-result of *this repo's* `calibrate_series`, keeping the raw trace visible
-underneath at `alpha=0.35`. It is session-only and defaults off, precisely so
+result of *this repo's* `calibrate_series` in red (`CALIBRATED_COLOR`),
+keeping the raw trace in its usual blue `LINE_COLOR` underneath at
+`alpha=0.55`. The two traces are distinguished by **hue, not by which one is
+faded** — recolouring the raw trace when the overlay came on read as the raw
+data having changed. It is session-only and defaults off, precisely so
 the app never starts up showing calibrated data without the user asking.
 
 ### GUI view-preservation (`ucatsb_gui.py` `redraw()`)
@@ -253,6 +267,51 @@ resetting on every masking/averaging tweak or aux-trace change:
   nav stack otherwise still references the just-destroyed Axes objects).
   Only `on_gas_changed` skips `preserve_view` — switching species changes
   the y-range meaning entirely, so a full rescale there is correct.
+
+### Box stats ("Stats" toolbar toggle)
+
+A checkable `QAction` appended to the stock `NavigationToolbar` (not declared
+through `NavigationToolbar.toolitems`, which would require subclassing the
+toolbar just to reach back into the pane) drives a `RectangleSelector`; the
+box's n/mean/std land in a `QLabel` **outside** the Figure, which is what lets
+the readout survive a redraw.
+
+- **The selector must be rebuilt on every draw.** `redraw()` calls
+  `figure.clear()`, so a selector from the previous draw holds a destroyed
+  Axes and silently stops responding — no error, the tool just goes dead.
+  `PlotPane.attach_stats_selector(ax)` is called at the end of `redraw()` for
+  exactly this reason, and carries `_box_extents` across so the drawn box
+  survives a masking tweak.
+- **Pan/zoom hold the canvas widgetlock**, and `_SelectorWidget.ignore()`
+  drops every event while it is held, so enabling Stats releases whichever is
+  active. The reverse needs no handling: clicking pan afterwards just makes
+  the selector inert until pan is switched off.
+- **It applies no masking, deliberately.** This is a generic selection tool:
+  the box is the user's statement of which data they mean, and its vertical
+  bounds already leave the cal dives out when it is drawn around the ambient
+  band. An earlier version filtered to ambient+unmasked; that was removed
+  because it made a general-purpose tool silently gas-pipeline-specific.
+  `n_clipped` (inside the time span, outside the box vertically) is still
+  reported — a 2D marquee truncates the distribution and narrows the reported
+  sigma, so the count is what makes an accidental clip visible.
+- **Traces are registered as they are plotted** (`_register_stats_trace`),
+  not scraped back off the Axes: artists carry no units and no stable
+  identity, and a conditionally-drawn trace would be easy to miss. The
+  registry is rebuilt by every `redraw()` and feeds the combo box; the
+  combo's current key is preserved across repopulation when it still exists.
+- **`y0`/`y1` are only meaningful on the Axes the box was drawn in.** When
+  the chosen trace lives elsewhere (the aux right axis, or a main trace when
+  the box is in the upper panel), `box_stats` is called with no y-bounds and
+  the readout says so. Without this the y-range of one panel would silently
+  filter another panel's data — and even within one Axes it bites: the
+  calibrated overlay sits an intercept away from the raw trace (~10 ppm on
+  the Jul 2026 CO2 flight), so a box drawn snugly around raw legitimately
+  contains almost no calibrated points, which the `outside box vertically`
+  count explains rather than hides.
+- **One box at a time, tracked by Axes *index*, not identity** — the Axes
+  objects are destroyed on redraw, so `PlotPane._box` stores
+  `(index into the selector list, extents)`. Selecting in one panel hides the
+  other panel's box, so the readout always refers to a box that is on screen.
 
 ### Tabs (`PlotPane`, `refresh()` dirty dispatch)
 

@@ -45,6 +45,52 @@ control panel — every control affects both.
 
 Zooming/panning (via the matplotlib toolbar) is preserved across masking, averaging, and upper-trace changes — only the Home button resets to full scale.
 
+### Box statistics ("Stats")
+
+The **Stats** toggle at the right-hand end of the Timeseries toolbar turns the
+cursor into a marquee: drag a box over a stretch of data and a readout appears
+under the toolbar with the sample count, mean, standard deviation and range,
+plus a **Copy** button.
+
+```
+19:34:06–19:52:06   CO2 (raw)   n=978   mean 393.4 ± 0.5685 ppm
+     min 391  max 394.7   (152 in span, outside box vertically)
+```
+
+It is a plain selection tool — **no masking is applied**. Drawing the box is
+how you say which data you mean; because the box has vertical bounds, drawing
+it around the ambient band naturally leaves the cal dives outside it. The
+count of points that fell in the time span but outside the box vertically is
+always reported, so a box that clipped the data rather than framing it says
+so. (That matters for σ: a 2D marquee truncates the distribution and narrows
+the spread it reports.)
+
+**A combo box on the readout row picks which plotted trace the statistics
+apply to**, listing whatever is currently on the figure:
+
+| Entry | When it appears |
+|---|---|
+| `<gas> (raw)` | always |
+| `<gas> (calibrated)` | "Show calibrated on main plot" is on |
+| `<column> (above, left)` | a Trace Above panel is shown |
+| `<column> (above, right)` | a right-axis trace is selected |
+
+Boxes can be drawn in either panel, and switching the combo re-reports the
+existing box without needing to redraw it. When the chosen trace lives on a
+different axis from the box — the upper panel's right axis, or a main-plot
+trace when the box was drawn above — the vertical bounds mean nothing for it,
+so the selection falls back to the time span alone and the readout says
+`time span only`.
+
+The box keeps drag handles after release, so it can be nudged or resized with
+the numbers updating, and it survives a masking or averaging change rather
+than vanishing on redraw. Note that pressing *inside* an existing box moves or
+resizes it — to start a fresh selection, drag somewhere clear of it.
+
+Turning Stats on releases pan or zoom if either is active, since they compete
+for the same drag. The Calibration tab has no Stats button: its three panels
+each mean something different, so a single readout there would be ambiguous.
+
 ### Static figure
 
 ```

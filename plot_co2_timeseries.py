@@ -101,6 +101,59 @@ def post_cal_flush_mask(datetimes, cal_intervals, flush_s, cal_mask=None):
     return flagged
 
 
+def box_stats(datetimes, values, t0, t1, y0=None, y1=None):
+    """Summarise the points inside a drawn box (Igor-style marquee stats).
+
+    A plain selection tool: whatever is inside the box is what gets counted.
+    It applies no masking of its own -- drawing the box is the user's way of
+    saying which data they mean, and the vertical bounds already exclude the
+    cal dives when the box is drawn around the ambient band.
+
+    `y0`/`y1` are optional: pass neither to select on time alone (used when
+    the chosen trace lives on a different Axes from the one the box was drawn
+    in, where the box's y-range means nothing).
+
+    Returns `values_stats` plus the box bounds and `n_clipped` -- points
+    inside the time range but outside the box vertically. A 2D marquee
+    truncates the distribution, which narrows the reported sigma, so the count
+    is what makes an accidental clip visible instead of silent.
+    """
+    in_x = (datetimes >= t0) & (datetimes <= t1)
+    finite = values.notna()
+    if y0 is None or y1 is None:
+        in_y = pd.Series(True, index=values.index)
+        lo = hi = None
+    else:
+        lo, hi = min(y0, y1), max(y0, y1)
+        in_y = values.between(lo, hi)
+
+    keep = in_x & in_y & finite
+    stats = values_stats(values, keep)
+    stats.update({
+        "keep": keep,
+        "t0": t0, "t1": t1, "y0": lo, "y1": hi,
+        "n_in_span": int((in_x & finite).sum()),
+        "n_clipped": int((in_x & finite & ~in_y).sum()),
+    })
+    return stats
+
+
+def values_stats(values, keep):
+    """n / mean / std / min / max of `values` over the rows `keep`
+    selects, skipping missing values. Split out of box_stats so a second
+    series can be summarised over an existing selection."""
+    kept = values[keep].dropna()
+    n = len(kept)
+    return {
+        "n": n,
+        "mean": float(kept.mean()) if n else None,
+        # ddof=1 needs two points; a one-point box gets None rather than NaN.
+        "std": float(kept.std(ddof=1)) if n > 1 else None,
+        "vmin": float(kept.min()) if n else None,
+        "vmax": float(kept.max()) if n else None,
+    }
+
+
 def shade_intervals(ax, datetimes, mask, color, alpha):
     """Shade contiguous stretches of x where mask is True."""
     for start, end in find_intervals(datetimes, mask):
@@ -438,7 +491,8 @@ def cal_mismatch_notes(bottles, gas_key, roster, rel_threshold=0.01):
 
 def calibrate_series(df, value_col, cal_points, cal_bottles, gas_key,
                      model="linear", smooth_window=CAL_DEFAULT_SMOOTH_EVENTS,
-                     roster=None, flush_mask=None, cal_mask=None):
+                     roster=None, flush_mask=None, cal_mask=None,
+                     exclude_mask=None):
     """Build a time-varying two-point calibration from the per-injection cal
     means and apply it to every row of df[value_col].
 
@@ -458,20 +512,30 @@ def calibrate_series(df, value_col, cal_points, cal_bottles, gas_key,
                                            bottles' node spans, or in a long gap
       flushed       Series[bool]        -- post-cal flush rows
       in_cal        Series[bool]        -- rows inside a cal period
-      non_ambient   Series[bool]        -- flushed | in_cal; NaN in
+      excluded      Series[bool]        -- warm-up / out-of-spec pressure rows
+      non_ambient   Series[bool]        -- flushed | in_cal
+      blanked       Series[bool]        -- non_ambient | excluded; NaN in
                                            `calibrated` (see below)
       residuals     [(time, state, closure, loo)]
       loo_rms       {state: float}      -- QC scatter, gas units
       span_gain     float|None
       warnings      [str]
 
-    `calibrated` is the calibrated *ambient* record: `cal_mask` (rows inside a
-    cal period) and `flush_mask` (post_cal_flush_mask) are both blanked from
-    it, as the last step. Neither affects the calibration itself -- the nodes,
-    slope, intercept and residuals are all derived before this point, from the
-    cal-period data `cal_mask` marks. Removing them here rather than in each
-    caller keeps the plotted trace and the exported CSV from ever disagreeing
-    about which rows count as air.
+    `calibrated` is the calibrated *good ambient* record. Three masks are
+    blanked from it as the last step: `cal_mask` (rows inside a cal period)
+    and `flush_mask` (post_cal_flush_mask), which are not air; and
+    `exclude_mask` (warm-up + out-of-spec detector pressure), which is air the
+    instrument was in no state to measure. None of the three affects the
+    calibration itself -- the nodes, slope, intercept and residuals are all
+    derived before this point.
+
+    `exclude_mask` here is the *same* mask that is handed to
+    `cal_mean_points`, but the two uses are independent and must stay that
+    way: there it drops raw rows before the cal means are estimated (so it can
+    remove a cal point); here it only blanks the output series. Passing it
+    here does not and must not change `cal_points`, `loo_rms` or `span_gain`.
+    Removing these rows here rather than in each caller keeps the plotted
+    trace and the exported CSV from ever disagreeing about which rows are good.
     """
     import statistics
 
@@ -484,7 +548,8 @@ def calibrate_series(df, value_col, cal_points, cal_bottles, gas_key,
             "low_state": None, "high_state": None,
             "slope": nan_series, "intercept": nan_series, "calibrated": nan_series,
             "extrapolated": false_series, "flushed": false_series,
-            "in_cal": false_series, "non_ambient": false_series,
+            "in_cal": false_series, "excluded": false_series,
+            "non_ambient": false_series, "blanked": false_series,
             "residuals": [], "loo_rms": {},
             "span_gain": None, "warnings": [],
         }
@@ -584,11 +649,17 @@ def calibrate_series(df, value_col, cal_points, cal_bottles, gas_key,
         )
 
     # Applied last, and only to the output series: `calibrated` is the
-    # calibrated *ambient* record, so everything that isn't atmosphere is
-    # blanked -- the cal gas itself, and the flush behind it while the cells
-    # still hold it. Nothing is lost by this: slope/intercept are still on
-    # every row, so a consumer who wants the calibrated value of a cal period
-    # (to check closure, say) can recompute it.
+    # calibrated *good ambient* record, so everything that isn't usable
+    # atmosphere is blanked -- the cal gas itself, the flush behind it while
+    # the cells still hold it, and the warm-up / out-of-spec-pressure rows the
+    # masking controls already exclude from the cal means. Nothing is lost by
+    # this: slope/intercept are still on every row, so a consumer who wants
+    # the calibrated value of a blanked row (to check closure, say) can
+    # recompute it.
+    #
+    # Note this runs after everything above: cal_points, the drift nodes,
+    # residuals and span_gain are all already fixed, so `exclude_mask` cannot
+    # reach back and change the calibration by being passed here.
     #
     # The rows stay in the frame as NaN rather than being dropped, so the
     # trace breaks visibly instead of interpolating over the removed stretch.
@@ -599,16 +670,19 @@ def calibrate_series(df, value_col, cal_points, cal_bottles, gas_key,
 
     flushed = _align(flush_mask)
     in_cal = _align(cal_mask)
+    excluded = _align(exclude_mask)
     non_ambient = flushed | in_cal
-    if non_ambient.any():
-        calibrated = calibrated.mask(non_ambient)
+    blanked = non_ambient | excluded
+    if blanked.any():
+        calibrated = calibrated.mask(blanked)
 
     return {
         "ok": True, "reason": None, "mode": mode, "bottles": bottles,
         "low_state": low_state, "high_state": high_state,
         "slope": slope, "intercept": intercept, "calibrated": calibrated,
         "extrapolated": extrapolated, "flushed": flushed,
-        "in_cal": in_cal, "non_ambient": non_ambient,
+        "in_cal": in_cal, "excluded": excluded,
+        "non_ambient": non_ambient, "blanked": blanked,
         "residuals": residuals, "loo_rms": loo_rms,
         "span_gain": span_gain, "warnings": warnings,
     }
@@ -650,10 +724,12 @@ def export_calibrated_csv(path, df, result, value_col, gas_key,
                  "past the last cal event of a bottle, or spans a long gap.")
     flushed = result.get("flushed")
     in_cal = result.get("in_cal")
-    lines.append(f"# {value_col}_cal is the calibrated AMBIENT record. It is blank "
-                 f"wherever the instrument was not sampling air (is_cal_period or "
-                 f"is_post_cal_flush), and also wherever the raw {value_col} is "
-                 f"itself missing or the calibration is undefined. The raw "
+    lines.append(f"# {value_col}_cal is the calibrated GOOD AMBIENT record. It is "
+                 f"blank wherever the instrument was not sampling air (is_cal_period "
+                 f"or is_post_cal_flush), wherever the air it was sampling is "
+                 f"excluded by the masking settings (is_masked: warm-up or "
+                 f"out-of-spec detector pressure), and also wherever the raw "
+                 f"{value_col} is itself missing or the calibration is undefined. The raw "
                  f"{value_col} is left untouched on every row, and cal_slope/"
                  f"cal_intercept are given for every row, so the calibrated "
                  f"value of a blanked row can be recomputed if it is wanted.")
@@ -664,6 +740,11 @@ def export_calibrated_csv(path, df, result, value_col, gas_key,
         lines.append(f"# is_post_cal_flush=True: within the post-cal flush window "
                      f"({int(flushed.sum())} rows) -- the detector was still "
                      f"clearing cal gas, so the air reading is not yet the atmosphere.")
+    masked = result.get("excluded")
+    if masked is not None and masked.any():
+        lines.append(f"# is_masked=True: excluded by the masking settings "
+                     f"({int(masked.sum())} rows) -- instrument warm-up or "
+                     f"detector pressure outside tolerance.")
 
     out = pd.DataFrame({
         "datetime": df["datetime"],
@@ -680,8 +761,14 @@ def export_calibrated_csv(path, df, result, value_col, gas_key,
     # <col>_cal in terms of this column, so it must not be able to go missing.
     if in_cal is not None:
         out["is_cal_period"] = in_cal
-    if analysis is not None:
-        out["is_masked"] = analysis["exclude_mask"]
+    # Same reasoning for is_masked: the header explains a blank <col>_cal in
+    # terms of it, so it comes from the calibration result (which did the
+    # blanking) and only falls back to the analysis dict.
+    excluded = result.get("excluded")
+    if excluded is None and analysis is not None:
+        excluded = analysis["exclude_mask"]
+    if excluded is not None:
+        out["is_masked"] = excluded
 
     with open(path, "w") as fh:
         fh.write("\n".join(lines) + "\n")
