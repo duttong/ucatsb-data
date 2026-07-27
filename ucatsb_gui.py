@@ -413,19 +413,21 @@ class UcatsbGui(QMainWindow):
 
         vbox.addWidget(self.cal_box)
 
-        vbox.addWidget(QLabel(
-            "Cal windows are relative to the last\n"
-            "point in a cal period (Cal_p), e.g.\n"
-            "-10 s to 2 s = [Cal_p-10s, Cal_p+2s].\n"
-            "Positive values reach past Cal_p.\n"
-            "Settings are saved per-gas."
-        ))
-
         vbox.addStretch(1)
         return panel
 
+    # Carried as a tooltip rather than a standing label -- it's reference
+    # material you need once, and the control panel has to fit on a laptop.
+    CAL_WINDOW_HELP = (
+        "Relative to the last point in a cal period (Cal_p),\n"
+        "e.g. -10 s to 2 s = [Cal_p-10s, Cal_p+2s].\n"
+        "Positive values reach past Cal_p.\n"
+        "Settings are saved per-gas."
+    )
+
     def _add_cal_window_box(self, vbox, title):
         box = QGroupBox(title)
+        box.setToolTip(self.CAL_WINDOW_HELP)
         form = QFormLayout(box)
 
         start_spin = QSpinBox()
