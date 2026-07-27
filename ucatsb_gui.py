@@ -21,6 +21,7 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
     QGroupBox, QComboBox, QDoubleSpinBox, QSpinBox, QLabel,
     QButtonGroup, QRadioButton, QPushButton, QFileDialog, QMessageBox,
+    QTabWidget,
 )
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg, NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
@@ -28,8 +29,9 @@ import matplotlib.dates as mdates
 
 from plot_co2_timeseries import (
     drop_presync_rows, find_intervals, merge_close_intervals,
-    shade_intervals, cal_mean_points, load_cal_bottles, most_common_serial,
-    mean_std_label, CALS_YAML_PATH,
+    shade_intervals, cal_mean_points, load_cal_bottles, load_cal_roster,
+    most_common_serial, mean_std_label, calibrate_series,
+    CALS_YAML_PATH, CAL_DRIFT_MODELS, CAL_DEFAULT_SMOOTH_EVENTS,
 )
 
 LINE_COLOR = "#2a78d6"
@@ -142,6 +144,30 @@ def save_config(path: Path, config: dict):
     path.write_text(yaml.safe_dump(config, sort_keys=False))
 
 
+class PlotPane(QWidget):
+    """One matplotlib Figure with its own toolbar, as a tab page.
+
+    Both views rebuild their Figure from scratch on every draw (the panel
+    count varies), so each needs its own toolbar nav-stack reset -- hence a
+    widget rather than a bare canvas.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        self.figure = Figure(constrained_layout=True)
+        self.canvas = FigureCanvasQTAgg(self.figure)
+        self.toolbar = NavigationToolbar(self.canvas, self)
+        layout.addWidget(self.toolbar)
+        layout.addWidget(self.canvas)
+
+    def reset_nav(self):
+        """Point the toolbar's Home at the newly-built full-scale view; its
+        nav stack otherwise still references the just-destroyed Axes."""
+        self.toolbar.update()
+        self.toolbar.push_current()
+
+
 class UcatsbGui(QMainWindow):
     def __init__(self, csv_path: Path = None, config_path: Path = DEFAULT_CONFIG_PATH):
         super().__init__()
@@ -162,20 +188,26 @@ class UcatsbGui(QMainWindow):
         self._loading = False
         self._initializing = True
         self._analysis = None
+        self._calibration = None
+        self._dirty = {"main": True, "cal": True}
+        self._preserve = {"main": False, "cal": False}
         self.cal_bottles = load_cal_bottles(CALS_YAML_PATH)
+        self.cal_roster = load_cal_roster(CALS_YAML_PATH)
         self.ax = None
         self.ax_aux = None
         self.ax_aux2 = None
         self._had_aux_panel = None
         self._last_aux_key = None
         self._last_right_axis_key = None
+        self._cal_ax = None
+        self._last_cal_key = None
 
         central = QWidget()
         self.setCentralWidget(central)
         layout = QHBoxLayout(central)
 
         layout.addWidget(self._build_controls(), 0)
-        layout.addWidget(self._build_canvas(), 1)
+        layout.addWidget(self._build_tabs(), 1)
 
         self._initializing = False
 
@@ -395,15 +427,29 @@ class UcatsbGui(QMainWindow):
             title += f" {value:g} {unit}"
         return title
 
-    def _build_canvas(self):
-        container = QWidget()
-        layout = QVBoxLayout(container)
-        self.figure = Figure(constrained_layout=True)
-        self.canvas = FigureCanvasQTAgg(self.figure)
-        self.toolbar = NavigationToolbar(self.canvas, self)
-        layout.addWidget(self.toolbar)
-        layout.addWidget(self.canvas)
-        return container
+    def _build_tabs(self):
+        """Timeseries and Calibration views as tabs over the shared controls.
+
+        The controls panel deliberately stays outside the tabs: every control
+        affects both views, so moving them inside would mean duplicating the
+        gas selector or making one tab depend on state invisible from the
+        other.
+        """
+        self.main_pane = PlotPane()
+        self.cal_pane = PlotPane()
+        # Keep the historical attribute names bound to the timeseries pane so
+        # redraw()'s existing body needs no changes.
+        self.figure = self.main_pane.figure
+        self.canvas = self.main_pane.canvas
+        self.toolbar = self.main_pane.toolbar
+
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self.main_pane, "Timeseries")
+        self.tabs.addTab(self.cal_pane, "Calibration")
+        # Connected after both addTab calls -- the first one fires
+        # currentChanged before the second tab exists.
+        self.tabs.currentChanged.connect(self.on_tab_changed)
+        return self.tabs
 
     def _apply_settings_to_controls(self, settings: dict):
         """Populate the controls from a per-gas settings dict without
@@ -481,17 +527,48 @@ class UcatsbGui(QMainWindow):
         self.refresh(preserve_view=True)
 
     def refresh(self, preserve_view=False):
-        """Invalidate the cached analysis and redraw.
+        """Invalidate the cached analysis, redraw the visible pane, and mark
+        the other one dirty so it redraws when it is next shown.
 
-        The single entry point for every state change, so the cache has
+        The single entry point for every state change, so the caches have
         exactly one invalidation site. Deliberately invalidates
         unconditionally rather than comparing a composite key of
         (file, gas, warm-up, tolerance, cal windows, ...): such a key is easy
         to get subtly wrong and then serves a stale plot, whereas
-        invalidate-everything cannot. The recompute is milliseconds.
+        invalidate-everything cannot. The recompute is milliseconds against
+        ~100 ms of rendering, and redrawing only the visible pane avoids
+        paying even that twice.
         """
         self._analysis = None
-        self.redraw(preserve_view=preserve_view)
+        self._calibration = None
+        for pane in self._dirty:
+            self._dirty[pane] = True
+            # A requested full rescale has to survive until it is actually
+            # honoured: changing gas (rescale) and then nudging a spinbox
+            # (preserve) must still rescale the pane that never redrew.
+            if not preserve_view:
+                self._preserve[pane] = False
+        self._draw_current_tab()
+
+    def _draw_current_tab(self):
+        """Draw whichever pane is showing, if it is dirty."""
+        if self.df is None:
+            return
+        name = "cal" if self.tabs.currentIndex() == 1 else "main"
+        if not self._dirty.get(name):
+            return
+        preserve = self._preserve.get(name, False)
+        if name == "cal":
+            self.redraw_cal(preserve_view=preserve)
+        else:
+            self.redraw(preserve_view=preserve)
+        self._dirty[name] = False
+        self._preserve[name] = True
+
+    def on_tab_changed(self, index):
+        if self._initializing:
+            return
+        self._draw_current_tab()
 
     def _get_analysis(self):
         """Masks, cal intervals and per-injection cal means for the current
@@ -713,8 +790,7 @@ class UcatsbGui(QMainWindow):
         # range -- reset the toolbar's view stack so Home returns to *this*
         # full-scale view, then (optionally) re-apply the pre-redraw zoom on
         # top of it, without pushing that onto the stack.
-        self.toolbar.update()
-        self.toolbar.push_current()
+        self.main_pane.reset_nav()
         if old_main_view is not None:
             ax.set_xlim(old_main_view[0])
             ax.set_ylim(old_main_view[1])
@@ -731,6 +807,18 @@ class UcatsbGui(QMainWindow):
         self._last_right_axis_key = right_axis_key
 
         self.canvas.draw()
+
+    def redraw_cal(self, preserve_view=False):
+        """Draw the Calibration tab. Placeholder until the panels land."""
+        fig = self.cal_pane.figure
+        fig.clear()
+        ax = fig.add_subplot(111)
+        ax.set_axis_off()
+        ax.text(0.5, 0.5, "Calibration view", ha="center", va="center",
+                color=MUTED_COLOR, fontsize=12, transform=ax.transAxes)
+        self.cal_pane.reset_nav()
+        self._cal_ax = ax
+        self.cal_pane.canvas.draw()
 
 
 def main():
