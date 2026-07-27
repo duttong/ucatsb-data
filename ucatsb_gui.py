@@ -51,6 +51,13 @@ GASES = {
     "CO2": {"value_col": "d1_CO2_ppm", "ylabel": "CO2 (ppm)", "title": "UCATS-B CO2 (uncalibrated) timeseries", "detector": "d1"},
     "N2O": {"value_col": "d1_N2O_ppb", "ylabel": "N2O (ppb)", "title": "UCATS-B N2O (uncalibrated) timeseries", "detector": "d1"},
     "CH4": {"value_col": "d2_CH4_ppb", "ylabel": "CH4 (ppb)", "title": "UCATS-B CH4 (uncalibrated) timeseries", "detector": "d2"},
+    # Ozone comes from its own dedicated sensor, not an Aeris detector, and
+    # isn't run through the cal-bottle system -- has_masking=False skips the
+    # warm-up/pressure-tol/cal-window machinery entirely for this gas, and
+    # detector=None disables the Detector Pressure/T_gas aux traces (there's
+    # no matching column to route to). Kept last so it sorts to the bottom
+    # of the Gas combo box.
+    "Ozone": {"value_col": "oz_o3best", "ylabel": "O3 (ppb)", "title": "UCATS-B O3 timeseries", "detector": None, "has_masking": False},
 }
 
 REQUIRED_COLUMNS = [
@@ -77,13 +84,19 @@ def aux_trace_info(selection: str, gas: str, other_column: str = None):
     to carry a redundant CO/N2O channel but now carries CH4/H2O instead), or
     None for "No Figure". "Other" plots whatever column the catch-all combo
     box is set to (its units are unknown, so the column name doubles as the
-    ylabel); None if no column is selected yet.
+    ylabel); None if no column is selected yet. Ozone has no detector of its
+    own, so Detector Pressure/T_gas have nothing to route to and fall back
+    to None (same as "No Figure") rather than raising.
     """
     detector = GASES[gas]["detector"]
     if selection == "Detector Pressure":
+        if detector is None:
+            return None
         col = f"{detector}_P_mbars"
         return col, f"{col} (mbar)"
     if selection == "T_gas":
+        if detector is None:
+            return None
         col = f"{detector}_T_gas"
         return col, f"{col} (°C)"
     if selection == "oz_o3":
@@ -105,15 +118,21 @@ DEFAULT_GAS_SETTINGS = {
 
 
 def load_config(path: Path) -> dict:
-    """Load per-gas control settings, filling in defaults for anything missing."""
-    config = {gas: copy.deepcopy(DEFAULT_GAS_SETTINGS) for gas in GASES}
+    """Load per-gas control settings, filling in defaults for anything
+    missing. Gases with has_masking=False (Ozone) never get an entry --
+    they don't use warm-up/pressure-tol/cal-window settings at all.
+    """
+    config = {
+        gas: copy.deepcopy(DEFAULT_GAS_SETTINGS)
+        for gas, info in GASES.items() if info.get("has_masking", True)
+    }
     if path.exists():
         try:
             loaded = yaml.safe_load(path.read_text()) or {}
         except (yaml.YAMLError, OSError) as e:
             print(f"Warning: could not read {path}: {e}")
             loaded = {}
-        for gas in GASES:
+        for gas in config:
             if isinstance(loaded.get(gas), dict):
                 config[gas].update(loaded[gas])
     return config
@@ -234,7 +253,7 @@ class UcatsbGui(QMainWindow):
         self.right_axis_combo.addItems(other_columns)
         self.right_axis_combo.blockSignals(False)
 
-        self._apply_settings_to_controls(self.config[self.current_gas])
+        self._select_gas(self.current_gas)
         self._initializing = was_initializing
         if not self._initializing:
             self.redraw()
@@ -297,8 +316,8 @@ class UcatsbGui(QMainWindow):
 
         vbox.addWidget(aux_box)
 
-        mask_box = QGroupBox("Data Masking")
-        mask_form = QFormLayout(mask_box)
+        self.mask_box = QGroupBox("Data Masking")
+        mask_form = QFormLayout(self.mask_box)
 
         self.warmup_spin = QSpinBox()
         self.warmup_spin.setRange(0, 120)
@@ -316,7 +335,7 @@ class UcatsbGui(QMainWindow):
         self.pressure_tol_spin.valueChanged.connect(self.on_control_changed)
         mask_form.addRow(f"Pressure tol\n(±{D1_P_TARGET_MBARS:.0f} mbar target):", self.pressure_tol_spin)
 
-        vbox.addWidget(mask_box)
+        vbox.addWidget(self.mask_box)
 
         # Visual order swapped: the 100% bottle box appears above the 50% one.
         self.cal2_box, self.cal2_start_spin, self.cal2_end_spin = self._add_cal_window_box(
@@ -405,11 +424,23 @@ class UcatsbGui(QMainWindow):
             "cal2_window_s": [self.cal2_start_spin.value(), self.cal2_end_spin.value()],
         }
 
+    def _select_gas(self, gas: str):
+        """Sync gas-dependent controls (masking/cal boxes, per-gas
+        settings) to `gas`. Shared by on_gas_changed and load_csv so a
+        freshly loaded file ends up in the same state as if the user had
+        picked this gas from the combo box themselves."""
+        self.current_gas = gas
+        has_masking = GASES[gas].get("has_masking", True)
+        self.mask_box.setEnabled(has_masking)
+        self.cal1_box.setEnabled(has_masking)
+        self.cal2_box.setEnabled(has_masking)
+        if has_masking:
+            self._apply_settings_to_controls(self.config[gas])
+
     def on_gas_changed(self, new_gas: str):
         if not new_gas:
             return
-        self.current_gas = new_gas
-        self._apply_settings_to_controls(self.config[new_gas])
+        self._select_gas(new_gas)
         if self._initializing:
             return
         self.redraw()
@@ -453,6 +484,7 @@ class UcatsbGui(QMainWindow):
             return
         gas = GASES[self.current_gas]
         value_col = gas["value_col"]
+        has_masking = gas.get("has_masking", True)
         warmup_minutes = self.warmup_spin.value()
         pressure_tol = self.pressure_tol_spin.value()
         cal0_window = (self.cal1_start_spin.value(), self.cal1_end_spin.value())
@@ -499,13 +531,13 @@ class UcatsbGui(QMainWindow):
             ax = self.figure.add_subplot(111)
         ax.set_facecolor("#fcfcfb")
 
+        # bad_pressure/warmup are computed unconditionally -- even for a gas
+        # with no masking of its own (Ozone), the aux panel can still show
+        # an Aeris trace (e.g. Detector Pressure) that these masks apply to.
+        # Only their use on the *main* plot (shading/notes/cal exclusion) is
+        # gated on has_masking below.
         cal = (df["j_sol_cals"].fillna(0).astype(bool)
                | df["j_sol_aircal"].fillna(0).astype(bool))
-        shade_intervals(ax, df["datetime"], cal, CAL_SHADE_COLOR, alpha=0.3)
-
-        cal_intervals = merge_close_intervals(
-            find_intervals(df["datetime"], cal), pd.Timedelta(seconds=CAL_MERGE_GAP_S)
-        )
 
         bad_pressure = (df["d1_P_mbars"] - D1_P_TARGET_MBARS).abs() > pressure_tol
         bad_pressure = bad_pressure.fillna(False)
@@ -513,27 +545,39 @@ class UcatsbGui(QMainWindow):
         warmup_end = df["datetime"].iloc[0] + pd.Timedelta(minutes=warmup_minutes)
         warmup = df["datetime"] < warmup_end
 
-        shade_intervals(ax, df["datetime"], warmup, WARMUP_EXCLUDE_COLOR, alpha=0.15)
-        shade_intervals(ax, df["datetime"], bad_pressure, PRESSURE_EXCLUDE_COLOR, alpha=0.15)
+        if has_masking:
+            shade_intervals(ax, df["datetime"], cal, CAL_SHADE_COLOR, alpha=0.3)
+            shade_intervals(ax, df["datetime"], warmup, WARMUP_EXCLUDE_COLOR, alpha=0.15)
+            shade_intervals(ax, df["datetime"], bad_pressure, PRESSURE_EXCLUDE_COLOR, alpha=0.15)
 
-        # Cal means are estimated from the raw data with these masks applied
-        # -- a cal point can be dropped entirely if its window has no valid data.
-        exclude_mask = bad_pressure | warmup
-        cal_points = cal_mean_points(
-            df, cal_intervals, value_col, cal0_window, cal1_window,
-            cal_bottles=self.cal_bottles, gas_key=self.current_gas,
-            exclude_mask=exclude_mask,
-        )
+            cal_intervals = merge_close_intervals(
+                find_intervals(df["datetime"], cal), pd.Timedelta(seconds=CAL_MERGE_GAP_S)
+            )
+            # Cal means are estimated from the raw data with these masks
+            # applied -- a cal point can be dropped entirely if its window
+            # has no valid data.
+            exclude_mask = bad_pressure | warmup
+            cal_points = cal_mean_points(
+                df, cal_intervals, value_col, cal0_window, cal1_window,
+                cal_bottles=self.cal_bottles, gas_key=self.current_gas,
+                exclude_mask=exclude_mask,
+            )
+        else:
+            cal_points = []
 
         plot_data = df[["datetime", value_col]].dropna()
         line, = ax.plot(plot_data["datetime"], plot_data[value_col], color=LINE_COLOR, linewidth=1.2)
 
+        # cal0_pts/cal1_pts are guaranteed empty when has_masking is False
+        # (cal_points == []), so cal0_label/cal1_label are never read below
+        # without having been set here first.
         cal0_pts = [(t, v) for t, v, state, serial in cal_points if state == 0]
         cal1_pts = [(t, v) for t, v, state, serial in cal_points if state == 1]
-        cal0_label = most_common_serial(cal_points, 0) or "Cal 1"
-        cal1_label = most_common_serial(cal_points, 1) or "Cal 2"
-        self.cal1_box.setTitle(self._cal_box_title(cal0_label, "Cal 1 Mean Window"))
-        self.cal2_box.setTitle(self._cal_box_title(cal1_label, "Cal 2 Mean Window"))
+        if has_masking:
+            cal0_label = most_common_serial(cal_points, 0) or "Cal 1"
+            cal1_label = most_common_serial(cal_points, 1) or "Cal 2"
+            self.cal1_box.setTitle(self._cal_box_title(cal0_label, "Cal 1 Mean Window"))
+            self.cal2_box.setTitle(self._cal_box_title(cal1_label, "Cal 2 Mean Window"))
 
         handles = [line]
         labels = [f"{gas['ylabel']} (ambient)"]
@@ -566,14 +610,15 @@ class UcatsbGui(QMainWindow):
         ax.legend(handles, labels, loc="lower right", fontsize=9, framealpha=0.9)
 
         notes = []
-        if cal.any():
-            notes.append("gray = calibration/cal-air (j_sol_cals, j_sol_aircal)")
-        if warmup.any():
-            notes.append(f"orange = excluded (first {warmup_minutes} min warm-up)")
-        if bad_pressure.any():
-            notes.append(
-                f"light red = excluded (d1_P_mbars outside {D1_P_TARGET_MBARS:.0f}±{pressure_tol:.2f} mbar)"
-            )
+        if has_masking:
+            if cal.any():
+                notes.append("gray = calibration/cal-air (j_sol_cals, j_sol_aircal)")
+            if warmup.any():
+                notes.append(f"orange = excluded (first {warmup_minutes} min warm-up)")
+            if bad_pressure.any():
+                notes.append(
+                    f"light red = excluded (d1_P_mbars outside {D1_P_TARGET_MBARS:.0f}±{pressure_tol:.2f} mbar)"
+                )
         if notes:
             ax.text(
                 0.01, 0.98, "\n".join(notes),
