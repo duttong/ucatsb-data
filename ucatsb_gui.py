@@ -18,7 +18,7 @@ from pathlib import Path
 
 import pandas as pd
 import yaml
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
     QGroupBox, QComboBox, QDoubleSpinBox, QSpinBox, QLabel,
@@ -32,7 +32,8 @@ import matplotlib.dates as mdates
 
 from plot_co2_timeseries import (
     drop_presync_rows, find_intervals, merge_close_intervals,
-    shade_intervals, cal_mean_points, load_cal_bottles, load_cal_roster,
+    shade_intervals, cal_mean_points, load_cal_roster, load_cal_assignment,
+    select_cal_bottles,
     most_common_serial, mean_std_label, calibrate_series, post_cal_flush_mask,
     box_stats,
     plot_calibration_panels, export_calibrated_csv,
@@ -134,29 +135,75 @@ DEFAULT_GAS_SETTINGS = {
 }
 
 
-def load_config(path: Path) -> dict:
-    """Load per-gas control settings, filling in defaults for anything
-    missing. Gases with has_masking=False (Ozone) never get an entry --
-    they don't use warm-up/pressure-tol/cal-window settings at all.
+def flight_config_path(csv_path: Path) -> Path:
+    """Where a dataset's own settings live: <dataset>_conf.yaml, beside the
+    CSV. Per-flight rather than global because the right warm-up, pressure
+    tolerance, cal windows and -- above all -- cal tanks are properties of the
+    flight, and re-deriving them every time a file is reopened loses work."""
+    return Path(csv_path).with_name(f"{Path(csv_path).stem}_conf.yaml")
+
+
+def _read_yaml(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        return yaml.safe_load(path.read_text()) or {}
+    except (yaml.YAMLError, OSError) as e:
+        print(f"Warning: could not read {path}: {e}")
+        return {}
+
+
+def load_config(path: Path, template: dict = None) -> dict:
+    """Load per-gas control settings, filling in anything missing from
+    `template` (the app-level config, for a flight being opened for the first
+    time) or from DEFAULT_GAS_SETTINGS. Gases with has_masking=False (Ozone)
+    never get an entry -- they don't use warm-up/pressure-tol/cal-window
+    settings at all.
+
+    Gas blocks only. The tank selection shares the same file but is kept out
+    of this dict deliberately -- see load_cal_selection.
     """
     config = {
-        gas: copy.deepcopy(DEFAULT_GAS_SETTINGS)
+        gas: copy.deepcopy((template or {}).get(gas) or DEFAULT_GAS_SETTINGS)
         for gas, info in GASES.items() if info.get("has_masking", True)
     }
-    if path.exists():
-        try:
-            loaded = yaml.safe_load(path.read_text()) or {}
-        except (yaml.YAMLError, OSError) as e:
-            print(f"Warning: could not read {path}: {e}")
-            loaded = {}
-        for gas in config:
-            if isinstance(loaded.get(gas), dict):
-                config[gas].update(loaded[gas])
+    for gas, settings in config.items():
+        for key, value in DEFAULT_GAS_SETTINGS.items():
+            settings.setdefault(key, copy.deepcopy(value))
+    loaded = _read_yaml(path)
+    for gas in config:
+        if isinstance(loaded.get(gas), dict):
+            config[gas].update(loaded[gas])
     return config
 
 
-def save_config(path: Path, config: dict):
-    path.write_text(yaml.safe_dump(config, sort_keys=False))
+def load_cal_selection(path: Path, default: dict) -> dict:
+    """The flight's `cals: {cal0: ..., cal1: ...}` choice from its
+    <dataset>_conf.yaml, falling back to `default` (cals.yaml's own block).
+
+    Kept out of load_config's dict, and out of the app-level config file, on
+    purpose: cals.yaml describes the tanks plumbed in *now*, so it is the only
+    safe default for a flight nobody has assigned tanks to yet. Seeding it
+    from "whatever the last flight used" instead would silently apply one
+    flight's tanks to another, which is exactly the error the Cal Tanks tab
+    exists to prevent.
+    """
+    selection = dict(default)
+    loaded = _read_yaml(path).get("cals")
+    if isinstance(loaded, dict):
+        selection.update({k: v for k, v in loaded.items()
+                          if k in ("cal0", "cal1") and isinstance(v, str)})
+    return selection
+
+
+def save_config(path: Path, config: dict, cal_selection: dict = None):
+    """Write the per-gas blocks, plus the tank selection when one is given
+    (i.e. for a flight's own conf file -- the app-level config stays free of
+    tank choices, for the reason in load_cal_selection)."""
+    doc = dict(config)
+    if cal_selection:
+        doc = {"cals": dict(cal_selection), **doc}
+    path.write_text(yaml.safe_dump(doc, sort_keys=False))
 
 
 class PlotPane(QWidget):
@@ -349,6 +396,11 @@ class UcatsbGui(QMainWindow):
         self.available_gases = {}
         self.other_columns = []
 
+        # Two config files, with different jobs: the app-level one is the
+        # template a never-before-opened flight starts from, and config_path
+        # is whatever is currently authoritative -- the flight's own
+        # <dataset>_conf.yaml once a dataset is loaded.
+        self.default_config_path = config_path
         self.config_path = config_path
         self.config = load_config(config_path)
         self.current_gas = None
@@ -367,8 +419,13 @@ class UcatsbGui(QMainWindow):
         self.show_calibrated = False
         self._dirty = {"main": True, "cal": True}
         self._preserve = {"main": False, "cal": False}
-        self.cal_bottles = load_cal_bottles(CALS_YAML_PATH)
         self.cal_roster = load_cal_roster(CALS_YAML_PATH)
+        # cals.yaml's own pairing is the default only; a flight's conf file
+        # overrides it, and the Cal Tanks tab edits it.
+        self.default_cal_selection = load_cal_assignment(CALS_YAML_PATH)
+        self.cal_selection = dict(self.default_cal_selection)
+        self.cal_bottles = select_cal_bottles(self.cal_roster,
+                                              self.cal_selection.values())
         self.ax = None
         self.ax_aux = None
         self.ax_aux2 = None
@@ -436,6 +493,8 @@ class UcatsbGui(QMainWindow):
         self.other_column = other_columns[0] if other_columns else None
         self.right_axis_column = None
 
+        self._adopt_flight_config(csv_path)
+
         self.setWindowTitle(f"UCATS-B Viewer - {csv_path.name}")
         self.file_label.setText(csv_path.name)
         self.file_label.setToolTip(str(csv_path))
@@ -468,6 +527,38 @@ class UcatsbGui(QMainWindow):
         self._initializing = was_initializing
         if not self._initializing:
             self.refresh()
+
+    def _adopt_flight_config(self, csv_path: Path):
+        """Switch to this dataset's own <dataset>_conf.yaml, seeding it from
+        the app-level config the first time the flight is opened, and write it
+        out immediately so the file exists (with every gas in it) from the
+        moment the data is loaded rather than only once a control is touched.
+
+        If the dataset's directory can't be written to -- a read-only archive
+        or a mounted share -- the app falls back to the app-level config
+        rather than failing the load, and says so once. Losing per-flight
+        persistence is worth less than losing the ability to open the file.
+        """
+        path = flight_config_path(csv_path)
+        template = load_config(self.default_config_path)
+        self.config = load_config(path, template=template)
+        self.cal_selection = load_cal_selection(path, self.default_cal_selection)
+        self._rebuild_cal_bottles()
+
+        self.config_path = path
+        try:
+            save_config(path, self.config, self.cal_selection)
+        except OSError as e:
+            print(f"Warning: could not write {path}: {e}")
+            self.config_path = self.default_config_path
+        self._apply_cal_selection_to_controls()
+
+    def _rebuild_cal_bottles(self):
+        """The two tanks matching is allowed to consider, from the current
+        selection. Called wherever cal_selection changes -- cal_bottles is
+        derived state and must never be edited on its own."""
+        self.cal_bottles = select_cal_bottles(self.cal_roster,
+                                              self.cal_selection.values())
 
     def on_load_data_clicked(self):
         start_dir = str(self.csv_path.parent) if self.csv_path else str(Path.cwd())
@@ -570,6 +661,22 @@ class UcatsbGui(QMainWindow):
         self.flag_air_spin.valueChanged.connect(self.on_control_changed)
         mask_form.addRow("Flag Air\n(after cal):", self.flag_air_spin)
 
+        # Warm-up, detector pressure and the cal timing are properties of the
+        # instrument on this flight rather than of the species, so the same
+        # values usually want to apply to every gas -- but the settings stay
+        # per-gas, so that a gas that does need its own can still have it.
+        # This button is the bridge. It lives in this box but reaches the cal
+        # window boxes below too, which the label and tooltip have to say.
+        self.copy_mask_button = QPushButton(self.COPY_SETTINGS_LABEL)
+        self.copy_mask_button.setToolTip(
+            "Copy warm-up, pressure tolerance, Flag Air and both cal mean\n"
+            "windows from the current gas to every other calibrated gas\n"
+            "(CO2/N2O/CH4). The drift model and smoothing window are left\n"
+            "alone."
+        )
+        self.copy_mask_button.clicked.connect(self.on_copy_masking_to_all)
+        mask_form.addRow(self.copy_mask_button)
+
         vbox.addWidget(self.mask_box)
 
         # Visual order swapped: the 100% bottle box appears above the 50% one.
@@ -583,16 +690,36 @@ class UcatsbGui(QMainWindow):
         self.cal_box = QGroupBox("Calibration")
         cal_form = QFormLayout(self.cal_box)
 
+        # One row, one label: the smoothing window only means anything for the
+        # "smooth" model, so it reads as part of that choice rather than as an
+        # independent setting, and it greys out with the model set to anything
+        # else. Its own label would just repeat what the suffix already says.
+        # Label carried inside the row and added as a spanning row, not via
+        # addRow(str, layout): the control panel is a fixed 300 px, and in the
+        # two-column form the label column got squeezed to nothing by the
+        # combo's stretch -- the label silently vanished.
+        drift_row = QHBoxLayout()
+        drift_row.setSpacing(4)
+        drift_row.addWidget(QLabel("Drift model:"))
         self.drift_combo = QComboBox()
         self.drift_combo.addItems(CAL_DRIFT_MODELS)
         self.drift_combo.currentTextChanged.connect(self.on_control_changed)
-        cal_form.addRow("Drift model:", self.drift_combo)
+        drift_row.addWidget(self.drift_combo, 1)
 
         self.smooth_spin = QSpinBox()
         self.smooth_spin.setRange(2, 21)
-        self.smooth_spin.setSuffix(" events")
+        # "ev" rather than " events": the row has a label, a combo and this
+        # spin box to fit into a 300 px panel, and the full word clipped. The
+        # tooltip carries the meaning.
+        self.smooth_spin.setSuffix(" ev")
+        self.smooth_spin.setToolTip(
+            "Width of the centred rolling mean over cal events, used by the\n"
+            '"smooth" drift model only.'
+        )
         self.smooth_spin.valueChanged.connect(self.on_control_changed)
-        cal_form.addRow("Smooth over:", self.smooth_spin)
+        self.smooth_spin.setMaximumWidth(72)
+        drift_row.addWidget(self.smooth_spin)
+        cal_form.addRow(drift_row)
 
         # Session-only, deliberately not persisted and off by default: the
         # timeseries is documented as showing uncalibrated data, and a
@@ -661,12 +788,15 @@ class UcatsbGui(QMainWindow):
         return title
 
     def _build_tabs(self):
-        """Timeseries and Calibration views as tabs over the shared controls.
+        """Timeseries, Calibration and Cal Tanks as tabs over the shared
+        controls.
 
         The controls panel deliberately stays outside the tabs: every control
-        affects both views, so moving them inside would mean duplicating the
-        gas selector or making one tab depend on state invisible from the
-        other.
+        affects both plot views, so moving them inside would mean duplicating
+        the gas selector or making one tab depend on state invisible from the
+        other. Cal Tanks is the exception that proves it -- the tank pairing
+        is one per flight, not one per gas or per view, so it has nowhere
+        sensible to live in a per-gas control panel.
         """
         self.main_pane = PlotPane()
         self.cal_pane = PlotPane()
@@ -681,13 +811,168 @@ class UcatsbGui(QMainWindow):
         self.canvas = self.main_pane.canvas
         self.toolbar = self.main_pane.toolbar
 
+        self.tanks_pane = self._build_cal_tanks_pane()
+
         self.tabs = QTabWidget()
         self.tabs.addTab(self.main_pane, "Timeseries")
         self.tabs.addTab(self.cal_pane, "Calibration")
-        # Connected after both addTab calls -- the first one fires
-        # currentChanged before the second tab exists.
+        self.tabs.addTab(self.tanks_pane, "Cal Tanks")
+        # Connected after every addTab call -- the first one fires
+        # currentChanged before the other tabs exist.
         self.tabs.currentChanged.connect(self.on_tab_changed)
         return self.tabs
+
+    def _build_cal_tanks_pane(self):
+        """Which two roster tanks this flight flew.
+
+        Its own tab rather than another group box in the control panel: the
+        choice is per *flight*, while everything in that panel is per gas, and
+        getting it wrong invalidates every calibrated number for every gas at
+        once -- so it gets room for the roster values that let you check it.
+        """
+        pane = QWidget()
+        vbox = QVBoxLayout(pane)
+
+        intro = QLabel(
+            "Which two cal tanks were plumbed in for this flight. Defaults to "
+            "the pair named in cals.yaml, which describes the tanks in use "
+            "now — an older flight almost certainly flew different ones. The "
+            "choice is saved in this dataset's own <dataset>_conf.yaml, so it "
+            "travels with the flight."
+        )
+        intro.setWordWrap(True)
+        vbox.addWidget(intro)
+
+        box = QGroupBox("Tanks on this flight")
+        form = QFormLayout(box)
+        self.tank_combos = {}
+        for key in ("cal0", "cal1"):
+            combo = QComboBox()
+            # Order is cosmetic: match_cal_serial identifies the tank in each
+            # cal window by measured concentration, so cal0/cal1 name the SET
+            # of two tanks, not which solenoid state each is wired to. Said
+            # out loud here because the labels invite the opposite assumption.
+            combo.setToolTip(
+                "cal0/cal1 mirror the cals.yaml key names. Which of the two "
+                "is flowing in a given cal window is identified from the "
+                "measured concentration, not from this order."
+            )
+            combo.currentIndexChanged.connect(
+                functools.partial(self.on_cal_tank_changed, key))
+            form.addRow(f"{key}:", combo)
+            self.tank_combos[key] = combo
+        vbox.addWidget(box)
+
+        self.tank_warning = QLabel()
+        self.tank_warning.setWordWrap(True)
+        self.tank_warning.setStyleSheet(f"color: {PRESSURE_EXCLUDE_COLOR};")
+        vbox.addWidget(self.tank_warning)
+
+        values_box = QGroupBox("Assigned values (cals.yaml)")
+        values_layout = QVBoxLayout(values_box)
+        self.tank_values_label = QLabel()
+        self.tank_values_label.setTextFormat(Qt.PlainText)
+        self.tank_values_label.setStyleSheet("font-family: Menlo, monospace;")
+        values_layout.addWidget(self.tank_values_label)
+        vbox.addWidget(values_box)
+
+        reset_row = QHBoxLayout()
+        reset_button = QPushButton("Reset to cals.yaml default")
+        reset_button.clicked.connect(self.on_reset_cal_tanks)
+        reset_row.addWidget(reset_button)
+        reset_row.addStretch(1)
+        vbox.addLayout(reset_row)
+
+        self.tank_conf_label = QLabel()
+        self.tank_conf_label.setWordWrap(True)
+        self.tank_conf_label.setStyleSheet(f"color: {MUTED_COLOR};")
+        vbox.addWidget(self.tank_conf_label)
+
+        vbox.addStretch(1)
+        self._populate_tank_combos()
+        self._apply_cal_selection_to_controls()
+        return pane
+
+    def _populate_tank_combos(self):
+        """Fill both combos with the whole roster. Every tank ever used is
+        offered, not just the two in cals.yaml's `cals:` block -- picking a
+        tank that is not the current pairing is the entire point of the tab."""
+        for combo in self.tank_combos.values():
+            combo.blockSignals(True)
+            combo.clear()
+            for serial in sorted(self.cal_roster):
+                info = self.cal_roster[serial].get("info")
+                combo.addItem(f"{serial} ({info})" if info else serial, serial)
+            combo.blockSignals(False)
+
+    def _apply_cal_selection_to_controls(self):
+        """Sync the Cal Tanks tab to self.cal_selection without re-triggering
+        a save/redraw per combo (same guard pattern as the control panel's
+        _apply_settings_to_controls)."""
+        if not hasattr(self, "tank_combos"):
+            return
+        loading = self._loading
+        self._loading = True
+        for key, combo in self.tank_combos.items():
+            serial = self.cal_selection.get(key)
+            index = combo.findData(serial)
+            # A conf file naming a tank the roster has since lost leaves the
+            # combo where it is rather than silently retargeting it; the
+            # warning label below says the selection is incomplete.
+            if index >= 0:
+                combo.setCurrentIndex(index)
+        self._loading = loading
+        self._update_tank_readout()
+
+    def _update_tank_readout(self):
+        """Warning + assigned-value table for the current pairing."""
+        serials = [self.cal_selection.get(k) for k in ("cal0", "cal1")]
+        missing = [s for s in serials if s not in self.cal_roster]
+        warnings = []
+        if missing:
+            warnings.append(
+                f"Not in cals.yaml's roster: {', '.join(str(s) for s in missing)}. "
+                "Add the tank to cals.yaml, or pick another.")
+        elif serials[0] == serials[1]:
+            warnings.append(
+                "Both states point at the same tank, so there is no span: the "
+                "calibration degrades to an offset-only correction.")
+        for gas in self.available_gases or GASES:
+            if not GASES[gas].get("has_masking", True):
+                continue
+            without = [s for s in serials if s in self.cal_roster
+                       and self.cal_roster[s].get(gas) is None]
+            if without:
+                warnings.append(
+                    f"No assigned {gas} value for {', '.join(without)} — "
+                    f"{gas} cannot be calibrated with this pairing.")
+        self.tank_warning.setText("\n".join(warnings))
+        self.tank_warning.setVisible(bool(warnings))
+
+        rows = [f"{'gas':<6}" + "".join(f"{str(s or '-'):>22}" for s in serials)]
+        for gas, info in GASES.items():
+            if not info.get("has_masking", True):
+                continue
+            unit = info["ylabel"].split("(")[-1].rstrip(")")
+            cells = []
+            for serial in serials:
+                nominal = self.cal_roster.get(serial, {})
+                value = nominal.get(gas)
+                if value is None:
+                    cells.append(f"{'--':>22}")
+                else:
+                    unc = nominal.get(f"{gas}_unc")
+                    text = f"{value:g}" + (f" ± {unc:g}" if unc is not None else "")
+                    cells.append(f"{text + ' ' + unit:>22}")
+            rows.append(f"{gas:<6}" + "".join(cells))
+        self.tank_values_label.setText("\n".join(rows))
+
+        if self.csv_path is None:
+            self.tank_conf_label.setText(
+                "No dataset loaded — this is cals.yaml's default pairing. "
+                "Load a flight to save a choice against it.")
+        else:
+            self.tank_conf_label.setText(f"Saved in {self.config_path.name}")
 
     def _apply_settings_to_controls(self, settings: dict):
         """Populate the controls from a per-gas settings dict without
@@ -751,8 +1036,102 @@ class UcatsbGui(QMainWindow):
         self.drift_model = settings["drift_model"]
         self.drift_smooth_events = settings["drift_smooth_events"]
         self.smooth_spin.setEnabled(self.drift_model == "smooth")
-        save_config(self.config_path, self.config)
+        self._save_settings()
         self.refresh(preserve_view=True)
+
+    def _save_settings(self):
+        """Persist to the flight's conf file, and to the app-level config as
+        the template the next never-before-opened flight starts from. Both,
+        because either alone loses something: the flight file alone means
+        every new flight reverts to shipped defaults, and the app-level file
+        alone is what the per-flight requirement exists to replace.
+
+        Tank choices only ever reach the flight file (see load_cal_selection).
+        """
+        targets = [(self.config_path, self.cal_selection)]
+        if self.config_path != self.default_config_path:
+            targets.append((self.default_config_path, None))
+        for path, cal_selection in targets:
+            try:
+                save_config(path, self.config, cal_selection)
+            except OSError as e:
+                print(f"Warning: could not write {path}: {e}")
+
+    # What the button copies: the masking values and both cal mean windows.
+    # The drift model and its smoothing window are the only per-gas settings
+    # left out -- they are a judgement about that gas's cal record (how noisy
+    # its injections are), not a description of the flight.
+    COPIED_SETTING_KEYS = ("warmup_min", "pressure_tol_mbar", "flag_air_s",
+                           "cal1_window_s", "cal2_window_s")
+    COPY_SETTINGS_LABEL = "Copy settings to all gases"
+
+    def on_copy_masking_to_all(self):
+        """Apply this gas's masking + cal-window settings to every other
+        calibrated gas.
+
+        Ozone is excluded by construction rather than by name -- it has no
+        entry in self.config at all (has_masking=False), so "every gas in the
+        config" is already the right set and stays right if a gas is added.
+        """
+        if self.current_gas is None:
+            return
+        # Read from the live controls, not from self.config: a spin box being
+        # edited by keyboard commits its value on focus-out, which the click
+        # on this button is, and the ordering of that against valueChanged is
+        # not something to bet the copied numbers on.
+        live = self._controls_to_settings()
+        self.config[self.current_gas] = live
+        targets = [gas for gas in self.config if gas != self.current_gas]
+        for gas in targets:
+            # deepcopy per target, not one shared source dict: cal1_window_s /
+            # cal2_window_s are lists, and handing every gas the same list
+            # object makes yaml.safe_dump emit anchors (&id001/*id001) into
+            # the conf file, and makes a later in-place edit of one gas's
+            # window silently change the others.
+            self.config[gas].update(
+                {key: copy.deepcopy(live[key]) for key in self.COPIED_SETTING_KEYS})
+        self._save_settings()
+        # No refresh: the current gas's own settings are unchanged, so the
+        # plots are still correct. The other gases redraw when selected.
+        self._flash_button(self.copy_mask_button,
+                           f"Copied to {', '.join(targets)}" if targets else "Nothing to copy",
+                           self.COPY_SETTINGS_LABEL)
+
+    def _flash_button(self, button, message, restore, msec=1600):
+        """Confirm an action in the button itself. A modal dialog for a
+        one-click settings copy would cost more attention than the action is
+        worth, and a status bar would be invisible next to the button."""
+        button.setText(message)
+        QTimer.singleShot(msec, lambda: button.setText(restore))
+
+    def on_cal_tank_changed(self, key, _index):
+        """A different tank for cal0/cal1 -- rewrites which bottles matching
+        may consider, so every cal point, label and calibrated number changes.
+        """
+        if self._loading or self._initializing:
+            return
+        serial = self.tank_combos[key].currentData()
+        if serial is None or serial == self.cal_selection.get(key):
+            return
+        self.cal_selection[key] = serial
+        self._rebuild_cal_bottles()
+        self._update_tank_readout()
+        self._save_settings()
+        # Full rescale, like a gas change and unlike every other control: the
+        # Calibration tab's top panel plots measured MINUS ASSIGNED, so a new
+        # tank shifts it by the difference in assigned values (11 ppm between
+        # CC470901 and CC302489), and the calibrated overlay moves with the
+        # intercept. Preserving the view there leaves the new points off-scale.
+        self.refresh(preserve_view=False)
+
+    def on_reset_cal_tanks(self):
+        if self.cal_selection == self.default_cal_selection:
+            return
+        self.cal_selection = dict(self.default_cal_selection)
+        self._rebuild_cal_bottles()
+        self._apply_cal_selection_to_controls()
+        self._save_settings()
+        self.refresh(preserve_view=False)
 
     def on_stats_box(self, ax, x0, x1, y0, y1):
         """Report n/mean/std for the points inside a dragged box, for whichever
@@ -880,10 +1259,21 @@ class UcatsbGui(QMainWindow):
         self._draw_current_tab()
 
     def _draw_current_tab(self):
-        """Draw whichever pane is showing, if it is dirty."""
+        """Draw whichever pane is showing, if it is dirty.
+
+        Keyed on the current *widget*, not the tab index: Cal Tanks draws
+        nothing, and an index test would have made it redraw the timeseries
+        (or, once a fourth tab appears, whatever else fell through the else).
+        """
         if self.df is None:
             return
-        name = "cal" if self.tabs.currentIndex() == 1 else "main"
+        widget = self.tabs.currentWidget()
+        if widget is self.cal_pane:
+            name = "cal"
+        elif widget is self.main_pane:
+            name = "main"
+        else:
+            return
         if not self._dirty.get(name):
             return
         preserve = self._preserve.get(name, False)

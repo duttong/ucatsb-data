@@ -189,20 +189,42 @@ def _read_cals_yaml(path: Path):
         return {}
 
 
-def load_cal_bottles(path: Path):
-    """Load cal bottle serials and their nominal gas concentrations from a
-    cals.yaml file (a local copy of ~/code/ucats-b/cals.yaml -- resync it by
-    hand if bottles change). Returns {serial: {"CO2": ..., "N2O": ..., ...}},
-    or {} if unavailable.
+def load_cal_assignment(path: Path):
+    """The `cals: {cal0: ..., cal1: ...}` block -- which two roster tanks are
+    plumbed in -- as {"cal0": serial, "cal1": serial}, or {} if unavailable.
 
-    Only the two serials named in the `cals:` block are returned. That is
-    deliberate: matching must consider only the tanks physically plumbed in
-    for this run, since an unrelated roster tank could otherwise sit closer to
-    a measured value and produce a wrong identification.
+    cals.yaml describes the CURRENT run, so this is only ever the *default*
+    for a flight. An older flight flew different tanks; the GUI stores the
+    per-flight choice in its <dataset>_conf.yaml and overrides this.
     """
     data = _read_cals_yaml(path)
-    serials = set(data.get("cals", {}).values())
-    return {serial: data[serial] for serial in serials if serial in data}
+    cals = data.get("cals")
+    return {k: v for k, v in cals.items() if isinstance(v, str)} if isinstance(cals, dict) else {}
+
+
+def select_cal_bottles(roster, serials):
+    """Narrow a full tank roster down to the ones actually plumbed in, as
+    {serial: {"CO2": ..., "N2O": ..., ...}}.
+
+    The single place that decides what bottle *matching* is allowed to see,
+    and it must stay narrow: an unrelated roster tank could otherwise sit
+    closer to a measured value than the real one and produce a wrong
+    identification. Unknown serials are dropped rather than raising, and a
+    duplicate (the same tank picked for both states) collapses to one entry
+    -- calibrate_series degrades to offset-only there rather than failing.
+    """
+    return {serial: roster[serial] for serial in dict.fromkeys(serials) if serial in roster}
+
+
+def load_cal_bottles(path: Path):
+    """Load the two plumbed cal bottles named in cals.yaml's `cals:` block,
+    with their nominal gas concentrations, as {serial: {...}} (or {}).
+
+    cals.yaml is a local copy of ~/code/ucats-b/cals.yaml -- resync it by hand
+    if the roster changes. This is the default pairing only; see
+    load_cal_assignment.
+    """
+    return select_cal_bottles(load_cal_roster(path), load_cal_assignment(path).values())
 
 
 def load_cal_roster(path: Path):

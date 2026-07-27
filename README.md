@@ -36,14 +36,87 @@ python3 ucatsb_gui.py /path/to/ucatsb-YYYYMMDDHH.csv
 Left panel:
 - **Gas** — switch the main plot between CO2 (`d1_CO2_ppm`), N2O (`d1_N2O_ppb`), and CH4 (`d2_CH4_ppb`), all uncalibrated. Only gases whose column exists in the loaded CSV are offered.
 - **Trace Above** — optionally add a smaller panel above the main plot: Detector Pressure, T_gas, or "Other". Detector Pressure/T_gas pull from whichever detector the active gas comes from (`d1` for CO2/N2O, `d2` for CH4). "Other" opens a combo box listing every remaining column in the loaded CSV (`oz_o3`, `oz_p`, `oz_t`, `j_sol_cals`, …), so anything in the file can be plotted without a dedicated control. A second combo box overlays any of those columns on a right-hand axis. "No Figure" returns to the single full-size plot.
-- **Data Masking** — warm-up exclusion (minutes from the start of the record) and detector pressure tolerance (±mbar around 140 mbar). Both are applied to the raw data *before* cal means are computed, not just drawn as bands — a cal point can disappear entirely if its averaging window has no valid data left. **Flag Air** (0–90 s, default 0 = off) additionally drops the air data immediately following each cal injection, while the detector cells are still clearing cal gas; unlike the other two it affects only the calibrated product, never the cal means or the raw trace. See [Post-cal flush](#post-cal-flush-flag-air).
-- **Cal Mean Windows** — one box per cal bottle, titled dynamically from `cals.yaml`: e.g. "50% Cal (CB09960) 206.51 ppm", or just "Cal (CC470901) 402.037 ppm" for a tank with no `info` label. The mole fraction shown is that tank's assigned value for whichever gas is currently active. Each box has a start/end offset in seconds relative to the last point in that calibration period (`Cal_p`), e.g. `-10 s` to `2 s` = `[Cal_p-10s, Cal_p+2s]` (positive values are allowed, reaching past `Cal_p`). Settings are saved per-gas to `ucatsb_gui_config.yaml` and reloaded on next launch.
+- **Data Masking** — warm-up exclusion (minutes from the start of the record) and detector pressure tolerance (±mbar around 140 mbar). Both are applied to the raw data *before* cal means are computed, not just drawn as bands — a cal point can disappear entirely if its averaging window has no valid data left. **Flag Air** (0–90 s, default 0 = off) additionally drops the air data immediately following each cal injection, while the detector cells are still clearing cal gas; unlike the other two it affects only the calibrated product, never the cal means or the raw trace. See [Post-cal flush](#post-cal-flush-flag-air). **Copy settings to all gases** applies these three values *and both cal mean windows* to every calibrated gas (CO2/N2O/CH4 — Ozone has no masking at all), since they describe the instrument on this flight rather than the species. Only the drift model and its smoothing window are left alone, being a judgement about how noisy that gas's own cal record is. Settings remain per-gas; the button is a shortcut, not a mode.
+- **Cal Mean Windows** — one box per cal bottle, titled dynamically from `cals.yaml`: e.g. "50% Cal (CB09960) 206.51 ppm", or just "Cal (CC470901) 402.037 ppm" for a tank with no `info` label. The mole fraction shown is that tank's assigned value for whichever gas is currently active. Each box has a start/end offset in seconds relative to the last point in that calibration period (`Cal_p`), e.g. `-10 s` to `2 s` = `[Cal_p-10s, Cal_p+2s]` (positive values are allowed, reaching past `Cal_p`). Settings are saved per-gas to the flight's own `<dataset>_conf.yaml` (see [Per-flight settings](#per-flight-settings-dataset_confyaml)) and reloaded whenever that dataset is opened again.
 - **Calibration** — drift model and smoothing window for the two-point calibration, a toggle to overlay the calibrated series on the main plot, and a CSV export. See [Calibration](#calibration) below.
 
-The two views (**Timeseries** and **Calibration**) are tabs sharing this one
-control panel — every control affects both.
+The three views (**Timeseries**, **Calibration** and **Cal Tanks**) are tabs
+sharing this one control panel — every control affects all of them.
 
-Zooming/panning (via the matplotlib toolbar) is preserved across masking, averaging, and upper-trace changes — only the Home button resets to full scale.
+Zooming/panning (via the matplotlib toolbar) is preserved across masking, averaging, and upper-trace changes — only the Home button, a gas change, and a cal-tank change reset to full scale.
+
+### Per-flight settings (`<dataset>_conf.yaml`)
+
+Settings belong to the flight, not to the app: the right warm-up, pressure
+tolerance, cal windows and — above all — cal tanks are properties of the
+dataset. So when a CSV is loaded, the viewer writes a settings file **next to
+that CSV**, named after it:
+
+```
+/path/to/ucatsb-2025021816.csv
+/path/to/ucatsb-2025021816_conf.yaml    <- created on load
+```
+
+It holds a block for every gas plus the flight's cal-tank pairing, and is
+rewritten on every control change:
+
+```yaml
+cals:
+  cal0: CC302489
+  cal1: CB09960
+CO2:
+  warmup_min: 12
+  pressure_tol_mbar: 0.3
+  flag_air_s: 38
+  cal1_window_s: [-8, -1]
+  cal2_window_s: [-8, -1]
+  drift_model: linear
+  drift_smooth_events: 3
+N2O:
+  ...
+```
+
+Reopening that CSV — in any session, from any directory — restores exactly
+those choices. `ucatsb_gui.py`'s own `ucatsb_gui_config.yaml` keeps working as
+before, but its job is now to be the **template** a flight opened for the
+first time starts from, so the settings you have converged on carry over to
+the next flight instead of reverting to shipped defaults. Two things follow:
+
+- Editing a control writes both files (the flight's, and the template).
+- The **tank pairing is never templated** — a flight with no conf file always
+  starts from `cals.yaml`, never from the last flight you had open. Tanks get
+  swapped between flights, and inheriting the previous flight's pair silently
+  is the one error that would corrupt every calibrated number without
+  announcing itself.
+
+If the dataset's directory is not writable (a read-only archive or a mounted
+share), the viewer says so on stderr and falls back to the app-level config
+rather than refusing to open the file.
+
+### Cal Tanks tab
+
+Which two tanks were plumbed in for **this** flight. `cals.yaml` names a
+`cal0`/`cal1` pair, but it describes the tanks in use *now* — an older flight
+almost certainly flew different ones, and using the wrong assigned values
+biases every calibrated number for every gas. The tab lets you pick from the
+full roster and saves the choice in the flight's `_conf.yaml`.
+
+Both combo boxes list every tank in `cals.yaml`, labelled with its `info` tag
+where it has one (`CB09960 (50%)`). Below them, the assigned value and
+uncertainty for each gas are shown side by side for the chosen pair, so the
+pick can be checked against what the flight actually measured (the
+Calibration tab's header reports `measured R` vs `assigned A` per tank).
+Warnings appear for a pairing that cannot work: a serial missing from the
+roster, the same tank picked twice (no span — the calibration degrades to
+offset-only), or a tank with no assigned value for one of the gases in the
+file.
+
+`cal0`/`cal1` mirror the key names in `cals.yaml`; **the order does not
+matter.** Which tank is flowing in a given cal window is identified from the
+measured concentration, not from this ordering (see [Data
+assumptions](#data-assumptions)). What matters is that the *pair* is right.
+
+**Reset to cals.yaml default** puts the pairing back to the `cals:` block.
 
 ### Box statistics ("Stats")
 
@@ -140,7 +213,7 @@ Two consequences are worth being explicit about:
 | Model | Nodes used | When |
 |---|---|---|
 | `linear` (default) | the per-injection means themselves | assumption-free; passes each event's noise straight into the calibrated data |
-| `smooth` | centred rolling mean over *N* events (**Smooth over**) | event-to-event scatter is several times the within-event noise and you want it suppressed without flattening real drift |
+| `smooth` | centred rolling mean over *N* events (the `N ev` spin box beside the model) | event-to-event scatter is several times the within-event noise and you want it suppressed without flattening real drift |
 | `constant` | one flight-mean value | a sanity baseline: what a single static calibration would have given |
 
 ### Post-cal flush ("Flag Air")
@@ -317,5 +390,6 @@ roster changes.
 |---|---|
 | `ucatsb_gui.py` | PyQt5 interactive viewer |
 | `plot_co2_timeseries.py` | Shared masking/cal-detection logic + standalone static-figure CLI |
-| `ucatsb_gui_config.yaml` | Per-gas masking/averaging settings, auto-saved by the GUI |
+| `ucatsb_gui_config.yaml` | Per-gas masking/averaging settings, auto-saved by the GUI; the template a newly-opened flight starts from |
+| `<dataset>_conf.yaml` | Written beside each loaded CSV: that flight's own per-gas settings **and** its cal-tank pairing |
 | `cals.yaml` | Full cal tank roster + which two are assigned for the current run (local copy of `~/code/ucats-b/cals.yaml`) |

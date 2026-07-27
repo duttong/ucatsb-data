@@ -36,7 +36,8 @@ checked.
 name/CLI, its functions are gas-agnostic) and also a standalone CLI producing
 one fixed CO2 figure. `ucatsb_gui.py` imports from it rather than
 duplicating: `drop_presync_rows`, `find_intervals`, `merge_close_intervals`,
-`shade_intervals`, `cal_mean_points`, `load_cal_bottles`, `most_common_serial`,
+`shade_intervals`, `cal_mean_points`, `load_cal_roster`,
+`load_cal_assignment`, `select_cal_bottles`, `most_common_serial`,
 `mean_std_label`, `CALS_YAML_PATH`, plus the calibration functions below. Any
 change to masking/cal-detection/calibration behavior belongs in that shared
 module so both stay in sync.
@@ -178,13 +179,20 @@ serial (the full roster of every cal tank ever used, each with its assigned
 mole fraction and uncertainty per gas as flat `<GAS>` / `<GAS>_unc` keys,
 e.g. `CO2: 418.947` / `CO2_unc: 0.021`), and a `cals: {cal0: ..., cal1: ...}`
 block naming which *two* of those serials are actually plumbed in for the
-current run. `load_cal_bottles` only returns the two tanks named in `cals:`
-(`{serial: data[serial] for serial in set(data["cals"].values())}`) — this
-is deliberate, not an oversight: matching should only ever consider the
-tanks physically in use this flight, since an unrelated roster tank could
-otherwise coincidentally match a measured value more closely and produce a
-wrong identification. When a tank is swapped between flights, `cals:` is
-what needs editing — the roster entries themselves don't move.
+current run. Bottle *matching* only ever sees two tanks, never the roster:
+`select_cal_bottles(roster, serials)` is the single implementation of that
+rule, and both entry points go through it — `load_cal_bottles` (cals.yaml's
+own `cals:` pair, via `load_cal_assignment`) and the GUI's per-flight
+selection. This is deliberate, not an oversight: an unrelated roster tank
+could otherwise coincidentally match a measured value more closely and
+produce a wrong identification.
+
+`cals.yaml`'s `cals:` block is now only the **default** pairing. Because it
+describes the tanks plumbed in *now*, it is wrong for any older flight, so
+the GUI's Cal Tanks tab overrides it per flight and stores the choice in
+`<dataset>_conf.yaml` (see Config persistence). Editing `cals:` is still what
+records a tank swap on the *current* run; it is no longer the only way to
+analyse a flight that flew something else.
 
 Not every roster tank has an `info` field (a rough round-number label like
 `50%`/`100%` for the original two tanks; the newer ones added don't have an
@@ -203,11 +211,13 @@ ppm, not `CC302489`'s 418.95 ppm — the reverse of the naive `cal0`→digital-0
 reading). `match_cal_serial` instead picks whichever of the two assigned
 serials' nominal concentration (for the active gas) is closest to the
 measured window mean. This is self-correcting if bottles are swapped
-between flights (as long as `cals:` is updated to name the new pair) — do
-not "fix" it to use the `cals.yaml` key order directly.
+between flights (as long as the flight names the right *pair*, in `cals:` or
+in its own conf file) — do not "fix" it to use the `cals.yaml` key order
+directly. It also means the Cal Tanks tab's `cal0`/`cal1` combos select a
+set, not a wiring: swapping which combo holds which serial changes nothing.
 
 `cals.yaml` has previously contained literal tab characters as
-`key:\tvalue` separators, which are invalid YAML syntax. `load_cal_bottles`
+`key:\tvalue` separators, which are invalid YAML syntax. `_read_cals_yaml`
 blanks tabs to spaces before parsing rather than erroring — keep that
 workaround even though the current file is clean, since a future hand-edit
 or re-copy from the acquisition repo could reintroduce them.
@@ -332,12 +342,34 @@ honoured, or changing gas and then nudging a spinbox would leave the
 never-drawn pane stuck at a stale scale when first opened. The cal tab's own
 "same content" key is `(gas, drift_model, smooth_events)`.
 
-### Config persistence
+### Config persistence: two files with different jobs
 
-`ucatsb_gui_config.yaml` (loaded/saved by `load_config`/`save_config`) holds
-one settings block per gas (`warmup_min`, `pressure_tol_mbar`, `flag_air_s`,
-`cal1_window_s`, `cal2_window_s`, `drift_model`, `drift_smooth_events`),
-auto-saved on every control change via `on_control_changed`.
+Settings live in one block per gas (`warmup_min`, `pressure_tol_mbar`,
+`flag_air_s`, `cal1_window_s`, `cal2_window_s`, `drift_model`,
+`drift_smooth_events`), auto-saved on every control change via
+`on_control_changed` → `_save_settings`, which writes **both**:
+
+- `<dataset>_conf.yaml` beside the loaded CSV (`flight_config_path`) — the
+  authoritative file for that flight, and the only one that carries the
+  cal-tank pairing. Created by `_adopt_flight_config` at load time, not
+  lazily on first edit, so the file exists (with every gas in it) as soon as
+  the data is open.
+- `ucatsb_gui_config.yaml` (`self.default_config_path`) — now a *template*:
+  what a flight that has no conf file yet starts from, so converged settings
+  carry to the next flight instead of reverting to `DEFAULT_GAS_SETTINGS`.
+
+`self.config_path` is whichever is authoritative right now, and falls back to
+the app-level path if the dataset's directory is unwritable (`OSError` on
+the first save) — a read-only archive must not make a file unopenable.
+
+**The tank pairing is deliberately not in `self.config` and never templated.**
+It lives in `self.cal_selection`, is read by `load_cal_selection` and written
+by `save_config`'s optional `cal_selection` argument, and defaults to
+`cals.yaml`'s own `cals:` block for any flight without a conf file. Seeding it
+from the app-level file instead would apply the last-opened flight's tanks to
+a different flight silently — the one failure mode the Cal Tanks tab exists to
+prevent, and one that corrupts every calibrated number for every gas at once
+while still looking plausible.
 `_initializing`/`_loading` flags exist specifically to suppress redraw/save
 during programmatic widget setup (e.g. `setChecked` on a freshly-constructed
 radio button fires its signal immediately, before sibling widgets it might
@@ -355,13 +387,57 @@ silently dropped from the file on the next control change, even though
 only the first three apply; adding a new group box is what requires the
 fourth.)
 
+**"Copy settings to all gases"** (`on_copy_masking_to_all`) writes
+`COPIED_SETTING_KEYS` — `warmup_min`, `pressure_tol_mbar`, `flag_air_s`,
+`cal1_window_s`, `cal2_window_s` — from the live controls into every *other*
+gas block. A new persisted control has to be added to that tuple too (or
+consciously left out), or the button will silently leave it behind on the
+other gases. Only `drift_model`/`drift_smooth_events` are excluded: those are
+a judgement about one gas's cal-record noise rather than a description of the
+flight. Ozone drops out by construction rather than by name — it has no entry
+in `self.config` at all — so "every gas in the config" stays the right set if
+a gas is ever added.
+
+**The copied values are `deepcopy`d per target gas.** `cal1_window_s` /
+`cal2_window_s` are lists: handing every gas the same list object makes
+`yaml.safe_dump` write anchors (`&id001`/`*id001`) into the conf file, and
+makes an in-place edit of one gas's window silently change the others.
+
 New masking settings default to a **no-op value** (`flag_air_s: 0`) rather
 than a physically plausible one. `load_config` fills missing keys from
 `DEFAULT_GAS_SETTINGS`, so a non-zero default would silently change the
 output of every already-saved config on first launch after the upgrade.
 
-**Verification scripts must pass `config_path=` to a scratch file.**
-`UcatsbGui` writes the real `ucatsb_gui_config.yaml` on any programmatic
-`setValue`, so an offscreen test that drives controls will otherwise silently
-overwrite the user's saved settings — and then the numbers in the next run
-won't match, which is confusing to debug.
+**Verification scripts must pass `config_path=` to a scratch file *and* load
+a scratch copy of the CSV.** `UcatsbGui` writes the real
+`ucatsb_gui_config.yaml` on any programmatic `setValue`, so an offscreen test
+that drives controls will otherwise silently overwrite the user's saved
+settings — and then the numbers in the next run won't match, which is
+confusing to debug. Since loading a dataset now also writes
+`<dataset>_conf.yaml` into that dataset's directory, copy the CSV into the
+scratchpad first rather than pointing the test at `~/Data/UCATSb/...`.
+
+### Cal Tanks tab
+
+Its own tab (`_build_cal_tanks_pane`), not another control-panel group box:
+the pairing is one per *flight*, while every control in that panel is per gas.
+Two combos over the whole roster (`load_cal_roster`), not just the plumbed
+pair — picking a tank outside the current `cals:` block is the entire point.
+
+- `self.cal_bottles` is **derived state**: `_rebuild_cal_bottles` recomputes
+  it from `cal_selection` via `select_cal_bottles`, which is the one place
+  implementing "matching may only see the plumbed tanks" (see the section on
+  `cals.yaml` above — `load_cal_bottles` now goes through it too). Never
+  assign `cal_bottles` directly.
+- `cal0`/`cal1` name a *set*, not a wiring. `match_cal_serial` identifies the
+  tank in each window by measured concentration, so swapping the two combos
+  changes nothing — said out loud in the tab's tooltip because the labels
+  invite the opposite assumption.
+- A tank change refreshes with **`preserve_view=False`**, like a gas change
+  and unlike every other control. The Calibration tab's top panel plots
+  measured *minus assigned*, so a different tank shifts it by the difference
+  in assigned values (11 ppm between `CC470901` and `CC302489`) and the old
+  y-range leaves the new points off-scale.
+- `_draw_current_tab` dispatches on the current *widget*, not the tab index:
+  Cal Tanks draws nothing, and the old `index == 1` test would have made it
+  redraw the timeseries pane.
