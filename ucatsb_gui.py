@@ -35,7 +35,7 @@ from plot_co2_timeseries import (
     shade_intervals, cal_mean_points, load_cal_roster, load_cal_assignment,
     select_cal_bottles,
     most_common_serial, mean_std_label, calibrate_series, post_cal_flush_mask,
-    cal_switch_mask,
+    cal_switch_mask, below_floor_mask, O3_VALID_MIN_PPB,
     box_stats, calibration_uncertainty, linear_fit,
     plot_calibration_panels, export_calibrated_csv,
     CALS_YAML_PATH, CAL_DRIFT_MODELS, CAL_DEFAULT_SMOOTH_EVENTS,
@@ -73,7 +73,11 @@ GASES = {
     # detector=None disables the Detector Pressure/T_gas aux traces (there's
     # no matching column to route to). Kept last so it sorts to the bottom
     # of the Gas combo box.
-    "Ozone": {"value_col": "oz_o3best", "ylabel": "O3 (ppb)", "title": "UCATS-B O3 timeseries", "detector": None, "has_masking": False},
+    # valid_min is a *physical floor*, not one of the maskable settings:
+    # below it the sensor is faulting, not measuring. Declared per gas rather
+    # than special-cased by name so the filtering code stays generic -- any
+    # gas that gains a floor gets the same raw/filtered treatment.
+    "Ozone": {"value_col": "oz_o3best", "ylabel": "O3 (ppb)", "title": "UCATS-B O3 timeseries", "detector": None, "has_masking": False, "valid_min": O3_VALID_MIN_PPB},
 }
 
 REQUIRED_COLUMNS = [
@@ -1661,6 +1665,17 @@ class UcatsbGui(QMainWindow):
         display. See _analysis_for."""
         return self._analysis_for(self.current_gas)
 
+    def _rejected_mask(self, gas_key):
+        """Rows where this gas's sensor read below its physical floor.
+
+        Separate from `_analysis_for`'s masks and not cached with them: it
+        depends on nothing the user can change, only on the gas's declared
+        `valid_min`, and it applies to gases (Ozone) that have no analysis
+        settings at all.
+        """
+        floor = GASES[gas_key].get("valid_min")
+        return below_floor_mask(self.df[GASES[gas_key]["value_col"]], floor)
+
     def _analysis_for(self, gas_key):
         """Masks, cal intervals and per-injection cal means for one gas, from
         the current file and that gas's settings.
@@ -1825,9 +1840,31 @@ class UcatsbGui(QMainWindow):
             "main:raw", f"{self.current_gas} (raw)", ax, df["datetime"],
             df[value_col], gas_unit)
 
+        # A gas with a physical floor (Ozone) gets the same two-trace
+        # treatment as a calibrated one -- raw blue underneath, the kept data
+        # in red on top -- deliberately reusing LINE_COLOR/CALIBRATED_COLOR
+        # rather than inventing a palette: on both figures red means "the
+        # series you should be reading" and blue means "everything the
+        # instrument recorded".
+        rejected = self._rejected_mask(self.current_gas)
+        show_filtered = bool(rejected.any())
+
         plot_data = df[["datetime", value_col]].dropna()
         line, = ax.plot(plot_data["datetime"], plot_data[value_col], color=LINE_COLOR,
-                        linewidth=1.2, alpha=0.55 if show_cal else 1.0)
+                        linewidth=1.2, alpha=0.55 if (show_cal or show_filtered) else 1.0)
+
+        filtered_line = None
+        if show_filtered:
+            # Rejected rows stay as NaN rather than being dropped, so the red
+            # line breaks over them instead of drawing across the removal --
+            # same reasoning as the calibrated trace below.
+            filtered = df[value_col].mask(rejected)
+            self._register_stats_trace(
+                "main:filtered", f"{self.current_gas} (filtered)", ax,
+                df["datetime"], filtered, gas_unit)
+            keep = filtered.notna() | rejected
+            filtered_line, = ax.plot(df["datetime"][keep], filtered[keep],
+                                     color=CALIBRATED_COLOR, linewidth=1.2)
 
         cal_line = None
         if show_cal:
@@ -1864,7 +1901,11 @@ class UcatsbGui(QMainWindow):
         handles = [line]
         # Kept short when both traces are shown -- the y-axis already names
         # the gas, and a four-entry legend clips against the axes edge.
-        labels = ["raw (ambient)" if show_cal else f"{gas['ylabel']} (ambient)"]
+        labels = ["raw (ambient)" if (show_cal or show_filtered)
+                  else f"{gas['ylabel']} (ambient)"]
+        if filtered_line is not None:
+            handles.append(filtered_line)
+            labels.append(f"filtered (≥ {GASES[self.current_gas]['valid_min']:g} {gas_unit})")
         if cal_line is not None:
             handles.append(cal_line)
             labels.append(f"calibrated ({calibration['mode']})")
@@ -1919,6 +1960,16 @@ class UcatsbGui(QMainWindow):
                 notes.append("red = calibrated, blue = raw; calibrated shows "
                              "good air only (cal periods, flush and masked "
                              "spans blanked)")
+        # Outside the has_masking gate on purpose: Ozone has no masking
+        # settings at all, and this is the one thing removing data from its
+        # figure, so it is the only line that would explain the red trace.
+        if show_filtered:
+            floor = GASES[self.current_gas]["valid_min"]
+            notes.append(
+                f"red = filtered, blue = raw; {int(rejected.sum())} reading"
+                f"{'' if rejected.sum() == 1 else 's'} below {floor:g} {gas_unit} "
+                f"removed (sensor fault, not a measurement)"
+            )
         notes_text = None
         if notes:
             notes_text = ax.text(
@@ -1942,6 +1993,20 @@ class UcatsbGui(QMainWindow):
         # (x, y, width, HEIGHT) -- the height is what is left above the notes,
         # not the full axes, or the anchor box overhangs the top and the
         # legend is placed outside the plot.
+        # Frame the default view on the FILTERED data. A single -2292 ppb
+        # fault otherwise sets the y-range and squashes the whole real ozone
+        # record into the top fifth of the axes -- which would make masking
+        # the fault pointless on the one figure it most needed to help. The
+        # raw trace is still drawn and simply runs off-scale; the note says
+        # how many readings that is, and zooming out still reaches them.
+        # Skipped when a view is being preserved, which reapplies its own
+        # limits below.
+        if show_filtered and old_main_view is None:
+            lo, hi = filtered.min(), filtered.max()
+            if pd.notna(lo) and pd.notna(hi) and hi > lo:
+                pad = 0.05 * (hi - lo)
+                ax.set_ylim(lo - pad, hi + pad)
+
         reserved = self._text_height_frac(ax, notes_text)
         anchor = (0.0, reserved, 1.0, 1.0 - reserved)
         ax.legend(handles, labels, loc="best", fontsize=9, framealpha=0.9,
@@ -2140,7 +2205,14 @@ class UcatsbGui(QMainWindow):
         gas = GASES[gas_key]
         unit = gas["ylabel"].split("(")[-1].rstrip(")")
         if not gas.get("has_masking", True):
-            return self.df[gas["value_col"]], None, unit, gas["value_col"], None
+            # Filtered, matching the red trace on the timeseries: a -2292 ppb
+            # fault is not a point on a tracer-tracer plot, it is an outlier
+            # that would set the axis range and drag the fit on its own.
+            values = self.df[gas["value_col"]].mask(self._rejected_mask(gas_key))
+            qual = gas["value_col"]
+            if gas.get("valid_min") is not None:
+                qual += f" ≥ {gas['valid_min']:g}"
+            return values, None, unit, qual, None
         result = self._calibration_for(gas_key)
         if not (result or {}).get("ok"):
             return None, None, unit, None, (result or {}).get("reason", "no calibration")
@@ -2248,8 +2320,13 @@ class UcatsbGui(QMainWindow):
         raw_axes = [gas for gas, qual in ((x_gas, x_qual), (y_gas, y_qual))
                     if qual != "calibrated"]
         for gas in raw_axes:
-            notes.append(f"{gas} has no cal bottles — plotted as recorded "
-                         f"({GASES[gas]['value_col']}), not calibrated")
+            note = (f"{gas} has no cal bottles — plotted as recorded "
+                    f"({GASES[gas]['value_col']}), not calibrated")
+            n_rejected = int(self._rejected_mask(gas).sum())
+            if n_rejected:
+                note += (f"; {n_rejected} below "
+                         f"{GASES[gas]['valid_min']:g} removed")
+            notes.append(note)
         # The fit summary rides in this block rather than in a legend: a
         # legend has to sit somewhere, and on a scatter that fills one corner
         # it lands either on the data or on this text.

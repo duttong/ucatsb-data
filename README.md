@@ -460,8 +460,9 @@ Timeseries tab overlays, so they are already good-air-only.
 
 **Ozone is the exception it has to be.** It has no cal bottles, so there is
 nothing to calibrate it against; it goes on the axis as the ozone
-instrument's own product, `oz_o3best`. The axis label and a line in the
-figure's note block both say so, and that axis gets no error bars — there is
+instrument's own product, `oz_o3best`, with its below-floor readings removed
+(see [Ozone validity floor](#ozone-validity-floor)). The axis label and a line
+in the figure's note block both say so, and that axis gets no error bars — there is
 no calibration to propagate, and a zero-width bar would claim a precision
 nobody established. It needs no time alignment: ozone shares the CSV's
 timestamps, so the rows line up directly. It does report on a slower cadence
@@ -516,6 +517,33 @@ in a number that would then look like ordinary uncertainty. Note also that
 these uncertainties are mostly **systematic** — they shift a whole flight
 together rather than scattering point to point — which is why the fit is plain
 OLS rather than weighted by them.
+
+### Ozone validity floor
+
+`oz_o3best` occasionally reports a fault rather than a measurement — the Feb
+2025 flight has 7 readings between −22 and −2292 ppb. Anything below
+**−15 ppb** (`O3_VALID_MIN_PPB`) is dropped as a sensor fault.
+
+The floor sits well below zero on purpose. A real near-zero ozone measurement
+scatters negative, and that flight has 168 readings between −15 and 0 ppb that
+are the sensor's noise about a small true value. Clipping at zero would bias
+the low end upward and hide how noisy the instrument actually is.
+
+The O3 timeseries therefore shows **two traces, in the same colours the Aeris
+gases use**: raw in blue underneath (faded), filtered in red on top — the same
+"blue is everything recorded, red is the series you should read" convention as
+the calibrated overlay. The red line *breaks* over each removed reading rather
+than drawing across it, and the note block says how many were removed.
+
+The default y-range is framed on the **filtered** data. One −2292 ppb fault
+would otherwise set the scale and squash the entire real ozone record into the
+top fifth of the axes; the raw trace is still drawn and simply runs off-scale,
+where zooming out reaches it.
+
+This is a per-gas property (`valid_min` in `GASES`), not one of the maskable
+settings — it is a physical floor, not a judgement call, so it is not
+adjustable from the control panel. No other gas declares one, and gases
+without one are drawn exactly as before, single trace at full opacity.
 
 ## Data assumptions
 

@@ -507,11 +507,11 @@ returning `(values, sigma, unit, qualifier, reason)`. Two kinds:
 
 - a cal-bottle gas → `calibrate_series`' `calibrated`, plus a 1σ, already
   masked to good air;
-- **Ozone** → `oz_o3best`, the ozone instrument's own product, with **no
-  sigma** (nothing to propagate — an axis with no calibration passes `None`
-  to `errorbar` rather than a zero bar, which would claim a precision nobody
-  established) and no masking of its own. Its partner axis still imposes its
-  masking through the intersection.
+- **Ozone** → `oz_o3best` with its below-floor readings removed (see below),
+  and **no sigma** (nothing to propagate — an axis with no calibration passes
+  `None` to `errorbar` rather than a zero bar, which would claim a precision
+  nobody established). Its partner axis still imposes its masking through the
+  intersection.
 
 `reason` is non-None only when a gas that *should* have a calibration lacks a
 usable one; Ozone having none is what Ozone is, not a failure to report. The
@@ -581,6 +581,36 @@ verification script must `processEvents()` after triggering one.
 Missing files stay listed but disabled and marked `(missing)` rather than
 being pruned on sight — an unmounted volume comes back. They are dropped only
 when opening one actually fails (`_try_load(..., forget_on_failure=True)`).
+
+### `valid_min`: a physical floor, not a maskable setting
+
+`GASES["Ozone"]["valid_min"] = O3_VALID_MIN_PPB` (−15 ppb) drives
+`below_floor_mask`, via `UcatsbGui._rejected_mask(gas)`. Declared per gas
+rather than special-cased by name, so any gas that gains a floor gets the same
+raw/filtered treatment for free — and *not* a control, because it is a
+statement about when the sensor is faulting rather than a judgement the user
+should be tuning per flight.
+
+- **The floor is well below zero deliberately.** Real near-zero ozone scatters
+  negative; the Feb 2025 flight has 168 readings in −15..0 ppb (noise about a
+  small true value) against 7 faults reaching −2292. Clipping at zero would
+  bias the low end upward and hide the instrument's true noise. Don't "tidy"
+  it to 0.
+- **NaN is not flagged.** Absent and invalid get different treatment
+  downstream — a gap versus a removal.
+- `_rejected_mask` is deliberately **not** part of `_analysis_for`'s cache: it
+  depends on nothing the user can change, and it applies to a gas that has no
+  analysis settings at all.
+- The timeseries draws raw (blue, faded) + filtered (red), reusing
+  `LINE_COLOR`/`CALIBRATED_COLOR` so red means the same thing here as on the
+  calibrated overlay. The filtered line keeps removed rows as NaN so it
+  **breaks** over them, the same trick `calibrate_series` output uses.
+- **The default y-range is framed on the filtered series** when anything was
+  removed (and only when not preserving a view). A single −2292 ppb fault
+  otherwise sets the scale and squashes the real record into the top fifth of
+  the axes, which would make masking it pointless on the figure that most
+  needed the help. The raw trace still runs off-scale, and the note says how
+  many readings that is.
 
 ### Cal Tanks tab
 

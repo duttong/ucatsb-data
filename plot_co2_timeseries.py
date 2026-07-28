@@ -74,6 +74,28 @@ def merge_close_intervals(intervals, gap):
     return merged
 
 
+# Ozone readings below this are instrument faults, not measurements (the Feb
+# 2025 flight has 7 of them, down to -2292 ppb). The floor is deliberately
+# well below zero rather than at zero: a real near-zero ozone measurement
+# scatters negative, and 168 readings in -15..0 ppb on that flight are the
+# sensor's noise about a small true value -- throwing those away would bias
+# the low end upward and hide how noisy the instrument actually is.
+O3_VALID_MIN_PPB = -15.0
+
+
+def below_floor_mask(values, floor):
+    """Flag readings below a physical floor as instrument faults.
+
+    Only ever a *display/pairing* filter: like every other mask in this
+    module it marks rows, and the raw column is never modified. NaN is not
+    flagged -- absent is not the same as invalid, and the two get different
+    treatment downstream (a gap versus a removal).
+    """
+    if floor is None:
+        return pd.Series(False, index=values.index)
+    return values.notna() & (values < floor)
+
+
 def cal_switch_mask(datetimes, cal_mask):
     """Flag the switch-over sample at the end of each cal period: the first
     row whose solenoid flag has gone False while the cell still holds cal gas.
