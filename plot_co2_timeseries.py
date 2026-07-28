@@ -985,7 +985,7 @@ def export_calibrated_csv(path, df, result, value_col, gas_key,
 def _shade_flagged(ax, datetimes, mask, color=CAL_SHADE_COLOR):
     """Hatch-shade extrapolated/untrustworthy spans. Hatching (rather than a
     plain fill) keeps these visually distinct from the timeseries plot's
-    cal-period shading, which uses the same colour for a different meaning."""
+    cal-period shading, which uses the same color for a different meaning."""
     for start, end in find_intervals(datetimes, mask):
         ax.axvspan(start, end, facecolor="none", edgecolor=color,
                    hatch="///", alpha=0.35, linewidth=0)
@@ -1107,8 +1107,8 @@ def plot_calibration_panels(fig, result, gas_key, ylabel, datetimes, unit=""):
     fig.suptitle("\n".join(head), color=MUTED_COLOR, fontsize=8,
                  ha="left", x=0.01, linespacing=1.4)
     if result["warnings"]:
-        # Colour the whole block as a warning -- matplotlib has no per-line
-        # colouring in a suptitle, and a visible flag matters more than
+        # Color the whole block as a warning -- matplotlib has no per-line
+        # coloring in a suptitle, and a visible flag matters more than
         # keeping the neutral lines neutral.
         fig.texts[-1].set_color(PRESSURE_EXCLUDE_COLOR)
 

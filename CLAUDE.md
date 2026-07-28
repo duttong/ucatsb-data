@@ -307,7 +307,7 @@ calibrated on main plot" toggle does **not** change this: it overlays the
 result of *this repo's* `calibrate_series` in red (`CALIBRATED_COLOR`),
 keeping the raw trace in its usual blue `LINE_COLOR` underneath at
 `alpha=0.55`. The two traces are distinguished by **hue, not by which one is
-faded** — recolouring the raw trace when the overlay came on read as the raw
+faded** — recoloring the raw trace when the overlay came on read as the raw
 data having changed. It is session-only and defaults off, precisely so
 the app never starts up showing calibrated data without the user asking.
 
@@ -547,20 +547,20 @@ of the assigned values, `c = (1-f)A_lo + f A_hi` with
   which are reported as a percentage of points instead — folding them in
   would disguise "we are guessing here" as ordinary uncertainty.
 
-**The z-axis colouring** (`CORR_COLOR_BY`, `CORR_COLORMAP`) maps each entry to
+**The z-axis coloring** (`CORR_COLOR_BY`, `CORR_COLORMAP`) maps each entry to
 `(label, column, colorbar label)`, with `column=None` meaning the time axis —
 which is not a plottable column and needs `mdates.date2num` going in and a
 `DateFormatter` on the colorbar coming out. Three rules:
 
 - **The z variable joins the pairing rule.** A point with no value for it is
-  dropped, not drawn: matplotlib would paint it in the colormap's "bad" colour
+  dropped, not drawn: matplotlib would paint it in the colormap's "bad" color
   (transparent), leaving it in the fit but invisible on the plot.
 - **Only encodings the loaded CSV can supply are offered** — the schema
   differs between flights, so `oz_p` may not exist. `_populate_corr_color_combo`
   also clears a selection the new file cannot honour.
 - **`turbo`, not `jet`/`rainbow`.** Same rainbow ordering, monotonic
   luminance, so it doesn't manufacture bands of false structure. A colorbar is
-  always drawn with it; a continuous colour encoding with no scale is
+  always drawn with it; a continuous color encoding with no scale is
   unreadable.
 
 Because these uncertainties are near-entirely *systematic* (they shift a whole

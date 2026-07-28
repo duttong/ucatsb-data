@@ -450,9 +450,9 @@ tabs, and each gas is analysed with *its own* saved settings.
   axes** flips them.
 - **Marker size** — marker diameter in points. A whole flight is tens of
   thousands of points; small markers show structure that large ones fill in.
-- **Colour by** — a z-axis encoding: **Time** or **Pressure (`oz_p`)**, drawn
+- **Color by** — a z-axis encoding: **Time** or **Pressure (`oz_p`)**, drawn
   with the `turbo` rainbow and always accompanied by a labelled colorbar (a
-  continuous colour scale with no key is unreadable). `turbo` rather than
+  continuous color scale with no key is unreadable). `turbo` rather than
   `jet`: same rainbow ordering, but rebuilt with monotonic luminance, so it
   does not invent bands of false structure. Points with no value for the
   chosen variable are dropped rather than drawn invisibly, and the `n` note
@@ -537,7 +537,7 @@ scatters negative, and that flight has 168 readings between −15 and 0 ppb that
 are the sensor's noise about a small true value. Clipping at zero would bias
 the low end upward and hide how noisy the instrument actually is.
 
-The O3 timeseries therefore shows **two traces, in the same colours the Aeris
+The O3 timeseries therefore shows **two traces, in the same colors the Aeris
 gases use**: raw in blue underneath (faded), filtered in red on top — the same
 "blue is everything recorded, red is the series you should read" convention as
 the calibrated overlay. The red line *breaks* over each removed reading rather

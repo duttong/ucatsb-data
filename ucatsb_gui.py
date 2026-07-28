@@ -43,7 +43,7 @@ from plot_co2_timeseries import (
 )
 
 LINE_COLOR = "#2a78d6"
-# The calibrated overlay gets its own colour rather than reusing LINE_COLOR:
+# The calibrated overlay gets its own color rather than reusing LINE_COLOR:
 # the raw trace stays blue when the overlay is on, so the two are told apart
 # by hue, not by which one happens to be faded. Darker/more saturated than the
 # 15%-alpha PRESSURE_EXCLUDE_COLOR band so it doesn't read as shading.
@@ -130,7 +130,7 @@ def aux_trace_info(selection: str, gas: str, other_column: str = None):
 DEFAULT_CONFIG_PATH = Path(__file__).parent / "ucatsb_gui_config.yaml"
 RECENT_FILES_MAX = 10
 
-# What the Correlations tab can colour points by: {key: (label, column,
+# What the Correlations tab can color points by: {key: (label, column,
 # colorbar label)}. `column` of None means the time axis, which is not a
 # plottable column and needs its own numeric conversion and tick format.
 # A key whose column is missing from the loaded CSV is simply not offered --
@@ -142,7 +142,7 @@ CORR_COLOR_BY = {
 # "turbo" rather than "jet" or "rainbow": it is the same rainbow ordering,
 # rebuilt with monotonic luminance, so it does not invent bands of false
 # structure where the older maps go light-dark-light. A colorbar is always
-# drawn with it -- a continuous colour encoding with no scale is unreadable.
+# drawn with it -- a continuous color encoding with no scale is unreadable.
 CORR_COLORMAP = "turbo"
 
 DEFAULT_GAS_SETTINGS = {
@@ -490,7 +490,7 @@ class UcatsbGui(QMainWindow):
         self.corr_y_gas = None
         self.corr_marker_size = 4
         self.corr_error_bars = False
-        # None = single-colour points; otherwise a key into CORR_COLOR_BY.
+        # None = single-color points; otherwise a key into CORR_COLOR_BY.
         self.corr_color_by = None
         self._corr_ax = None
         self._last_corr_key = None
@@ -695,9 +695,9 @@ class UcatsbGui(QMainWindow):
         # stretching field).
         color_row = QHBoxLayout()
         color_row.setSpacing(4)
-        self.corr_color_check = QCheckBox("Colour by")
+        self.corr_color_check = QCheckBox("Color by")
         self.corr_color_check.setToolTip(
-            "Colour each point by a third variable, so the scatter shows\n"
+            "Color each point by a third variable, so the scatter shows\n"
             "where in the flight — or at what pressure — each part of the\n"
             "correlation came from. Points with no value for it are dropped."
         )
@@ -741,7 +741,7 @@ class UcatsbGui(QMainWindow):
         for key, (label, _, _) in available:
             combo.addItem(label, key)
         combo.blockSignals(False)
-        # A colouring whose column this file lacks cannot survive the reload.
+        # A coloring whose column this file lacks cannot survive the reload.
         if self.corr_color_by not in [key for key, _ in available]:
             self.corr_color_by = None
             self.corr_color_check.setChecked(False)
@@ -1480,7 +1480,7 @@ class UcatsbGui(QMainWindow):
         self._refresh_corr(preserve_view=False)
 
     def on_corr_color_changed(self):
-        """z-axis colouring on/off, or a different variable to colour by."""
+        """z-axis coloring on/off, or a different variable to color by."""
         if self._loading or self._initializing:
             return
         self.corr_color_combo.setEnabled(self.corr_color_check.isChecked())
@@ -2329,8 +2329,8 @@ class UcatsbGui(QMainWindow):
         keep = x_vals.notna() & y_vals.notna()
 
         # The z variable joins the pairing rule: a point with no value for it
-        # has no colour, and matplotlib would draw it in the colormap's "bad"
-        # colour (transparent) -- present in the fit but invisible on the
+        # has no color, and matplotlib would draw it in the colormap's "bad"
+        # color (transparent) -- present in the fit but invisible on the
         # plot. Dropped instead, and counted in the note.
         z_vals, z_label = None, None
         if self.corr_color_by in CORR_COLOR_BY:
@@ -2365,7 +2365,7 @@ class UcatsbGui(QMainWindow):
             ax.scatter(x, y, s=self.corr_marker_size ** 2, color=LINE_COLOR,
                        alpha=0.55, edgecolors="none", zorder=2)
         else:
-            # Less transparent than the single-colour case: at 0.55 the hues
+            # Less transparent than the single-color case: at 0.55 the hues
             # blend with the white surface and with each other, which is the
             # one thing this encoding cannot afford.
             points = ax.scatter(x, y, s=self.corr_marker_size ** 2,
