@@ -9,7 +9,7 @@ CO2:
   - -15
   - 0
   drift_model: smooth
-  drift_smooth_events: 3
+  drift_smooth_events: 4
 N2O:
   warmup_min: 30
   pressure_tol_mbar: 0.1
@@ -20,7 +20,7 @@ N2O:
   cal2_window_s:
   - -15
   - 0
-  drift_model: smooth
+  drift_model: linear
   drift_smooth_events: 3
 CH4:
   warmup_min: 30

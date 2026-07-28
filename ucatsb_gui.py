@@ -1718,8 +1718,6 @@ class UcatsbGui(QMainWindow):
             label.set_rotation(45)
             label.set_horizontalalignment("right")
 
-        ax.legend(handles, labels, loc="lower right", fontsize=9, framealpha=0.9)
-
         notes = []
         if has_masking:
             if cal.any():
@@ -1741,12 +1739,33 @@ class UcatsbGui(QMainWindow):
                 notes.append("red = calibrated, blue = raw; calibrated shows "
                              "good air only (cal periods, flush and masked "
                              "spans blanked)")
+        notes_text = None
         if notes:
-            ax.text(
-                0.01, 0.98, "\n".join(notes),
-                transform=ax.transAxes, ha="left", va="top",
+            notes_text = ax.text(
+                0.01, 0.01, "\n".join(notes),
+                transform=ax.transAxes, ha="left", va="bottom",
                 color=MUTED_COLOR, fontsize=9,
+                # Along the bottom the key sits over the cal dives and the cal
+                # mean dots rather than over empty sky, so it needs a backing
+                # box to stay readable. Semi-transparent, like the legend's
+                # frame, so it dims the data underneath without hiding it.
+                bbox=dict(facecolor="white", alpha=0.72, edgecolor="none", pad=2),
             )
+
+        # Placed after the notes, and confined to the axes *above* them.
+        # `loc="best"` searches for a gap in the DATA only -- a Text artist is
+        # invisible to that search -- so on a flight whose data leaves the
+        # bottom-left clear it would sit straight on top of the notes. It does
+        # honour bbox_to_anchor, though (`_find_best_position` anchors its
+        # candidate boxes inside it), so handing it the region above the notes
+        # keeps the placement automatic while making the collision impossible.
+        # (x, y, width, HEIGHT) -- the height is what is left above the notes,
+        # not the full axes, or the anchor box overhangs the top and the
+        # legend is placed outside the plot.
+        reserved = self._text_height_frac(ax, notes_text)
+        anchor = (0.0, reserved, 1.0, 1.0 - reserved)
+        ax.legend(handles, labels, loc="best", fontsize=9, framealpha=0.9,
+                  bbox_to_anchor=anchor, bbox_transform=ax.transAxes)
 
         ax_aux2 = None
         if ax_aux is not None:
@@ -2029,6 +2048,26 @@ class UcatsbGui(QMainWindow):
         self._corr_ax = ax
         self._last_corr_key = corr_key
         self.corr_pane.canvas.draw()
+
+    def _text_height_frac(self, ax, text, cap=0.5):
+        """How tall `text` is as a fraction of `ax`, for reserving space.
+
+        Measured rather than assumed: the note block runs from one line to
+        five depending on which masks are active, and the same text is a
+        different fraction of a resized window. `get_renderer()` is enough --
+        no full draw is needed to measure a Text. Falls back to a generous
+        fixed strip if the backend won't give one up, since guessing too big
+        only nudges the legend, while guessing too small puts it on the text.
+        """
+        if text is None:
+            return 0.0
+        try:
+            renderer = self.figure.canvas.get_renderer()
+            height = (text.get_window_extent(renderer)
+                      .transformed(ax.transAxes.inverted()).height)
+        except (AttributeError, RuntimeError, ValueError):
+            return 0.2
+        return min(height + 0.02, cap)
 
     @staticmethod
     def _style_axes(ax):
