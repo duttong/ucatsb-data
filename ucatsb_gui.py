@@ -130,6 +130,21 @@ def aux_trace_info(selection: str, gas: str, other_column: str = None):
 DEFAULT_CONFIG_PATH = Path(__file__).parent / "ucatsb_gui_config.yaml"
 RECENT_FILES_MAX = 10
 
+# What the Correlations tab can colour points by: {key: (label, column,
+# colorbar label)}. `column` of None means the time axis, which is not a
+# plottable column and needs its own numeric conversion and tick format.
+# A key whose column is missing from the loaded CSV is simply not offered --
+# the schema differs between flights.
+CORR_COLOR_BY = {
+    "time": ("Time", None, "Time (UTC-ish)"),
+    "oz_p": ("Pressure (oz_p)", "oz_p", "oz_p (mbar)"),
+}
+# "turbo" rather than "jet" or "rainbow": it is the same rainbow ordering,
+# rebuilt with monotonic luminance, so it does not invent bands of false
+# structure where the older maps go light-dark-light. A colorbar is always
+# drawn with it -- a continuous colour encoding with no scale is unreadable.
+CORR_COLORMAP = "turbo"
+
 DEFAULT_GAS_SETTINGS = {
     "warmup_min": 30,
     "pressure_tol_mbar": 10.0,
@@ -475,6 +490,8 @@ class UcatsbGui(QMainWindow):
         self.corr_y_gas = None
         self.corr_marker_size = 4
         self.corr_error_bars = False
+        # None = single-colour points; otherwise a key into CORR_COLOR_BY.
+        self.corr_color_by = None
         self._corr_ax = None
         self._last_corr_key = None
 
@@ -565,6 +582,7 @@ class UcatsbGui(QMainWindow):
         self.corr_file_label.setText(csv_path.name)
         self.corr_file_label.setToolTip(str(csv_path))
         self._populate_corr_combos()
+        self._populate_corr_color_combo()
 
         was_initializing = self._initializing
         self._initializing = True
@@ -671,6 +689,25 @@ class UcatsbGui(QMainWindow):
         )
         self.corr_error_check.toggled.connect(self.on_corr_style_changed)
         style_form.addRow(self.corr_error_check)
+
+        # Checkbox + combo on one spanning row (see the drift-model row: in
+        # the two-column form the label gets squeezed to nothing by a
+        # stretching field).
+        color_row = QHBoxLayout()
+        color_row.setSpacing(4)
+        self.corr_color_check = QCheckBox("Colour by")
+        self.corr_color_check.setToolTip(
+            "Colour each point by a third variable, so the scatter shows\n"
+            "where in the flight — or at what pressure — each part of the\n"
+            "correlation came from. Points with no value for it are dropped."
+        )
+        self.corr_color_check.toggled.connect(self.on_corr_color_changed)
+        color_row.addWidget(self.corr_color_check)
+        self.corr_color_combo = QComboBox()
+        self.corr_color_combo.setEnabled(False)
+        self.corr_color_combo.currentIndexChanged.connect(self.on_corr_color_changed)
+        color_row.addWidget(self.corr_color_combo, 1)
+        style_form.addRow(color_row)
         vbox.addWidget(style_box)
 
         self.corr_note = QLabel(
@@ -692,6 +729,22 @@ class UcatsbGui(QMainWindow):
 
         vbox.addStretch(1)
         return panel
+
+    def _populate_corr_color_combo(self):
+        """Offer the z-axis encodings this file can actually supply. Time
+        always works; `oz_p` only if the flight's schema has it."""
+        available = [(key, spec) for key, spec in CORR_COLOR_BY.items()
+                     if spec[1] is None or spec[1] in self.df.columns]
+        combo = self.corr_color_combo
+        combo.blockSignals(True)
+        combo.clear()
+        for key, (label, _, _) in available:
+            combo.addItem(label, key)
+        combo.blockSignals(False)
+        # A colouring whose column this file lacks cannot survive the reload.
+        if self.corr_color_by not in [key for key, _ in available]:
+            self.corr_color_by = None
+            self.corr_color_check.setChecked(False)
 
     def _populate_corr_combos(self):
         """Offer every gas in this file, Ozone included.
@@ -1425,6 +1478,15 @@ class UcatsbGui(QMainWindow):
         self.corr_y_combo.setCurrentText(self.corr_y_gas)
         self._loading = loading
         self._refresh_corr(preserve_view=False)
+
+    def on_corr_color_changed(self):
+        """z-axis colouring on/off, or a different variable to colour by."""
+        if self._loading or self._initializing:
+            return
+        self.corr_color_combo.setEnabled(self.corr_color_check.isChecked())
+        self.corr_color_by = (self.corr_color_combo.currentData()
+                              if self.corr_color_check.isChecked() else None)
+        self._refresh_corr(preserve_view=True)
 
     def on_corr_style_changed(self):
         if self._loading or self._initializing:
@@ -2265,6 +2327,24 @@ class UcatsbGui(QMainWindow):
         # what each axis has a value for, which is also what makes a
         # calibrated partner impose its masking on the Ozone axis.
         keep = x_vals.notna() & y_vals.notna()
+
+        # The z variable joins the pairing rule: a point with no value for it
+        # has no colour, and matplotlib would draw it in the colormap's "bad"
+        # colour (transparent) -- present in the fit but invisible on the
+        # plot. Dropped instead, and counted in the note.
+        z_vals, z_label = None, None
+        if self.corr_color_by in CORR_COLOR_BY:
+            _, z_col, z_label = CORR_COLOR_BY[self.corr_color_by]
+            if z_col is None:
+                # Dates are not numbers; convert once, and format the colorbar
+                # ticks back to clock time below.
+                z_vals = pd.Series(mdates.date2num(self.df["datetime"]),
+                                   index=self.df.index)
+            elif z_col in self.df.columns:
+                z_vals = self.df[z_col]
+            if z_vals is not None:
+                keep &= z_vals.notna()
+
         x, y = x_vals[keep], y_vals[keep]
 
         if self.corr_error_bars and len(x) and (x_sigma is not None or y_sigma is not None):
@@ -2281,8 +2361,22 @@ class UcatsbGui(QMainWindow):
 
         # s is an area in points^2; the control is a diameter, which is what
         # "marker size" means to anyone looking at the plot.
-        ax.scatter(x, y, s=self.corr_marker_size ** 2, color=LINE_COLOR,
-                   alpha=0.55, edgecolors="none", zorder=2)
+        if z_vals is None:
+            ax.scatter(x, y, s=self.corr_marker_size ** 2, color=LINE_COLOR,
+                       alpha=0.55, edgecolors="none", zorder=2)
+        else:
+            # Less transparent than the single-colour case: at 0.55 the hues
+            # blend with the white surface and with each other, which is the
+            # one thing this encoding cannot afford.
+            points = ax.scatter(x, y, s=self.corr_marker_size ** 2,
+                                c=z_vals[keep], cmap=CORR_COLORMAP,
+                                alpha=0.85, edgecolors="none", zorder=2)
+            bar = fig.colorbar(points, ax=ax, pad=0.02)
+            bar.set_label(z_label, color=TEXT_COLOR, fontsize=9)
+            bar.ax.tick_params(colors=MUTED_COLOR, labelsize=8)
+            bar.outline.set_edgecolor(AXIS_COLOR)
+            if CORR_COLOR_BY[self.corr_color_by][1] is None:
+                bar.ax.yaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
 
         fit = linear_fit(x, y)
         if fit:
@@ -2312,7 +2406,9 @@ class UcatsbGui(QMainWindow):
             if (result or {}).get("ok"):
                 extrapolated |= result["extrapolated"]
         extrapolated = extrapolated[keep]
-        notes = [f"n = {len(x)} of {len(self.df)} rows (usable data in both tracers)"]
+        notes = [f"n = {len(x)} of {len(self.df)} rows (usable data in both tracers"
+                 + (f", and in {CORR_COLOR_BY[self.corr_color_by][0].lower()})"
+                    if z_vals is not None else ")")]
         # Said plainly, because the axis label alone is easy to skim past and
         # the consequence -- no gain correction on that axis, so the slope
         # inherits that instrument's scale error -- is the whole reason the

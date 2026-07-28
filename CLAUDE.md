@@ -547,6 +547,22 @@ of the assigned values, `c = (1-f)A_lo + f A_hi` with
   which are reported as a percentage of points instead — folding them in
   would disguise "we are guessing here" as ordinary uncertainty.
 
+**The z-axis colouring** (`CORR_COLOR_BY`, `CORR_COLORMAP`) maps each entry to
+`(label, column, colorbar label)`, with `column=None` meaning the time axis —
+which is not a plottable column and needs `mdates.date2num` going in and a
+`DateFormatter` on the colorbar coming out. Three rules:
+
+- **The z variable joins the pairing rule.** A point with no value for it is
+  dropped, not drawn: matplotlib would paint it in the colormap's "bad" colour
+  (transparent), leaving it in the fit but invisible on the plot.
+- **Only encodings the loaded CSV can supply are offered** — the schema
+  differs between flights, so `oz_p` may not exist. `_populate_corr_color_combo`
+  also clears a selection the new file cannot honour.
+- **`turbo`, not `jet`/`rainbow`.** Same rainbow ordering, monotonic
+  luminance, so it doesn't manufacture bands of false structure. A colorbar is
+  always drawn with it; a continuous colour encoding with no scale is
+  unreadable.
+
 Because these uncertainties are near-entirely *systematic* (they shift a whole
 flight together), `linear_fit` is plain OLS and must stay that way: weighting
 by them would not do what weighting is for, and would make the reported slope

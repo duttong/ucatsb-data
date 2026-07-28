@@ -450,6 +450,14 @@ tabs, and each gas is analysed with *its own* saved settings.
   axes** flips them.
 - **Marker size** — marker diameter in points. A whole flight is tens of
   thousands of points; small markers show structure that large ones fill in.
+- **Colour by** — a z-axis encoding: **Time** or **Pressure (`oz_p`)**, drawn
+  with the `turbo` rainbow and always accompanied by a labelled colorbar (a
+  continuous colour scale with no key is unreadable). `turbo` rather than
+  `jet`: same rainbow ordering, but rebuilt with monotonic luminance, so it
+  does not invent bands of false structure. Points with no value for the
+  chosen variable are dropped rather than drawn invisibly, and the `n` note
+  says so. Only encodings the loaded CSV can supply are offered — a flight
+  whose schema lacks `oz_p` gets Time alone.
 - **Error bars (1σ)** — see below.
 
 **Each axis is calibrated wherever a calibration exists**, deliberately: a
