@@ -2,3 +2,12 @@ __pycache__/
 *.pyc
 *.csv
 *.png
+
+# Local viewer state: per-gas settings and the recent-files list, which holds
+# absolute paths from whichever machine ran it. The app recreates it from
+# DEFAULT_GAS_SETTINGS when absent, and the analysis state that matters
+# travels with each flight in its own <dataset>_conf.yaml.
+ucatsb_gui_config.yaml
+
+# Written beside each loaded CSV by the viewer.
+*_conf.yaml

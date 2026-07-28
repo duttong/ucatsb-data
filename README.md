@@ -577,6 +577,6 @@ roster changes.
 |---|---|
 | `ucatsb_gui.py` | PyQt5 interactive viewer |
 | `plot_co2_timeseries.py` | Shared masking/cal-detection logic + standalone static-figure CLI |
-| `ucatsb_gui_config.yaml` | Per-gas masking/averaging settings, auto-saved by the GUI; the template a newly-opened flight starts from, plus the recent-files list |
+| `ucatsb_gui_config.yaml` | Per-gas masking/averaging settings, auto-saved by the GUI; the template a newly-opened flight starts from, plus the recent-files list. **Local and gitignored** — it holds absolute paths from whichever machine ran it, and the app recreates it from `DEFAULT_GAS_SETTINGS` when it is absent |
 | `<dataset>_conf.yaml` | Written beside each loaded CSV: that flight's own per-gas settings **and** its cal-tank pairing |
 | `cals.yaml` | Full cal tank roster + which two are assigned for the current run (local copy of `~/code/ucats-b/cals.yaml`) |
