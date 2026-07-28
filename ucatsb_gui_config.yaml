@@ -1,3 +1,6 @@
+recent_files:
+- /Users/gdutton/Data/UCATSb/20250218/ucatsb-20250218All.csv
+- /Users/gdutton/Data/UCATSb/20260726/ucatsb-2026072618.csv
 CO2:
   warmup_min: 30
   pressure_tol_mbar: 0.1
