@@ -34,6 +34,17 @@ python3 ucatsb_gui.py /path/to/ucatsb-YYYYMMDDHH.csv
 ```
 
 Left panel:
+- **Load Data** — opens a menu: **Open File…** for the file browser, then the
+  last 10 datasets opened, then **Clear Recent Files**. The same commands are
+  in the menu bar as **File > Open…** (⌘O) and **File > Open Recent**. The
+  currently-loaded file is check-marked; one whose file has since moved or
+  whose volume is unmounted is shown greyed and marked `(missing)` rather than
+  forgotten, and is dropped only if opening it actually fails. Two datasets
+  with the same name in different directories are disambiguated by their
+  parent directory (`ucatsb-20250218All.csv — 20250218`). The list lives in
+  `ucatsb_gui_config.yaml`, never in a flight's conf, and opening a recent
+  file restores that flight's own settings as any other load does. Launching
+  with no argument still starts empty — nothing is opened for you.
 - **Gas** — switch the main plot between CO2 (`d1_CO2_ppm`), N2O (`d1_N2O_ppb`), and CH4 (`d2_CH4_ppb`), all uncalibrated. Only gases whose column exists in the loaded CSV are offered.
 - **Trace Above** — optionally add a smaller panel above the main plot: Detector Pressure, T_gas, or "Other". Detector Pressure/T_gas pull from whichever detector the active gas comes from (`d1` for CO2/N2O, `d2` for CH4). "Other" opens a combo box listing every remaining column in the loaded CSV (`oz_o3`, `oz_p`, `oz_t`, `j_sol_cals`, …), so anything in the file can be plotted without a dedicated control. A second combo box overlays any of those columns on a right-hand axis. "No Figure" returns to the single full-size plot.
 - **Data Masking** — warm-up exclusion (minutes from the start of the record) and detector pressure tolerance (±mbar around 140 mbar). Both are applied to the raw data *before* cal means are computed, not just drawn as bands — a cal point can disappear entirely if its averaging window has no valid data left. **Flag Air** (0–90 s, default 0 = off) additionally drops the air data immediately following each cal injection, while the detector cells are still clearing cal gas; unlike the other two it affects only the calibrated product, never the cal means or the raw trace. See [Post-cal flush](#post-cal-flush-flag-air). **Copy settings to all gases** applies these three values *and both cal mean windows* to every calibrated gas (CO2/N2O/CH4 — Ozone has no masking at all), since they describe the instrument on this flight rather than the species. Only the drift model and its smoothing window are left alone, being a judgement about how noisy that gas's own cal record is. Settings remain per-gas; the button is a shortcut, not a mode.
@@ -524,6 +535,6 @@ roster changes.
 |---|---|
 | `ucatsb_gui.py` | PyQt5 interactive viewer |
 | `plot_co2_timeseries.py` | Shared masking/cal-detection logic + standalone static-figure CLI |
-| `ucatsb_gui_config.yaml` | Per-gas masking/averaging settings, auto-saved by the GUI; the template a newly-opened flight starts from |
+| `ucatsb_gui_config.yaml` | Per-gas masking/averaging settings, auto-saved by the GUI; the template a newly-opened flight starts from, plus the recent-files list |
 | `<dataset>_conf.yaml` | Written beside each loaded CSV: that flight's own per-gas settings **and** its cal-tank pairing |
 | `cals.yaml` | Full cal tank roster + which two are assigned for the current run (local copy of `~/code/ucats-b/cals.yaml`) |

@@ -23,7 +23,7 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
     QGroupBox, QComboBox, QDoubleSpinBox, QSpinBox, QLabel,
     QButtonGroup, QRadioButton, QPushButton, QFileDialog, QMessageBox,
-    QTabWidget, QCheckBox, QAction, QStackedWidget,
+    QTabWidget, QCheckBox, QAction, QStackedWidget, QMenu,
 )
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg, NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
@@ -124,6 +124,7 @@ def aux_trace_info(selection: str, gas: str, other_column: str = None):
     return None
 
 DEFAULT_CONFIG_PATH = Path(__file__).parent / "ucatsb_gui_config.yaml"
+RECENT_FILES_MAX = 10
 
 DEFAULT_GAS_SETTINGS = {
     "warmup_min": 30,
@@ -178,6 +179,20 @@ def load_config(path: Path, template: dict = None) -> dict:
     return config
 
 
+def load_recent_files(path: Path) -> list:
+    """The recently-opened datasets from the app-level config, newest first.
+
+    App-level and never per-flight, the mirror image of `cals:` (which is
+    flight-only): "files I have been working on" is a property of the person,
+    not of any one dataset, and writing it into a flight's conf would put a
+    list of unrelated paths beside that flight's settings.
+    """
+    loaded = _read_yaml(path).get("recent_files")
+    if not isinstance(loaded, list):
+        return []
+    return list(dict.fromkeys(p for p in loaded if isinstance(p, str)))[:RECENT_FILES_MAX]
+
+
 def load_cal_selection(path: Path, default: dict) -> dict:
     """The flight's `cals: {cal0: ..., cal1: ...}` choice from its
     <dataset>_conf.yaml, falling back to `default` (cals.yaml's own block).
@@ -197,13 +212,22 @@ def load_cal_selection(path: Path, default: dict) -> dict:
     return selection
 
 
-def save_config(path: Path, config: dict, cal_selection: dict = None):
-    """Write the per-gas blocks, plus the tank selection when one is given
-    (i.e. for a flight's own conf file -- the app-level config stays free of
-    tank choices, for the reason in load_cal_selection)."""
+def save_config(path: Path, config: dict, cal_selection: dict = None,
+                recent_files: list = None):
+    """Write the per-gas blocks, plus whichever of the two non-gas blocks
+    belongs in this file: the tank selection for a flight's own conf, the
+    recent-file list for the app-level config. Never both -- see
+    load_cal_selection and load_recent_files for why each lives where it does.
+
+    This writes a *fresh* document, so an omitted block is a deletion: any
+    app-level write that forgets `recent_files=` wipes the list, the same trap
+    the per-gas settings have with _controls_to_settings().
+    """
     doc = dict(config)
     if cal_selection:
         doc = {"cals": dict(cal_selection), **doc}
+    if recent_files:
+        doc = {"recent_files": list(recent_files), **doc}
     path.write_text(yaml.safe_dump(doc, sort_keys=False))
 
 
@@ -404,6 +428,7 @@ class UcatsbGui(QMainWindow):
         self.default_config_path = config_path
         self.config_path = config_path
         self.config = load_config(config_path)
+        self.recent_files = load_recent_files(config_path)
         self.current_gas = None
         self.aux_selection = "No Figure"
         self.other_column = None
@@ -448,6 +473,14 @@ class UcatsbGui(QMainWindow):
         self.corr_error_bars = False
         self._corr_ax = None
         self._last_corr_key = None
+
+        # Before _build_controls: the Load Data button attaches recent_menu,
+        # and both menus share this one QAction so "Open…" is defined once.
+        self.open_action = QAction("Open…", self)
+        self.open_action.setShortcut("Ctrl+O")   # Qt maps this to ⌘O on macOS
+        self.open_action.triggered.connect(self.on_load_data_clicked)
+        self.recent_menu = QMenu(self)
+        self._build_menu_bar()
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -517,6 +550,10 @@ class UcatsbGui(QMainWindow):
         self.right_axis_column = None
 
         self._adopt_flight_config(csv_path)
+        # After the commit above, so a file that failed validation never
+        # enters the list. main() loads through here too, which is why a
+        # dataset opened from the command line is remembered as well.
+        self._remember_recent(csv_path)
 
         self.setWindowTitle(f"UCATS-B Viewer - {csv_path.name}")
         self.file_label.setText(csv_path.name)
@@ -684,18 +721,146 @@ class UcatsbGui(QMainWindow):
         )
         if not path_str:
             return
+        self._try_load(Path(path_str))
+
+    def _try_load(self, path: Path, forget_on_failure=False):
+        """Load a dataset, reporting a bad file rather than raising.
+
+        `load_csv` validates before it commits, so a failure here leaves
+        whatever was already open untouched -- the user just gets a warning.
+        A recent-menu entry that fails is dropped from the list: it is a
+        shortcut to a file, and a shortcut that does not work is worse than
+        no shortcut.
+        """
         try:
-            self.load_csv(Path(path_str))
+            self.load_csv(path)
         except (OSError, ValueError, pd.errors.ParserError) as e:
-            QMessageBox.warning(self, "Load Data", f"Could not load {Path(path_str).name}:\n{e}")
+            QMessageBox.warning(self, "Load Data", f"Could not load {path.name}:\n{e}")
+            if forget_on_failure:
+                self._forget_recent(path)
+            return False
+        return True
+
+    def _build_menu_bar(self):
+        """A real menu bar, which on macOS is the system one at the top of the
+        screen -- Open/Open Recent is where the OS trains people to look for
+        this, and it brings ⌘O with it."""
+        file_menu = self.menuBar().addMenu("&File")
+        file_menu.addAction(self.open_action)
+        self.file_recent_menu = file_menu.addMenu("Open Recent")
+        self._rebuild_recent_menus()
+
+    def _remember_recent(self, csv_path: Path):
+        """Move this dataset to the front of the recent list and persist it."""
+        resolved = str(Path(csv_path).resolve())
+        self.recent_files = ([resolved]
+                             + [p for p in self.recent_files if p != resolved])
+        del self.recent_files[RECENT_FILES_MAX:]
+        self._save_app_config()
+        self._rebuild_recent_menus()
+
+    def _forget_recent(self, csv_path: Path):
+        resolved = str(Path(csv_path).resolve())
+        self.recent_files = [p for p in self.recent_files if p != resolved]
+        self._save_app_config()
+        self._rebuild_recent_menus()
+
+    # Both of these are triggered FROM an action that the work itself deletes:
+    # they end in _rebuild_recent_menus(), and QMenu.clear() destroys the
+    # QAction whose `triggered` signal is still unwinding on the stack.
+    # Returning into a deleted sender is a use-after-free, so the work is
+    # deferred by one event-loop turn and the signal gets to finish first.
+    def on_clear_recent_files(self):
+        QTimer.singleShot(0, self._clear_recent_now)
+
+    def _clear_recent_now(self):
+        self.recent_files = []
+        self._save_app_config()
+        self._rebuild_recent_menus()
+
+    def _save_app_config(self):
+        """Write the app-level config. Always carries recent_files -- see
+        save_config: an omitted block is a deletion."""
+        try:
+            save_config(self.default_config_path, self.config,
+                        recent_files=self.recent_files)
+        except OSError as e:
+            print(f"Warning: could not write {self.default_config_path}: {e}")
+
+    def _recent_labels(self):
+        """Menu labels for the recent list: the file name, plus its parent
+        directory only where the name alone would be ambiguous. Flights are
+        named by date, so two directories holding `ucatsb-20250218All.csv` is
+        exactly the case where the bare name is useless."""
+        names = [Path(p).name for p in self.recent_files]
+        return [f"{name} — {Path(p).parent.name}" if names.count(name) > 1 else name
+                for p, name in zip(self.recent_files, names)]
+
+    def _rebuild_recent_menus(self):
+        """Repopulate both menus from self.recent_files.
+
+        One builder for the button menu and the File > Open Recent submenu, so
+        the two can never drift apart. Rebuilt on every change rather than
+        patched, which is the same reasoning as refresh()'s unconditional
+        cache invalidation: cheap, and it cannot serve a stale entry.
+        """
+        current = str(self.csv_path.resolve()) if self.csv_path else None
+        labels = self._recent_labels()
+
+        self.recent_menu.clear()
+        self.recent_menu.addAction(self.open_action)
+        self.recent_menu.addSeparator()
+        self.file_recent_menu.clear()
+
+        if not self.recent_files:
+            for menu in (self.recent_menu, self.file_recent_menu):
+                empty = menu.addAction("No recent files")
+                empty.setEnabled(False)
+            return
+
+        for path_str, label in zip(self.recent_files, labels):
+            exists = Path(path_str).exists()
+            for menu in (self.recent_menu, self.file_recent_menu):
+                action = menu.addAction(label)
+                action.setToolTip(path_str)
+                action.setStatusTip(path_str)
+                # Kept but greyed rather than dropped: an unmounted volume
+                # comes back, and silently forgetting the path would look like
+                # the app losing track of the user's work.
+                action.setEnabled(exists)
+                if not exists:
+                    action.setText(f"{label} (missing)")
+                if path_str == current:
+                    action.setCheckable(True)
+                    action.setChecked(True)
+                action.triggered.connect(
+                    functools.partial(self._open_recent, path_str))
+
+        for menu, label in ((self.recent_menu, "Clear Recent Files"),
+                            (self.file_recent_menu, "Clear Menu")):
+            menu.addSeparator()
+            menu.addAction(label).triggered.connect(self.on_clear_recent_files)
+
+    def _open_recent(self, path_str):
+        """Deferred for the reason above on_clear_recent_files."""
+        QTimer.singleShot(0, functools.partial(self._open_recent_now, path_str))
+
+    def _open_recent_now(self, path_str):
+        path = Path(path_str)
+        if path == self.csv_path:
+            return
+        self._try_load(path, forget_on_failure=True)
 
     def _build_controls(self):
         panel = QWidget()
         panel.setFixedWidth(300)
         vbox = QVBoxLayout(panel)
 
+        # The menu IS the button's action (no clicked handler): pressing it
+        # opens "Open File… / recent files / Clear", and setMenu also gives
+        # the button its native dropdown indicator.
         load_button = QPushButton("Load Data")
-        load_button.clicked.connect(self.on_load_data_clicked)
+        load_button.setMenu(self.recent_menu)
         vbox.addWidget(load_button)
 
         # Just the name -- the panel is 300 px wide and a full path would
@@ -1168,14 +1333,24 @@ class UcatsbGui(QMainWindow):
         every new flight reverts to shipped defaults, and the app-level file
         alone is what the per-flight requirement exists to replace.
 
-        Tank choices only ever reach the flight file (see load_cal_selection).
+        Tank choices only ever reach the flight file (see load_cal_selection),
+        and the recent-file list only the app-level one (load_recent_files).
         """
-        targets = [(self.config_path, self.cal_selection)]
+        targets = [self.config_path]
         if self.config_path != self.default_config_path:
-            targets.append((self.default_config_path, None))
-        for path, cal_selection in targets:
+            targets.append(self.default_config_path)
+        for path in targets:
+            # Each file gets only the block that belongs in it, keyed off what
+            # the path *is* rather than off loop position: when a dataset's
+            # directory is unwritable, config_path falls back to the app-level
+            # file, and the tank selection must not follow it there.
+            app_level = path == self.default_config_path
             try:
-                save_config(path, self.config, cal_selection)
+                save_config(
+                    path, self.config,
+                    cal_selection=None if app_level else self.cal_selection,
+                    recent_files=self.recent_files if app_level else None,
+                )
             except OSError as e:
                 print(f"Warning: could not write {path}: {e}")
 

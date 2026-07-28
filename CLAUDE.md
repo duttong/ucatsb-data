@@ -435,6 +435,18 @@ from the app-level file instead would apply the last-opened flight's tanks to
 a different flight silently — the one failure mode the Cal Tanks tab exists to
 prevent, and one that corrupts every calibrated number for every gas at once
 while still looking plausible.
+
+**Two non-gas blocks, each in exactly one file, and `save_config` writes a
+*fresh* document.** `cals:` goes only to a flight's conf; `recent_files:` only
+to the app-level one. So an omitted argument is a *deletion*: an app-level
+`save_config` that forgets `recent_files=` wipes the recent list, exactly the
+trap `_controls_to_settings()` has for per-gas keys. `_save_settings` decides
+per target from `path == self.default_config_path` rather than from loop
+position, because `config_path` *is* the app-level path when a dataset's
+directory turned out to be unwritable, and the tank selection must not follow
+it there. `_save_app_config()` is the only other writer and always passes the
+list.
+
 `_initializing`/`_loading` flags exist specifically to suppress redraw/save
 during programmatic widget setup (e.g. `setChecked` on a freshly-constructed
 radio button fires its signal immediately, before sibling widgets it might
@@ -526,6 +538,30 @@ line from the tank's composition to the atmosphere's, which on this plot looks
 exactly like a tracer-tracer correlation and drags the fit (Feb 2025: n 11519
 → 10088 and slope 0.906 → 0.883 when Flag Air goes 0 → 45 s). It is the one
 masking setting whose absence is invisible here without saying so.
+
+### Recent files (Load Data menu + File menu)
+
+`self.recent_files` (newest first, capped at `RECENT_FILES_MAX`) is fed by
+`_remember_recent`, called from `load_csv` **after the dataset is committed** —
+`load_csv` validates first, so a file that fails never enters the list, and
+because `main()` goes through it a CLI-opened dataset is remembered too.
+
+`_rebuild_recent_menus` populates the Load Data button's menu and
+`File > Open Recent` from one builder, so the two cannot drift. It rebuilds
+wholesale rather than patching, for the same reason `refresh()` invalidates
+unconditionally. The `QAction` for "Open…" is *shared* by both menus.
+
+**The rebuild deletes the QAction whose signal is running.** `_open_recent`
+and `on_clear_recent_files` are triggered from actions that the work destroys
+(`QMenu.clear()` deletes them) while `triggered` is still unwinding — a
+use-after-free on the sender. Both therefore defer via
+`QTimer.singleShot(0, ...)` and let the signal finish first. Any future action
+inside these menus that ends in a rebuild needs the same treatment; a
+verification script must `processEvents()` after triggering one.
+
+Missing files stay listed but disabled and marked `(missing)` rather than
+being pruned on sight — an unmounted volume comes back. They are dropped only
+when opening one actually fails (`_try_load(..., forget_on_failure=True)`).
 
 ### Cal Tanks tab
 
