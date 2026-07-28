@@ -496,11 +496,30 @@ scratchpad first rather than pointing the test at `~/Data/UCATSb/...`.
 
 ### Correlations tab and `calibration_uncertainty`
 
-A tracer-tracer scatter of two `calibrate_series` outputs. Calibrated only,
-and that is the point rather than a convenience: a slope from uncalibrated
-counts carries each detector's gain error into the slope, which is the number
-the plot produces. A point survives only where **both** gases are good air,
-so it is the intersection of two independently-masked series.
+A tracer-tracer scatter, calibrated wherever a calibration exists — and that
+is the point rather than a convenience: a slope from uncalibrated counts
+carries that detector's gain error into the slope, which is the number the
+plot produces. A point survives only where **both** axes have a value, so it
+is the intersection of two independently-masked series.
+
+`_corr_axis(gas)` is the single place that decides what an axis contributes,
+returning `(values, sigma, unit, qualifier, reason)`. Two kinds:
+
+- a cal-bottle gas → `calibrate_series`' `calibrated`, plus a 1σ, already
+  masked to good air;
+- **Ozone** → `oz_o3best`, the ozone instrument's own product, with **no
+  sigma** (nothing to propagate — an axis with no calibration passes `None`
+  to `errorbar` rather than a zero bar, which would claim a precision nobody
+  established) and no masking of its own. Its partner axis still imposes its
+  masking through the intersection.
+
+`reason` is non-None only when a gas that *should* have a calibration lacks a
+usable one; Ozone having none is what Ozone is, not a failure to report. The
+qualifier rides on each **axis label** (`calibrated` / `oz_o3best`) because
+with one axis of each kind a single title word would have to lie about one of
+them; the title falls back to "see axis labels" when they differ. Anything
+new that assumes both axes are calibrated — the extrapolated-fraction note,
+the Flag Air note, the median-1σ readout — has to check `has_masking` first.
 
 `calibration_uncertainty(result)` (shared module) returns the 1σ on each
 calibrated value, propagated by writing the two-point calibration as a blend

@@ -446,18 +446,32 @@ the per-gas controls are replaced rather than left there to be misread.
 Masking, cal windows and drift model for each gas still live on the other
 tabs, and each gas is analysed with *its own* saved settings.
 
-- **X axis / Y axis** — any two calibratable gases in the file (Ozone is not
-  offered: no cal bottles, so no calibrated series). **Swap axes** flips them.
+- **X axis / Y axis** — any two gases in the file, Ozone included. **Swap
+  axes** flips them.
 - **Marker size** — marker diameter in points. A whole flight is tens of
   thousands of points; small markers show structure that large ones fill in.
 - **Error bars (1σ)** — see below.
 
-**It is calibrated data only**, deliberately: a tracer-tracer slope taken from
-uncalibrated counts carries each detector's gain error straight into the
-slope, which is the number the plot exists to produce. Both series come from
-the same `calibrate_series` output the Timeseries tab overlays, so they are
-already good-air-only, and a point is plotted when **both** tracers are good
-there. The figure says how many rows that left, what fraction sits where a
+**Each axis is calibrated wherever a calibration exists**, deliberately: a
+tracer-tracer slope taken from uncalibrated counts carries that detector's
+gain error straight into the slope, which is the number the plot exists to
+produce. Those series come from the same `calibrate_series` output the
+Timeseries tab overlays, so they are already good-air-only.
+
+**Ozone is the exception it has to be.** It has no cal bottles, so there is
+nothing to calibrate it against; it goes on the axis as the ozone
+instrument's own product, `oz_o3best`. The axis label and a line in the
+figure's note block both say so, and that axis gets no error bars — there is
+no calibration to propagate, and a zero-width bar would claim a precision
+nobody established. It needs no time alignment: ozone shares the CSV's
+timestamps, so the rows line up directly. It does report on a slower cadence
+(~2 s against the Aeris' 1 Hz on the Feb 2025 flight, so only about half the
+rows carry a value), which shows up as a lower `n`. Ozone carries no masking
+of its own either, but its partner axis is blanked wherever *that* gas was in
+cal, flushing or masked, and the pairing is an intersection — so the partner's
+masking reaches the ozone axis too.
+
+A point is plotted when **both** tracers have a usable value there. The figure says how many rows that left, what fraction sits where a
 calibration is extrapolated, and — because it matters here more than anywhere
 — when **Flag Air is 0**: post-cal flush points run in a line from the tank's
 composition toward the atmosphere's, which looks exactly like a tracer-tracer

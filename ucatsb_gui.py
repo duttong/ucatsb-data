@@ -670,10 +670,11 @@ class UcatsbGui(QMainWindow):
         vbox.addWidget(style_box)
 
         self.corr_note = QLabel(
-            "Calibrated data only. A point needs good air in <i>both</i> "
-            "tracers, so each gas's own masking, cal periods and post-cal "
-            "flush all remove points. Settings for each gas stay on the other "
-            "tabs."
+            "Calibrated data wherever there is a calibration. A point needs a "
+            "value in <i>both</i> tracers, so each gas's own masking, cal "
+            "periods and post-cal flush all remove points. Ozone has no cal "
+            "bottles, so it is plotted as recorded (<tt>oz_o3best</tt>) and "
+            "gets no error bars. Settings for each gas stay on the other tabs."
         )
         self.corr_note.setWordWrap(True)
         self.corr_note.setStyleSheet(f"color: {MUTED_COLOR};")
@@ -689,11 +690,15 @@ class UcatsbGui(QMainWindow):
         return panel
 
     def _populate_corr_combos(self):
-        """Offer the calibratable gases in this file. Ozone is excluded: it
-        has no cal bottles, so it has no calibrated series to plot, and this
-        figure is calibrated data only."""
-        gases = [gas for gas in self.available_gases
-                 if GASES[gas].get("has_masking", True)]
+        """Offer every gas in this file, Ozone included.
+
+        Ozone has no cal bottles, so there is nothing to calibrate it against
+        and it goes on the axis as the instrument's own product (`oz_o3best`).
+        That is worth having anyway: O3 against N2O or CO2 is a standard
+        tracer-tracer pairing, and it shares the CSV's timestamps, so the rows
+        line up with no resampling. The axis label says which it is.
+        """
+        gases = list(self.available_gases)
         self.corr_x_gas = gases[0] if gases else None
         # Default to a genuine pair rather than a gas against itself, which
         # would draw a diagonal line and look like a bug.
@@ -2110,12 +2115,46 @@ class UcatsbGui(QMainWindow):
         self._last_cal_key = cal_key
         self.cal_pane.canvas.draw()
 
-    def redraw_corr(self, preserve_view=False):
-        """Draw the Correlations tab: one calibrated tracer against another.
+    def _corr_axis(self, gas_key):
+        """What goes on one correlation axis, as
+        (values, sigma, unit, qualifier, reason).
 
-        Calibrated only, by design -- a tracer-tracer slope from uncalibrated
-        counts would carry each detector's gain error into the slope, which is
-        the number the plot exists to produce.
+        Two kinds of axis, and the difference is deliberately visible rather
+        than smoothed over:
+
+        - A cal-bottle gas contributes its CALIBRATED series -- a
+          tracer-tracer slope from uncalibrated counts would carry that
+          detector's gain error straight into the slope -- with a 1σ from the
+          calibration, and it is already masked down to good air.
+        - Ozone has no cal bottles, so `calibrate_series` has nothing to work
+          from. It contributes `oz_o3best`, the ozone instrument's own
+          product, with no sigma and no masking of its own. It is not
+          left out over that: its partner axis is blanked wherever that gas
+          was in cal, flushing or masked, and the pairing is an intersection,
+          so those rows drop anyway.
+
+        `reason` is non-None only when a gas that *should* have a calibration
+        has no usable one -- that is a failure to report, whereas Ozone having
+        none is just what Ozone is.
+        """
+        gas = GASES[gas_key]
+        unit = gas["ylabel"].split("(")[-1].rstrip(")")
+        if not gas.get("has_masking", True):
+            return self.df[gas["value_col"]], None, unit, gas["value_col"], None
+        result = self._calibration_for(gas_key)
+        if not (result or {}).get("ok"):
+            return None, None, unit, None, (result or {}).get("reason", "no calibration")
+        sigma = self._uncertainty_for(gas_key)[0] if self.corr_error_bars else None
+        return result["calibrated"], sigma, unit, "calibrated", None
+
+    def redraw_corr(self, preserve_view=False):
+        """Draw the Correlations tab: one tracer against another.
+
+        Calibrated wherever a calibration exists -- a tracer-tracer slope from
+        uncalibrated counts would carry each detector's gain error into the
+        slope, which is the number the plot exists to produce. Ozone is the
+        exception it cannot be: no cal bottles, so no calibration to apply.
+        See _corr_axis.
         """
         if self.df is None or not self.corr_x_gas or not self.corr_y_gas:
             return
@@ -2131,14 +2170,13 @@ class UcatsbGui(QMainWindow):
         ax = fig.add_subplot(111)
         self._style_axes(ax)
 
-        x_cal = self._calibration_for(x_gas)
-        y_cal = self._calibration_for(y_gas)
-        failed = [(gas, res) for gas, res in ((x_gas, x_cal), (y_gas, y_cal))
-                  if not (res or {}).get("ok")]
+        x_vals, x_sigma, x_unit, x_qual, x_reason = self._corr_axis(x_gas)
+        y_vals, y_sigma, y_unit, y_qual, y_reason = self._corr_axis(y_gas)
+        failed = [(gas, reason) for gas, reason in ((x_gas, x_reason), (y_gas, y_reason))
+                  if reason]
         if failed:
             ax.text(0.5, 0.5,
-                    "\n\n".join(f"{gas}: {res.get('reason', 'no calibration')}"
-                                for gas, res in failed),
+                    "\n\n".join(f"{gas}: {reason}" for gas, reason in failed),
                     transform=ax.transAxes, ha="center", va="center",
                     color=MUTED_COLOR, fontsize=10, wrap=True)
             ax.set_xticks([]); ax.set_yticks([])
@@ -2149,22 +2187,23 @@ class UcatsbGui(QMainWindow):
             self.corr_pane.canvas.draw()
             return
 
-        # Both series are already "good air only" (each gas's own masking, cal
-        # periods and flush are blanked by calibrate_series), so the pairing is
-        # just the intersection of what survived on each axis.
-        x, y = x_cal["calibrated"], y_cal["calibrated"]
-        keep = x.notna() & y.notna()
-        x, y = x[keep], y[keep]
-        x_unit = GASES[x_gas]["ylabel"].split("(")[-1].rstrip(")")
-        y_unit = GASES[y_gas]["ylabel"].split("(")[-1].rstrip(")")
+        # A calibrated series is already good-air-only (its own masking, cal
+        # periods and flush are blanked by calibrate_series); Ozone carries no
+        # masking of its own. Either way the pairing is the intersection of
+        # what each axis has a value for, which is also what makes a
+        # calibrated partner impose its masking on the Ozone axis.
+        keep = x_vals.notna() & y_vals.notna()
+        x, y = x_vals[keep], y_vals[keep]
 
-        if self.corr_error_bars and len(x):
-            x_sigma, _ = self._uncertainty_for(x_gas)
-            y_sigma, _ = self._uncertainty_for(y_gas)
+        if self.corr_error_bars and len(x) and (x_sigma is not None or y_sigma is not None):
             # Drawn under the markers and thin: at flight scale the bars
             # overlap into a band, and a band that hides its own points would
-            # misrepresent the density the plot is mostly about.
-            ax.errorbar(x, y, xerr=x_sigma[keep], yerr=y_sigma[keep],
+            # misrepresent the density the plot is mostly about. An axis with
+            # no calibration passes None -- there is nothing to propagate, and
+            # a zero bar would claim a precision nobody established.
+            ax.errorbar(x, y,
+                        xerr=None if x_sigma is None else x_sigma[keep],
+                        yerr=None if y_sigma is None else y_sigma[keep],
                         fmt="none", ecolor=CAL_SHADE_COLOR, elinewidth=0.6,
                         alpha=0.5, zorder=1)
 
@@ -2179,18 +2218,38 @@ class UcatsbGui(QMainWindow):
             ax.plot(xs, [fit["slope"] * v + fit["intercept"] for v in xs],
                     color=CALIBRATED_COLOR, linewidth=1.4, zorder=3)
 
-        ax.set_xlabel(f"{x_gas} ({x_unit}), calibrated", color=TEXT_COLOR)
-        ax.set_ylabel(f"{y_gas} ({y_unit}), calibrated", color=TEXT_COLOR)
+        # The qualifier rides on each axis label rather than only in the
+        # title: with one calibrated axis and one raw one, a single title word
+        # would have to lie about one of them.
+        ax.set_xlabel(f"{x_gas} ({x_unit}), {x_qual}", color=TEXT_COLOR)
+        ax.set_ylabel(f"{y_gas} ({y_unit}), {y_qual}", color=TEXT_COLOR)
         date_str = self.df["datetime"].iloc[0].strftime("%Y-%m-%d")
-        ax.set_title(f"UCATS-B {y_gas} vs {x_gas} (calibrated, {date_str})",
+        quals = {x_qual, y_qual}
+        title_qual = quals.pop() if len(quals) == 1 else "see axis labels"
+        ax.set_title(f"UCATS-B {y_gas} vs {x_gas} ({title_qual}, {date_str})",
                      color=TEXT_COLOR, loc="left")
         ax.grid(True, color=GRID_COLOR, linewidth=0.8)
 
         # Extrapolated spans are not excluded -- they are real data, and
         # dropping them silently would be worse than saying how much of the
-        # plot rests on a held-flat calibration.
-        extrapolated = (x_cal["extrapolated"] | y_cal["extrapolated"])[keep]
-        notes = [f"n = {len(x)} of {len(self.df)} rows (good air in both tracers)"]
+        # plot rests on a held-flat calibration. Only calibrated axes have the
+        # flag at all.
+        extrapolated = pd.Series(False, index=self.df.index)
+        for gas in (x_gas, y_gas):
+            result = self._calibration_for(gas)
+            if (result or {}).get("ok"):
+                extrapolated |= result["extrapolated"]
+        extrapolated = extrapolated[keep]
+        notes = [f"n = {len(x)} of {len(self.df)} rows (usable data in both tracers)"]
+        # Said plainly, because the axis label alone is easy to skim past and
+        # the consequence -- no gain correction on that axis, so the slope
+        # inherits that instrument's scale error -- is the whole reason the
+        # other axes are calibrated.
+        raw_axes = [gas for gas, qual in ((x_gas, x_qual), (y_gas, y_qual))
+                    if qual != "calibrated"]
+        for gas in raw_axes:
+            notes.append(f"{gas} has no cal bottles — plotted as recorded "
+                         f"({GASES[gas]['value_col']}), not calibrated")
         # The fit summary rides in this block rather than in a legend: a
         # legend has to sit somewhere, and on a scatter that fills one corner
         # it lands either on the data or on this text.
@@ -2204,13 +2263,17 @@ class UcatsbGui(QMainWindow):
         # in a line from the tank's composition to the atmosphere's, which
         # looks exactly like a tracer-tracer correlation and drags the fit.
         no_flush = [gas for gas in (x_gas, y_gas)
-                    if not self._analysis_for(gas)["flag_air_s"]]
+                    if GASES[gas].get("has_masking", True)
+                    and not self._analysis_for(gas)["flag_air_s"]]
         if no_flush:
             notes.append(f"Flag Air is 0 s for {', '.join(dict.fromkeys(no_flush))} — "
                          f"post-cal flush points are included")
         if self.corr_error_bars:
-            notes.append("error bars: 1σ from the calibration only "
-                         "(assigned values + drift-model reproducibility)")
+            note = ("error bars: 1σ from the calibration only "
+                    "(assigned values + drift-model reproducibility)")
+            if raw_axes:
+                note += f"; none on {', '.join(raw_axes)}"
+            notes.append(note)
         ax.text(0.01, 0.99, "\n".join(notes), transform=ax.transAxes,
                 ha="left", va="top", color=MUTED_COLOR, fontsize=9)
 
@@ -2260,10 +2323,16 @@ class UcatsbGui(QMainWindow):
             return
         sigma_note = ""
         if self.corr_error_bars:
-            x_sigma, _ = self._uncertainty_for(x_gas)
-            y_sigma, _ = self._uncertainty_for(y_gas)
-            sigma_note = (f"\nmedian 1σ  {x_gas} {x_sigma.median():.3g} {x_unit}"
-                          f"\n           {y_gas} {y_sigma.median():.3g} {y_unit}")
+            # Only for axes that have a calibration to propagate from; an
+            # uncalibrated axis gets no line rather than a zero.
+            lines = []
+            for gas, unit in ((x_gas, x_unit), (y_gas, y_unit)):
+                if not GASES[gas].get("has_masking", True):
+                    continue
+                sigma, _ = self._uncertainty_for(gas)
+                lines.append(f"{gas} {sigma.median():.3g} {unit}")
+            if lines:
+                sigma_note = "\nmedian 1σ  " + "\n           ".join(lines)
         self.corr_stats_label.setText(
             f"n      {fit['n']}\n"
             f"slope  {fit['slope']:.5g} ± {fit['slope_err']:.3g}\n"
