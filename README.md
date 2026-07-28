@@ -40,8 +40,9 @@ Left panel:
 - **Cal Mean Windows** — one box per cal bottle, titled dynamically from `cals.yaml`: e.g. "50% Cal (CB09960) 206.51 ppm", or just "Cal (CC470901) 402.037 ppm" for a tank with no `info` label. The mole fraction shown is that tank's assigned value for whichever gas is currently active. Each box has a start/end offset in seconds relative to the last point in that calibration period (`Cal_p`), e.g. `-10 s` to `2 s` = `[Cal_p-10s, Cal_p+2s]` (positive values are allowed, reaching past `Cal_p`). Settings are saved per-gas to the flight's own `<dataset>_conf.yaml` (see [Per-flight settings](#per-flight-settings-dataset_confyaml)) and reloaded whenever that dataset is opened again.
 - **Calibration** — drift model and smoothing window for the two-point calibration, a toggle to overlay the calibrated series on the main plot, and a CSV export. See [Calibration](#calibration) below.
 
-The three views (**Timeseries**, **Calibration** and **Cal Tanks**) are tabs
-sharing this one control panel — every control affects all of them.
+The **Timeseries**, **Calibration** and **Cal Tanks** tabs share this one
+control panel — every control affects all three. The **Correlations** tab
+brings its own panel instead (see [Correlations](#correlations)).
 
 Zooming/panning (via the matplotlib toolbar) is preserved across masking, averaging, and upper-trace changes — only the Home button, a gas change, and a cal-tank change reset to full scale.
 
@@ -216,12 +217,79 @@ Two consequences are worth being explicit about:
 | `smooth` | centred rolling mean over *N* events (the `N ev` spin box beside the model) | event-to-event scatter is several times the within-event noise and you want it suppressed without flattening real drift |
 | `constant` | one flight-mean value | a sanity baseline: what a single static calibration would have given |
 
+### The switch-over sample (always flagged)
+
+`j_sol_cals`/`j_sol_aircal` describe the **valve**, but the reading carrying a
+given timestamp is of gas that entered the cell a second or so earlier. So the
+first ambient-flagged row after each injection is not air at all — it is the
+tank, at full concentration:
+
+```
+row   datetime             CO2      N2O    j_sol_cals  j_sol_aircal  d1_P_mbars
+3192  2025-02-18 16:48:59  206.64  163.79     0.0          1.0         140.64   <- cal
+3193  2025-02-18 16:49:00  206.60  163.81     0.0          0.0         140.61   <- "air"
+3194  2025-02-18 16:49:01  197.48  153.63     0.0          0.0         139.49
+3195  2025-02-18 16:49:02  172.76  125.53     0.0          0.0         122.94   <- pressure mask
+```
+
+The cause is a **real ~1 s latency in the serial data** — the reading arrives
+after the gas it describes. Measured across all 45 solenoid transitions in the
+Feb 2025 file (1 Hz sampling), the response starts moving a median of 1 sample
+after the flag changes, and it is symmetric, which is what identifies it as a
+fixed transport delay rather than an edge artifact:
+
+| Edge | Samples until the response moves | Seconds |
+|---|---|---|
+| air → cal (rising) | median 1, range 0–2 | median 1.0, range 0–3 |
+| cal → air (falling) | median 1, range 0–2 | median 1.0, range 0–2 |
+
+The rising edge needs no handling: the first cal-flagged rows still read air,
+but cal periods run 40–97 s and the mean windows are anchored to `Cal_p` at
+the *end*, so even a `-30 s` window never reaches within 2 s of an interval's
+start (0 of 41 events on that flight). The falling edge is the one that
+escapes into the ambient record.
+
+Nothing else caught it. The cal mask goes by the flag, which is already off;
+the pressure mask misses it because the pressure is still in spec at that
+sample (the transient hits a second later); and the flush window starts
+*after* the interval's end, which is that very row's timestamp. One row per
+cal event — 18 on the Feb 2025 flight — sitting in the middle of the ambient
+record at the tank's composition. On a timeseries these are single samples
+hiding at the trailing edge of each cal dive; on the Correlations tab they
+pile up into an obvious tank-composition cluster, which is how they were
+found.
+
+These rows are now **always** flagged as not-air, independently of Flag Air,
+because they are mislabelled rather than merely early: the gray cal band
+extends over them and they are blanked from the calibrated series and the
+export (`is_cal_period=True`). This does *not* touch the cal periods
+themselves, so `Cal_p`, every cal mean and every calibration coefficient are
+unchanged.
+
 ### Post-cal flush ("Flag Air")
 
-When the solenoid switches back to ambient at the end of an injection, the
+The sample above is the leading edge of a longer effect. When the solenoid
+switches back to ambient at the end of an injection, the
 detector cells still hold cal gas, so the air data reads toward the tank for
 some seconds afterwards. **Flag Air** (in *Data Masking*, 0–90 s, default 0)
-drops that stretch.
+drops that stretch. With Flag Air at 0 the flush is kept, so tank-ward points
+remain in the calibrated record for a few seconds after each cal — 21 of them
+below 300 ppm on the Feb 2025 CO2 record, versus none at 45 s.
+
+That 21 includes the second sample of a 2 s lag, which the always-on
+switch-over mask (one timestamp) does not reach:
+
+```
+16:25:44 = 206.6      flag: cal
+16:25:45 = 206.6  *   <- switch-over mask
+16:25:46 = 206.1  *   <- still tank; needs Flag Air
+16:25:47 = 271.4  *
+```
+
+So the two mechanisms split the job deliberately: the switch-over mask is the
+zero-configuration floor that keeps a full-strength tank reading out of the
+air record no matter what, and Flag Air is the tunable part that covers the
+rest of the lag *and* the cell-clearing tail behind it.
 
 It behaves differently from the warm-up and pressure masks, deliberately:
 
@@ -357,6 +425,72 @@ quotes the warm-up and tolerance in force, so it is directly actionable), and
 when `cals.yaml` has no assigned value for the active gas. A flight with only
 one usable tank degrades to an offset-only correction (`mode: offset`, slope
 fixed at 1) rather than refusing outright, and says so in the header.
+
+## Correlations
+
+The **Correlations** tab plots one calibrated tracer against another —
+`N2O` vs `CO2` and so on. This tab has **its own left panel**: everything in
+the usual panel is per-gas, and this figure is about two gases at once, so
+the per-gas controls are replaced rather than left there to be misread.
+Masking, cal windows and drift model for each gas still live on the other
+tabs, and each gas is analysed with *its own* saved settings.
+
+- **X axis / Y axis** — any two calibratable gases in the file (Ozone is not
+  offered: no cal bottles, so no calibrated series). **Swap axes** flips them.
+- **Marker size** — marker diameter in points. A whole flight is tens of
+  thousands of points; small markers show structure that large ones fill in.
+- **Error bars (1σ)** — see below.
+
+**It is calibrated data only**, deliberately: a tracer-tracer slope taken from
+uncalibrated counts carries each detector's gain error straight into the
+slope, which is the number the plot exists to produce. Both series come from
+the same `calibrate_series` output the Timeseries tab overlays, so they are
+already good-air-only, and a point is plotted when **both** tracers are good
+there. The figure says how many rows that left, what fraction sits where a
+calibration is extrapolated, and — because it matters here more than anywhere
+— when **Flag Air is 0**: post-cal flush points run in a line from the tank's
+composition toward the atmosphere's, which looks exactly like a tracer-tracer
+correlation and drags the fit. On the Feb 2025 file, raising Flag Air to 45 s
+drops that trail (n 11519 → 10088) and moves the slope 0.906 → 0.883.
+
+An ordinary least-squares fit is drawn in red, with slope ± standard error,
+intercept and *r* both on the figure and in the panel on the left (which
+survives zooming and can be read while the plot is somewhere else).
+
+### Where the error bars come from
+
+Yes — a meaningful uncertainty does follow from the calibration, and that is
+exactly what the toggle shows. Writing the two-point calibration as a blend
+of the two assigned values, `c = (1-f)·A_lo + f·A_hi` where
+`f = (c - A_lo)/(A_hi - A_lo)`:
+
+```
+var(c) = ((1-f)·sA_lo)² + (f·sA_hi)² + (slope·(1-f)·sR_lo)² + (slope·f·sR_hi)²
+```
+
+with two inputs per tank:
+
+| Term | What it is |
+|---|---|
+| `sA` | the tank's assigned-value uncertainty, from `cals.yaml`'s `<GAS>_unc`. Missing is treated as 0 — an underestimate, but inventing a number would be worse |
+| `sR` | how well the drift model reproduces that tank's measured response: `sqrt(loo² + closure²)` |
+
+`sR` is where **the choice of calibration method shows up in the numbers**.
+Leave-one-out RMS is the honest scatter under a model that interpolates
+through every node (`linear`, whose closure residual is 0 by construction);
+the closure RMS is the error the model itself introduces by *not* passing
+through the nodes, which is 0 under `linear` and dominant under `constant`.
+On the Feb 2025 flight, switching CO2 from `linear` to `constant` moves the
+median 1σ from 2.67 to 3.34 ppm.
+
+Two things it deliberately does **not** include: the instrument's own
+single-sample noise (nothing in the calibration constrains it — it would have
+to come from the raw trace's high-frequency scatter), and any inflation over
+the extrapolated spans, which are reported as a count instead of being buried
+in a number that would then look like ordinary uncertainty. Note also that
+these uncertainties are mostly **systematic** — they shift a whole flight
+together rather than scattering point to point — which is why the fit is plain
+OLS rather than weighted by them.
 
 ## Data assumptions
 

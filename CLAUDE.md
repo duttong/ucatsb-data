@@ -67,13 +67,54 @@ module so both stay in sync.
 4. `cal_mean_points` averages each cal window (offset in seconds relative to
    the interval's last timestamp, independently configurable per bottle) and
    identifies which physical bottle was flowing.
+4b. `cal_switch_mask` flags the **switch-over sample**: the first row whose
+   solenoid flag has gone False while the cell still holds cal gas. The cause
+   is a real ~1 s latency in the serial data — measured across all 45
+   transitions in the Feb 2025 file (1 Hz), the response starts moving a
+   median of 1 sample after the flag changes, **symmetrically at both edges**
+   (rising 0–2 samples, falling 0–2), which is what marks it as a fixed
+   transport delay rather than an edge artifact. The rising edge needs no
+   handling — cal periods run 40–97 s and the mean windows are anchored to
+   `Cal_p` at the end, so even `-30 s` never reaches within 2 s of an
+   interval's start (0 of 41 events) — but the falling edge escapes into the
+   ambient record. The offending row is the tank at full concentration
+   (206.6 ppm against 206.51 assigned, Feb 2025) sitting in the ambient
+   record. Three masks all miss it — the cal mask goes by the flag, the
+   pressure mask misses it because the transient arrives a sample later, and
+   `find_intervals` closes a run *at that row's timestamp* while
+   `post_cal_flush_mask` starts strictly after it. It is OR-ed into `not_air`
+   (used for shading and for `calibrate_series`' `cal_mask`) and deliberately
+   **not** into `cal` itself: `cal` defines the cal intervals, whose ends are
+   the `Cal_p` every cal-mean window is measured from, so folding it in there
+   would silently shift every cal mean. Verify after touching this:
+   `cal_points`, `cal_intervals`, `span_gain`, `loo_rms` and `slope` must be
+   identical with the mask and with it stubbed out to all-False.
+
+   It covers **one timestamp, not the whole lag**, and that is a considered
+   split rather than an oversight. A 2 s lag leaks a second tank sample
+   (16:25:46 = 206.1 ppm on that flight) which this mask does not reach. The
+   switch-over mask is the zero-configuration floor that keeps a
+   full-strength tank reading out of the air record unconditionally; `Flag
+   Air` is the tunable part covering the rest of the lag and the
+   cell-clearing tail behind it. Parameterising the lag, or shifting the
+   solenoid flags by it, was considered and declined (2026-07-27): shifting
+   moves `Cal_p` and therefore every already-saved flight's calibration.
 5. `post_cal_flush_mask` ("Flag Air") flags the first N seconds of *ambient*
    data after each cal interval ends — the detector cells are still clearing
    cal gas, so those rows read toward the tank rather than the atmosphere.
 
+**`find_intervals` returns the timestamp of the first row *after* each run as
+its `end`**, not the last row inside it. Everything downstream inherits that:
+`Cal_p` (so a cal window of `[-15, -1]` ends one sample before the first
+ambient row), the flush window's start, and the right-hand edge of the cal
+shading. It is why the switch-over sample fell through every mask until
+`cal_switch_mask` existed. Changing it would move every cal mean, so leave it
+and remember it.
+
 **`calibrate_series`' `calibrated` output is the calibrated GOOD AMBIENT
 record.** Three masks are blanked from it as the very last step — `cal_mask`
-(rows inside a cal period), `flush_mask`, and `exclude_mask` (warm-up +
+(rows inside a cal period, plus the switch-over sample: the GUI passes
+`not_air`), `flush_mask`, and `exclude_mask` (warm-up +
 out-of-spec detector pressure) — so the calibrated trace and the exported
 `<col>_cal` column contain good air and nothing else. Nothing is lost by
 this: `cal_slope`/`cal_intercept` are still emitted on every row, so the
@@ -104,12 +145,25 @@ band (like the orange/red masking bands) is shaded whether or not "Show
 calibrated" is on, since the band is how the user finds out those rows exist
 before turning the overlay on.
 
-Both views read these through `UcatsbGui._get_analysis()`, a cache whose sole
-invalidation site is `refresh()` — the entry point every state change calls.
-It invalidates unconditionally rather than comparing a composite key of
-(file, gas, warm-up, tolerance, cal windows, drift model): such a key is easy
-to get subtly wrong and then serves a stale plot. The recompute is
-milliseconds against ~100 ms of rendering.
+Every view reads these through `UcatsbGui._analysis_for(gas)` /
+`_calibration_for(gas)` / `_uncertainty_for(gas)` — **dicts keyed by gas**,
+not one slot for the gas on display, because the Correlations tab needs two
+gases' calibrations at once. `_get_analysis()`/`_get_calibration()` remain as
+the current-gas shorthands. Their sole invalidation site is `refresh()`, the
+entry point every state change calls; it clears all three unconditionally
+rather than comparing a composite key of (file, gas, warm-up, tolerance, cal
+windows, drift model), since such a key is easy to get subtly wrong and then
+serves a stale plot. The recompute is milliseconds against ~100 ms of
+rendering.
+
+`_settings_for(gas)` decides *whose* settings a gas is analysed with: the live
+control widgets for `current_gas`, `self.config[gas]` for any other. The two
+agree in practice (every edit writes `config[current_gas]`), but a
+Correlations plot of CO2 against N2O must analyse each with its own saved
+warm-up/tolerance/cal windows, not with whatever the panel happens to be
+showing. Anything reading the widgets directly instead is a bug for the
+non-displayed gas — that is why `_analysis_for` takes settings, not spin-box
+values.
 
 ### Calibration: drift removal and calibration are ONE step
 
@@ -331,16 +385,27 @@ timeseries pane** rather than being renamed, so `redraw()`'s body needs no
 changes; don't rename them while also changing behavior, or a rendering
 regression becomes indistinguishable from a refactor slip.
 
-The controls panel deliberately stays **outside** the tabs — every control
-affects both views, so moving it inside would mean duplicating the gas
-selector or making one tab depend on state invisible from the other.
+The controls panel stays **outside** the tabs, in a `QStackedWidget` with two
+pages: the per-gas panel shared by Timeseries/Calibration/Cal Tanks, and the
+Correlations panel. `on_tab_changed` switches the page. Sharing one panel is
+still the default and the reason holds (duplicating the gas selector, or
+making one tab depend on state invisible from another); Correlations is the
+exception because it is inherently about *two* gases, so a per-gas panel
+beside it would be actively misleading about what is plotted.
 
-`refresh()` redraws only the visible pane and marks the other dirty, so a
+`refresh()` redraws only the visible pane and marks the others dirty, so a
 spinbox drag doesn't render a pane nobody is looking at. The `_preserve`
 latch matters: a requested full rescale must survive until it is actually
 honoured, or changing gas and then nudging a spinbox would leave the
 never-drawn pane stuck at a stale scale when first opened. The cal tab's own
-"same content" key is `(gas, drift_model, smooth_events)`.
+"same content" key is `(gas, drift_model, smooth_events)`; the correlation
+tab's is `(x_gas, y_gas)`.
+
+Correlation-only controls call **`_refresh_corr`, not `refresh()`**: marker
+size, the error-bar toggle and the axis pickers change nothing about any
+mask, calibration or setting, so going through `refresh()` would clear both
+per-gas caches and dirty every pane — making a marker-size nudge recompute
+two gases' analyses and redraw the timeseries.
 
 ### Config persistence: two files with different jobs
 
@@ -416,6 +481,51 @@ settings — and then the numbers in the next run won't match, which is
 confusing to debug. Since loading a dataset now also writes
 `<dataset>_conf.yaml` into that dataset's directory, copy the CSV into the
 scratchpad first rather than pointing the test at `~/Data/UCATSb/...`.
+
+### Correlations tab and `calibration_uncertainty`
+
+A tracer-tracer scatter of two `calibrate_series` outputs. Calibrated only,
+and that is the point rather than a convenience: a slope from uncalibrated
+counts carries each detector's gain error into the slope, which is the number
+the plot produces. A point survives only where **both** gases are good air,
+so it is the intersection of two independently-masked series.
+
+`calibration_uncertainty(result)` (shared module) returns the 1σ on each
+calibrated value, propagated by writing the two-point calibration as a blend
+of the assigned values, `c = (1-f)A_lo + f A_hi` with
+`f = (c - A_lo)/(A_hi - A_lo)`. Non-obvious properties:
+
+- **`f` comes from the calibrated value, not from the interpolated
+  responses.** That keeps the function a pure function of what
+  `calibrate_series` already returns, with no need to re-expose `R_lo`/`R_hi`.
+- **`f` is not clamped to [0, 1].** Ambient air usually sits outside the
+  bracket the two tanks span, and the uncertainty genuinely grows as the
+  calibration extrapolates away from them.
+- **Per-bottle response sigma is `sqrt(loo² + closure²)`, and both halves are
+  required.** Under `linear` the closure residual is identically 0 (the model
+  interpolates through every node), so closure alone would report zero
+  uncertainty; under `constant` the LOO scatter understates the error the
+  model introduces by not passing through the nodes. Together they are what
+  makes the answer depend on the drift model at all — CO2 on the Feb 2025
+  flight moves from 2.67 to 3.34 ppm median 1σ between `linear` and
+  `constant`. A change here that makes the two models agree is a bug signal.
+- **A missing `<GAS>_unc` counts as 0**, which understates — but inventing a
+  number would be worse, and the tank roster is where the fix belongs.
+- **Single-sample instrument noise is deliberately absent**: nothing in the
+  calibration constrains it. So is any inflation over extrapolated spans,
+  which are reported as a percentage of points instead — folding them in
+  would disguise "we are guessing here" as ordinary uncertainty.
+
+Because these uncertainties are near-entirely *systematic* (they shift a whole
+flight together), `linear_fit` is plain OLS and must stay that way: weighting
+by them would not do what weighting is for, and would make the reported slope
+depend on whether a display toggle is on.
+
+The figure calls out **Flag Air = 0** by name. Post-cal flush points trace a
+line from the tank's composition to the atmosphere's, which on this plot looks
+exactly like a tracer-tracer correlation and drags the fit (Feb 2025: n 11519
+→ 10088 and slope 0.906 → 0.883 when Flag Air goes 0 → 45 s). It is the one
+masking setting whose absence is invisible here without saying so.
 
 ### Cal Tanks tab
 

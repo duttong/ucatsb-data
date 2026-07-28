@@ -23,7 +23,7 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
     QGroupBox, QComboBox, QDoubleSpinBox, QSpinBox, QLabel,
     QButtonGroup, QRadioButton, QPushButton, QFileDialog, QMessageBox,
-    QTabWidget, QCheckBox, QAction,
+    QTabWidget, QCheckBox, QAction, QStackedWidget,
 )
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg, NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
@@ -35,7 +35,8 @@ from plot_co2_timeseries import (
     shade_intervals, cal_mean_points, load_cal_roster, load_cal_assignment,
     select_cal_bottles,
     most_common_serial, mean_std_label, calibrate_series, post_cal_flush_mask,
-    box_stats,
+    cal_switch_mask,
+    box_stats, calibration_uncertainty, linear_fit,
     plot_calibration_panels, export_calibrated_csv,
     CALS_YAML_PATH, CAL_DRIFT_MODELS, CAL_DEFAULT_SMOOTH_EVENTS,
     POST_CAL_FLUSH_COLOR,
@@ -409,16 +410,20 @@ class UcatsbGui(QMainWindow):
         self.right_axis_column = None
         self._loading = False
         self._initializing = True
-        self._analysis = None
-        self._calibration = None
+        # Per-gas caches: the Correlations tab needs two gases' calibrations
+        # at once, so these are dicts keyed by gas rather than one slot for
+        # whichever gas is on display.
+        self._analysis = {}
+        self._calibration = {}
+        self._uncertainty = {}
         # Rebuilt by every redraw(); initialised here so on_stats_box is safe
         # to reach before the first draw.
         self._stats_traces = {}
         self.drift_model = DEFAULT_GAS_SETTINGS["drift_model"]
         self.drift_smooth_events = DEFAULT_GAS_SETTINGS["drift_smooth_events"]
         self.show_calibrated = False
-        self._dirty = {"main": True, "cal": True}
-        self._preserve = {"main": False, "cal": False}
+        self._dirty = {"main": True, "cal": True, "corr": True}
+        self._preserve = {"main": False, "cal": False, "corr": False}
         self.cal_roster = load_cal_roster(CALS_YAML_PATH)
         # cals.yaml's own pairing is the default only; a flight's conf file
         # overrides it, and the Cal Tanks tab edits it.
@@ -434,12 +439,30 @@ class UcatsbGui(QMainWindow):
         self._last_right_axis_key = None
         self._cal_ax = None
         self._last_cal_key = None
+        # Correlations tab state. Session-only, like the calibrated overlay:
+        # which pair of tracers you are looking at is a question you are
+        # asking right now, not a property of the flight worth persisting.
+        self.corr_x_gas = None
+        self.corr_y_gas = None
+        self.corr_marker_size = 4
+        self.corr_error_bars = False
+        self._corr_ax = None
+        self._last_corr_key = None
 
         central = QWidget()
         self.setCentralWidget(central)
         layout = QHBoxLayout(central)
 
-        layout.addWidget(self._build_controls(), 0)
+        # The control panel is a stack, not one panel: everything in the
+        # main panel is per-gas and the Correlations tab is inherently about
+        # two gases at once, so its controls replace them rather than sitting
+        # alongside and contradicting them. Tabs that share the per-gas
+        # controls (Timeseries, Calibration, Cal Tanks) still share one panel.
+        self.controls_stack = QStackedWidget()
+        self.controls_stack.addWidget(self._build_controls())
+        self.controls_stack.addWidget(self._build_corr_controls())
+        self.controls_stack.setFixedWidth(300)
+        layout.addWidget(self.controls_stack, 0)
         layout.addWidget(self._build_tabs(), 1)
 
         self._initializing = False
@@ -498,6 +521,9 @@ class UcatsbGui(QMainWindow):
         self.setWindowTitle(f"UCATS-B Viewer - {csv_path.name}")
         self.file_label.setText(csv_path.name)
         self.file_label.setToolTip(str(csv_path))
+        self.corr_file_label.setText(csv_path.name)
+        self.corr_file_label.setToolTip(str(csv_path))
+        self._populate_corr_combos()
 
         was_initializing = self._initializing
         self._initializing = True
@@ -552,6 +578,97 @@ class UcatsbGui(QMainWindow):
             print(f"Warning: could not write {path}: {e}")
             self.config_path = self.default_config_path
         self._apply_cal_selection_to_controls()
+
+    def _build_corr_controls(self):
+        """Controls for the Correlations tab only (see the stack comment in
+        __init__ for why they are not merged into the main panel)."""
+        panel = QWidget()
+        vbox = QVBoxLayout(panel)
+
+        self.corr_file_label = QLabel("No file loaded")
+        self.corr_file_label.setStyleSheet(f"color: {MUTED_COLOR};")
+        vbox.addWidget(self.corr_file_label)
+
+        axes_box = QGroupBox("Tracers")
+        axes_form = QFormLayout(axes_box)
+        self.corr_x_combo = QComboBox()
+        self.corr_x_combo.currentTextChanged.connect(
+            functools.partial(self.on_corr_gas_changed, "x"))
+        axes_form.addRow("X axis:", self.corr_x_combo)
+        self.corr_y_combo = QComboBox()
+        self.corr_y_combo.currentTextChanged.connect(
+            functools.partial(self.on_corr_gas_changed, "y"))
+        axes_form.addRow("Y axis:", self.corr_y_combo)
+
+        swap_button = QPushButton("Swap axes")
+        swap_button.clicked.connect(self.on_corr_swap_axes)
+        axes_form.addRow(swap_button)
+        vbox.addWidget(axes_box)
+
+        style_box = QGroupBox("Points")
+        style_form = QFormLayout(style_box)
+        self.corr_size_spin = QSpinBox()
+        self.corr_size_spin.setRange(1, 20)
+        self.corr_size_spin.setValue(self.corr_marker_size)
+        self.corr_size_spin.setSuffix(" pt")
+        self.corr_size_spin.setToolTip(
+            "Marker diameter. A whole flight is tens of thousands of points,\n"
+            "so small markers show the structure that large ones fill in."
+        )
+        self.corr_size_spin.valueChanged.connect(self.on_corr_style_changed)
+        style_form.addRow("Marker size:", self.corr_size_spin)
+
+        self.corr_error_check = QCheckBox("Error bars (1σ)")
+        self.corr_error_check.setToolTip(
+            "1-sigma uncertainty propagated from the calibration itself:\n"
+            "the tanks' assigned-value uncertainties from cals.yaml, and how\n"
+            "well the drift model reproduces each tank's measured response\n"
+            "(leave-one-out + closure). It does NOT include the instrument's\n"
+            "own single-sample noise, which the calibration says nothing\n"
+            "about. Mostly systematic — it shifts points together rather\n"
+            "than scattering them."
+        )
+        self.corr_error_check.toggled.connect(self.on_corr_style_changed)
+        style_form.addRow(self.corr_error_check)
+        vbox.addWidget(style_box)
+
+        self.corr_note = QLabel(
+            "Calibrated data only. A point needs good air in <i>both</i> "
+            "tracers, so each gas's own masking, cal periods and post-cal "
+            "flush all remove points. Settings for each gas stay on the other "
+            "tabs."
+        )
+        self.corr_note.setWordWrap(True)
+        self.corr_note.setStyleSheet(f"color: {MUTED_COLOR};")
+        vbox.addWidget(self.corr_note)
+
+        self.corr_stats_label = QLabel()
+        self.corr_stats_label.setWordWrap(True)
+        self.corr_stats_label.setTextFormat(Qt.PlainText)
+        self.corr_stats_label.setStyleSheet("font-family: Menlo, monospace;")
+        vbox.addWidget(self.corr_stats_label)
+
+        vbox.addStretch(1)
+        return panel
+
+    def _populate_corr_combos(self):
+        """Offer the calibratable gases in this file. Ozone is excluded: it
+        has no cal bottles, so it has no calibrated series to plot, and this
+        figure is calibrated data only."""
+        gases = [gas for gas in self.available_gases
+                 if GASES[gas].get("has_masking", True)]
+        self.corr_x_gas = gases[0] if gases else None
+        # Default to a genuine pair rather than a gas against itself, which
+        # would draw a diagonal line and look like a bug.
+        self.corr_y_gas = gases[1] if len(gases) > 1 else self.corr_x_gas
+        for combo, current in ((self.corr_x_combo, self.corr_x_gas),
+                               (self.corr_y_combo, self.corr_y_gas)):
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItems(gases)
+            if current:
+                combo.setCurrentText(current)
+            combo.blockSignals(False)
 
     def _rebuild_cal_bottles(self):
         """The two tanks matching is allowed to consider, from the current
@@ -812,10 +929,15 @@ class UcatsbGui(QMainWindow):
         self.toolbar = self.main_pane.toolbar
 
         self.tanks_pane = self._build_cal_tanks_pane()
+        self.corr_pane = PlotPane()
+        # Same reason as the Calibration tab: the box-stats readout describes
+        # one trace over a time span, which a tracer-tracer scatter is not.
+        self.corr_pane.stats_action.setVisible(False)
 
         self.tabs = QTabWidget()
         self.tabs.addTab(self.main_pane, "Timeseries")
         self.tabs.addTab(self.cal_pane, "Calibration")
+        self.tabs.addTab(self.corr_pane, "Correlations")
         self.tabs.addTab(self.tanks_pane, "Cal Tanks")
         # Connected after every addTab call -- the first one fires
         # currentChanged before the other tabs exist.
@@ -1097,6 +1219,49 @@ class UcatsbGui(QMainWindow):
                            f"Copied to {', '.join(targets)}" if targets else "Nothing to copy",
                            self.COPY_SETTINGS_LABEL)
 
+    def on_corr_gas_changed(self, axis, gas_key):
+        if self._loading or self._initializing or not gas_key:
+            return
+        if axis == "x":
+            self.corr_x_gas = gas_key
+        else:
+            self.corr_y_gas = gas_key
+        # A different tracer is a different set of numbers on that axis, so
+        # the old limits mean nothing -- rescale, as a gas change does on the
+        # timeseries.
+        self._refresh_corr(preserve_view=False)
+
+    def on_corr_swap_axes(self):
+        if self.corr_x_gas is None or self.corr_x_gas == self.corr_y_gas:
+            return
+        self.corr_x_gas, self.corr_y_gas = self.corr_y_gas, self.corr_x_gas
+        loading = self._loading
+        self._loading = True
+        self.corr_x_combo.setCurrentText(self.corr_x_gas)
+        self.corr_y_combo.setCurrentText(self.corr_y_gas)
+        self._loading = loading
+        self._refresh_corr(preserve_view=False)
+
+    def on_corr_style_changed(self):
+        if self._loading or self._initializing:
+            return
+        self.corr_marker_size = self.corr_size_spin.value()
+        self.corr_error_bars = self.corr_error_check.isChecked()
+        self._refresh_corr(preserve_view=True)
+
+    def _refresh_corr(self, preserve_view=True):
+        """Redraw the correlation pane only.
+
+        Not refresh(): none of these controls changes any mask, calibration
+        or setting, so invalidating the shared caches and dirtying the other
+        panes would make a marker-size tweak recompute two gases' worth of
+        analysis and redraw the timeseries.
+        """
+        self._dirty["corr"] = True
+        if not preserve_view:
+            self._preserve["corr"] = False
+        self._draw_current_tab()
+
     def _flash_button(self, button, message, restore, msec=1600):
         """Confirm an action in the button itself. A modal dialog for a
         one-click settings copy would cost more attention than the action is
@@ -1247,8 +1412,9 @@ class UcatsbGui(QMainWindow):
         ~100 ms of rendering, and redrawing only the visible pane avoids
         paying even that twice.
         """
-        self._analysis = None
-        self._calibration = None
+        self._analysis.clear()
+        self._calibration.clear()
+        self._uncertainty.clear()
         for pane in self._dirty:
             self._dirty[pane] = True
             # A requested full rescale has to survive until it is actually
@@ -1270,6 +1436,8 @@ class UcatsbGui(QMainWindow):
         widget = self.tabs.currentWidget()
         if widget is self.cal_pane:
             name = "cal"
+        elif widget is self.corr_pane:
+            name = "corr"
         elif widget is self.main_pane:
             name = "main"
         else:
@@ -1279,35 +1447,60 @@ class UcatsbGui(QMainWindow):
         preserve = self._preserve.get(name, False)
         if name == "cal":
             self.redraw_cal(preserve_view=preserve)
+        elif name == "corr":
+            self.redraw_corr(preserve_view=preserve)
         else:
             self.redraw(preserve_view=preserve)
         self._dirty[name] = False
         self._preserve[name] = True
 
     def on_tab_changed(self, index):
+        # The control panel follows the tab: correlation controls for the
+        # Correlations tab, the per-gas panel for everything else.
+        self.controls_stack.setCurrentIndex(
+            1 if self.tabs.currentWidget() is self.corr_pane else 0)
         if self._initializing:
             return
         self._draw_current_tab()
 
-    def _get_analysis(self):
-        """Masks, cal intervals and per-injection cal means for the current
-        file, gas and control settings.
+    def _settings_for(self, gas_key):
+        """The settings that apply to `gas_key`.
 
-        Cached because more than one view reads the same numbers and they
-        must not disagree; see refresh() for how the cache is invalidated.
-        Returns None when no file is loaded.
+        The live controls for the gas on display, `self.config` for any other
+        -- the Correlations tab analyses two gases at once, only one of which
+        the control panel is showing. The two agree in practice (every edit
+        writes `config[current_gas]`), but reading the widgets for the current
+        gas keeps the displayed controls authoritative for what is drawn.
         """
-        if self.df is None:
-            return None
-        if self._analysis is not None:
-            return self._analysis
+        if gas_key == self.current_gas:
+            return self._controls_to_settings()
+        return self.config.get(gas_key, DEFAULT_GAS_SETTINGS)
 
-        gas = GASES[self.current_gas]
+    def _get_analysis(self):
+        """Masks, cal intervals and per-injection cal means for the gas on
+        display. See _analysis_for."""
+        return self._analysis_for(self.current_gas)
+
+    def _analysis_for(self, gas_key):
+        """Masks, cal intervals and per-injection cal means for one gas, from
+        the current file and that gas's settings.
+
+        Cached per gas because more than one view reads the same numbers and
+        they must not disagree; see refresh() for how the cache is
+        invalidated. Returns None when no file is loaded.
+        """
+        if self.df is None or gas_key is None:
+            return None
+        if gas_key in self._analysis:
+            return self._analysis[gas_key]
+
+        gas = GASES[gas_key]
+        settings = self._settings_for(gas_key)
         df = self.df
         has_masking = gas.get("has_masking", True)
-        warmup_minutes = self.warmup_spin.value()
-        pressure_tol = self.pressure_tol_spin.value()
-        flag_air_s = self.flag_air_spin.value()
+        warmup_minutes = settings["warmup_min"]
+        pressure_tol = settings["pressure_tol_mbar"]
+        flag_air_s = settings["flag_air_s"]
 
         # bad_pressure/warmup are computed unconditionally -- even for a gas
         # with no masking of its own (Ozone), the aux panel can still show
@@ -1316,6 +1509,14 @@ class UcatsbGui(QMainWindow):
         # gated on has_masking by the caller.
         cal = (df["j_sol_cals"].fillna(0).astype(bool)
                | df["j_sol_aircal"].fillna(0).astype(bool))
+        # The valve flag leads the measurement by about a sample, so the first
+        # "ambient" row after an injection is still tank gas. Kept as its own
+        # mask and OR-ed into `not_air` below rather than into `cal` itself:
+        # `cal` defines the cal INTERVALS, whose ends are the Cal_p every cal
+        # mean window is measured from, and moving those would silently shift
+        # every cal mean.
+        cal_switch = cal_switch_mask(df["datetime"], cal)
+        not_air = cal | cal_switch
 
         bad_pressure = (df["d1_P_mbars"] - D1_P_TARGET_MBARS).abs() > pressure_tol
         bad_pressure = bad_pressure.fillna(False)
@@ -1334,21 +1535,22 @@ class UcatsbGui(QMainWindow):
             # the means are computed over, and folding it in would suggest it
             # can drop a cal point (it cannot).
             post_cal_flush = post_cal_flush_mask(
-                df["datetime"], cal_intervals, flag_air_s, cal_mask=cal
+                df["datetime"], cal_intervals, flag_air_s, cal_mask=not_air
             )
             # Cal means are estimated from the raw data with these masks
             # applied -- a cal point can be dropped entirely if its window
             # has no valid data.
             cal_points = cal_mean_points(
                 df, cal_intervals, gas["value_col"],
-                (self.cal1_start_spin.value(), self.cal1_end_spin.value()),
-                (self.cal2_start_spin.value(), self.cal2_end_spin.value()),
-                cal_bottles=self.cal_bottles, gas_key=self.current_gas,
+                tuple(settings["cal1_window_s"]),
+                tuple(settings["cal2_window_s"]),
+                cal_bottles=self.cal_bottles, gas_key=gas_key,
                 exclude_mask=bad_pressure | warmup,
             )
 
-        self._analysis = {
-            "cal": cal, "warmup": warmup, "bad_pressure": bad_pressure,
+        self._analysis[gas_key] = {
+            "cal": cal, "cal_switch": cal_switch, "not_air": not_air,
+            "warmup": warmup, "bad_pressure": bad_pressure,
             "exclude_mask": bad_pressure | warmup,
             "cal_intervals": cal_intervals, "cal_points": cal_points,
             "post_cal_flush": post_cal_flush,
@@ -1356,7 +1558,7 @@ class UcatsbGui(QMainWindow):
             "warmup_minutes": warmup_minutes, "pressure_tol": pressure_tol,
             "flag_air_s": flag_air_s,
         }
-        return self._analysis
+        return self._analysis[gas_key]
 
     def redraw(self, preserve_view=False):
         analysis = self._get_analysis()
@@ -1410,13 +1612,16 @@ class UcatsbGui(QMainWindow):
         ax.set_facecolor("#fcfcfb")
 
         cal = analysis["cal"]
+        # The band tracks what is treated as not-air, switch-over sample
+        # included, so the shading and the blanked calibrated trace agree.
+        not_air = analysis["not_air"]
         warmup = analysis["warmup"]
         bad_pressure = analysis["bad_pressure"]
         cal_points = analysis["cal_points"]
         post_cal_flush = analysis["post_cal_flush"]
 
         if has_masking:
-            shade_intervals(ax, df["datetime"], cal, CAL_SHADE_COLOR, alpha=0.3)
+            shade_intervals(ax, df["datetime"], not_air, CAL_SHADE_COLOR, alpha=0.3)
             shade_intervals(ax, df["datetime"], warmup, WARMUP_EXCLUDE_COLOR, alpha=0.15)
             shade_intervals(ax, df["datetime"], bad_pressure, PRESSURE_EXCLUDE_COLOR, alpha=0.15)
             # Shaded whether or not the calibrated trace is showing: the band
@@ -1518,7 +1723,9 @@ class UcatsbGui(QMainWindow):
         notes = []
         if has_masking:
             if cal.any():
-                notes.append("gray = calibration/cal-air (j_sol_cals, j_sol_aircal)")
+                notes.append("gray = calibration/cal-air (j_sol_cals, j_sol_aircal"
+                             + (", + switch-over sample)"
+                                if analysis["cal_switch"].any() else ")"))
             if warmup.any():
                 notes.append(f"orange = excluded (first {warmup_minutes} min warm-up)")
             if bad_pressure.any():
@@ -1621,46 +1828,61 @@ class UcatsbGui(QMainWindow):
         }
 
     def _get_calibration(self):
-        """The calibration for the current analysis and drift-model settings.
+        """The calibration for the gas on display. See _calibration_for."""
+        return self._calibration_for(self.current_gas)
 
-        Cached and computed lazily, so a gas with no cal system, or a session
-        that never opens the Calibration tab, never pays for it. Invalidated
-        alongside the analysis in refresh().
+    def _calibration_for(self, gas_key):
+        """The calibration for one gas, from its analysis and drift settings.
+
+        Cached per gas and computed lazily, so a gas with no cal system, or a
+        session that never opens the Calibration or Correlations tab, never
+        pays for it. Invalidated alongside the analysis in refresh().
         """
-        analysis = self._get_analysis()
+        analysis = self._analysis_for(gas_key)
         if analysis is None:
             return None
-        if self._calibration is not None:
-            return self._calibration
+        if gas_key in self._calibration:
+            return self._calibration[gas_key]
 
+        settings = self._settings_for(gas_key)
         if not analysis["has_masking"]:
-            self._calibration = {
+            self._calibration[gas_key] = {
                 "ok": False,
-                "reason": f"{self.current_gas} is not run through the cal-bottle "
+                "reason": f"{gas_key} is not run through the cal-bottle "
                           f"system, so there is nothing to calibrate against.",
             }
-            return self._calibration
+            return self._calibration[gas_key]
         if not analysis["cal_points"]:
-            self._calibration = {
+            self._calibration[gas_key] = {
                 "ok": False,
                 "reason": (f"No cal events survive the current masking "
                            f"({analysis['warmup_minutes']} min warm-up, "
                            f"±{analysis['pressure_tol']:.2f} mbar)."),
             }
-            return self._calibration
+            return self._calibration[gas_key]
 
-        self._calibration = calibrate_series(
-            self.df, GASES[self.current_gas]["value_col"], analysis["cal_points"],
-            self.cal_bottles, self.current_gas,
-            model=self.drift_model, smooth_window=self.drift_smooth_events,
+        self._calibration[gas_key] = calibrate_series(
+            self.df, GASES[gas_key]["value_col"], analysis["cal_points"],
+            self.cal_bottles, gas_key,
+            model=settings["drift_model"],
+            smooth_window=settings["drift_smooth_events"],
             roster=self.cal_roster, flush_mask=analysis["post_cal_flush"],
-            cal_mask=analysis["cal"],
+            cal_mask=analysis["not_air"],
             # Blanks warm-up/bad-pressure rows from the *output* only. The
             # same mask separately fed cal_mean_points above, which is what
             # affects the calibration; this use cannot.
             exclude_mask=analysis["exclude_mask"],
         )
-        return self._calibration
+        return self._calibration[gas_key]
+
+    def _uncertainty_for(self, gas_key):
+        """(sigma Series, components dict) for one gas, cached per gas."""
+        if gas_key not in self._uncertainty:
+            result = self._calibration_for(gas_key)
+            if result is None:
+                return None, {}
+            self._uncertainty[gas_key] = calibration_uncertainty(result)
+        return self._uncertainty[gas_key]
 
     def redraw_cal(self, preserve_view=False):
         """Draw the Calibration tab."""
@@ -1693,6 +1915,151 @@ class UcatsbGui(QMainWindow):
         self._cal_ax = axes
         self._last_cal_key = cal_key
         self.cal_pane.canvas.draw()
+
+    def redraw_corr(self, preserve_view=False):
+        """Draw the Correlations tab: one calibrated tracer against another.
+
+        Calibrated only, by design -- a tracer-tracer slope from uncalibrated
+        counts would carry each detector's gain error into the slope, which is
+        the number the plot exists to produce.
+        """
+        if self.df is None or not self.corr_x_gas or not self.corr_y_gas:
+            return
+        x_gas, y_gas = self.corr_x_gas, self.corr_y_gas
+        fig = self.corr_pane.figure
+
+        corr_key = (x_gas, y_gas)
+        old_view = None
+        if preserve_view and self._corr_ax is not None and self._last_corr_key == corr_key:
+            old_view = (self._corr_ax.get_xlim(), self._corr_ax.get_ylim())
+
+        fig.clear()
+        ax = fig.add_subplot(111)
+        self._style_axes(ax)
+
+        x_cal = self._calibration_for(x_gas)
+        y_cal = self._calibration_for(y_gas)
+        failed = [(gas, res) for gas, res in ((x_gas, x_cal), (y_gas, y_cal))
+                  if not (res or {}).get("ok")]
+        if failed:
+            ax.text(0.5, 0.5,
+                    "\n\n".join(f"{gas}: {res.get('reason', 'no calibration')}"
+                                for gas, res in failed),
+                    transform=ax.transAxes, ha="center", va="center",
+                    color=MUTED_COLOR, fontsize=10, wrap=True)
+            ax.set_xticks([]); ax.set_yticks([])
+            self.corr_stats_label.setText("")
+            self._corr_ax = None
+            self._last_corr_key = corr_key
+            self.corr_pane.reset_nav()
+            self.corr_pane.canvas.draw()
+            return
+
+        # Both series are already "good air only" (each gas's own masking, cal
+        # periods and flush are blanked by calibrate_series), so the pairing is
+        # just the intersection of what survived on each axis.
+        x, y = x_cal["calibrated"], y_cal["calibrated"]
+        keep = x.notna() & y.notna()
+        x, y = x[keep], y[keep]
+        x_unit = GASES[x_gas]["ylabel"].split("(")[-1].rstrip(")")
+        y_unit = GASES[y_gas]["ylabel"].split("(")[-1].rstrip(")")
+
+        if self.corr_error_bars and len(x):
+            x_sigma, _ = self._uncertainty_for(x_gas)
+            y_sigma, _ = self._uncertainty_for(y_gas)
+            # Drawn under the markers and thin: at flight scale the bars
+            # overlap into a band, and a band that hides its own points would
+            # misrepresent the density the plot is mostly about.
+            ax.errorbar(x, y, xerr=x_sigma[keep], yerr=y_sigma[keep],
+                        fmt="none", ecolor=CAL_SHADE_COLOR, elinewidth=0.6,
+                        alpha=0.5, zorder=1)
+
+        # s is an area in points^2; the control is a diameter, which is what
+        # "marker size" means to anyone looking at the plot.
+        ax.scatter(x, y, s=self.corr_marker_size ** 2, color=LINE_COLOR,
+                   alpha=0.55, edgecolors="none", zorder=2)
+
+        fit = linear_fit(x, y)
+        if fit:
+            xs = [x.min(), x.max()]
+            ax.plot(xs, [fit["slope"] * v + fit["intercept"] for v in xs],
+                    color=CALIBRATED_COLOR, linewidth=1.4, zorder=3)
+
+        ax.set_xlabel(f"{x_gas} ({x_unit}), calibrated", color=TEXT_COLOR)
+        ax.set_ylabel(f"{y_gas} ({y_unit}), calibrated", color=TEXT_COLOR)
+        date_str = self.df["datetime"].iloc[0].strftime("%Y-%m-%d")
+        ax.set_title(f"UCATS-B {y_gas} vs {x_gas} (calibrated, {date_str})",
+                     color=TEXT_COLOR, loc="left")
+        ax.grid(True, color=GRID_COLOR, linewidth=0.8)
+
+        # Extrapolated spans are not excluded -- they are real data, and
+        # dropping them silently would be worse than saying how much of the
+        # plot rests on a held-flat calibration.
+        extrapolated = (x_cal["extrapolated"] | y_cal["extrapolated"])[keep]
+        notes = [f"n = {len(x)} of {len(self.df)} rows (good air in both tracers)"]
+        # The fit summary rides in this block rather than in a legend: a
+        # legend has to sit somewhere, and on a scatter that fills one corner
+        # it lands either on the data or on this text.
+        if fit:
+            notes.append(f"red line: OLS  {y_gas} = {fit['slope']:.4g}(±{fit['slope_err']:.2g})"
+                         f"·{x_gas} {fit['intercept']:+.4g}    r = {fit['r']:.4f}")
+        if len(x) and extrapolated.any():
+            notes.append(f"{extrapolated.mean():.0%} of points fall where at least one "
+                         f"calibration is extrapolated")
+        # Worth saying on this figure specifically: post-cal flush points run
+        # in a line from the tank's composition to the atmosphere's, which
+        # looks exactly like a tracer-tracer correlation and drags the fit.
+        no_flush = [gas for gas in (x_gas, y_gas)
+                    if not self._analysis_for(gas)["flag_air_s"]]
+        if no_flush:
+            notes.append(f"Flag Air is 0 s for {', '.join(dict.fromkeys(no_flush))} — "
+                         f"post-cal flush points are included")
+        if self.corr_error_bars:
+            notes.append("error bars: 1σ from the calibration only "
+                         "(assigned values + drift-model reproducibility)")
+        ax.text(0.01, 0.99, "\n".join(notes), transform=ax.transAxes,
+                ha="left", va="top", color=MUTED_COLOR, fontsize=9)
+
+        self._update_corr_stats(fit, x, y, x_gas, y_gas, x_unit, y_unit)
+
+        self.corr_pane.reset_nav()
+        if old_view is not None:
+            ax.set_xlim(old_view[0])
+            ax.set_ylim(old_view[1])
+        self._corr_ax = ax
+        self._last_corr_key = corr_key
+        self.corr_pane.canvas.draw()
+
+    @staticmethod
+    def _style_axes(ax):
+        """The muted spine/tick styling the other panels get inline."""
+        for spine in ax.spines.values():
+            spine.set_color(AXIS_COLOR)
+        ax.tick_params(colors=MUTED_COLOR)
+
+    def _update_corr_stats(self, fit, x, y, x_gas, y_gas, x_unit, y_unit):
+        """Numbers panel under the correlation controls. Outside the Figure,
+        for the same reason the box-stats readout is: it survives a redraw and
+        can be read while the plot is zoomed somewhere else."""
+        if not fit:
+            self.corr_stats_label.setText("Not enough overlapping points to fit.")
+            return
+        sigma_note = ""
+        if self.corr_error_bars:
+            x_sigma, _ = self._uncertainty_for(x_gas)
+            y_sigma, _ = self._uncertainty_for(y_gas)
+            sigma_note = (f"\nmedian 1σ  {x_gas} {x_sigma.median():.3g} {x_unit}"
+                          f"\n           {y_gas} {y_sigma.median():.3g} {y_unit}")
+        self.corr_stats_label.setText(
+            f"n      {fit['n']}\n"
+            f"slope  {fit['slope']:.5g} ± {fit['slope_err']:.3g}\n"
+            f"       {y_unit} per {x_unit}\n"
+            f"icept  {fit['intercept']:.6g} {y_unit}\n"
+            f"r      {fit['r']:.5f}\n"
+            f"{x_gas:6s} {x.mean():.4g} ± {x.std():.3g} {x_unit}\n"
+            f"{y_gas:6s} {y.mean():.4g} ± {y.std():.3g} {y_unit}"
+            + sigma_note
+        )
 
 
 def main():

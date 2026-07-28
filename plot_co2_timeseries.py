@@ -74,6 +74,45 @@ def merge_close_intervals(intervals, gap):
     return merged
 
 
+def cal_switch_mask(datetimes, cal_mask):
+    """Flag the switch-over sample at the end of each cal period: the first
+    row whose solenoid flag has gone False while the cell still holds cal gas.
+
+    `j_sol_cals`/`j_sol_aircal` describe the *valve*, but the reading carrying
+    a given timestamp is of gas that entered the cell a second or so earlier.
+    So the first ambient-flagged row after an injection is not air at all --
+    it is the tank, at full concentration (206.6 ppm CO2 against 206.51
+    assigned, on the Feb 2025 flight), and its detector pressure is back in
+    spec by then, so neither the cal mask nor the pressure mask removes it.
+    One row per cal event, 18 on that flight, every one of them a tank-composition
+    point sitting in the middle of the ambient record.
+
+    Nothing else catches it. `find_intervals` closes a run *at* this row's
+    timestamp, and `post_cal_flush_mask` starts strictly after that, so the row
+    falls in the gap between the two masks -- and the flush is 0 by default
+    anyway, while this row is wrong regardless of what the flush is set to.
+
+    Rows sharing that timestamp are flagged together: the file logs the same
+    second more than once, and half a switch-over is not a useful thing to
+    flag. A dropped sample mid-injection (flag False for one row inside a cal
+    period) is flagged by the same rule, which is also right -- it is cal gas
+    too.
+
+    This must be applied to `cal_mask` (what counts as *not air*), never to
+    the cal *intervals*: those set `Cal_p`, which every cal-mean window is
+    measured from, so extending them would silently move every cal mean.
+    """
+    cal_mask = cal_mask.astype(bool)
+    previous = cal_mask.shift(1, fill_value=False)
+    first_false = (~cal_mask) & previous
+    if not first_false.any():
+        return first_false
+    # Group adjacent rows that share a timestamp, then take whole groups: the
+    # switch-over may be logged as two rows with identical times.
+    groups = (~datetimes.eq(datetimes.shift(1))).cumsum()
+    return groups.isin(groups[first_false].unique()) & ~cal_mask
+
+
 def post_cal_flush_mask(datetimes, cal_intervals, flush_s, cal_mask=None):
     """Flag ambient rows within `flush_s` seconds after each cal period ends.
 
@@ -708,6 +747,129 @@ def calibrate_series(df, value_col, cal_points, cal_bottles, gas_key,
         "residuals": residuals, "loo_rms": loo_rms,
         "span_gain": span_gain, "warnings": warnings,
     }
+
+
+def linear_fit(x, y):
+    """Ordinary least squares of y on x, as {"n", "slope", "intercept",
+    "slope_err", "r"}, or None if there is nothing to fit.
+
+    Deliberately plain OLS, not a fit that uses the error bars: the
+    calibration uncertainties are almost entirely *systematic* (they shift a
+    whole flight together), so weighting by them would not do what weighting
+    is for -- and it would make the slope depend on whether a display toggle
+    happens to be on. Slope error is the usual residual-based standard error
+    and so describes the scatter about the line, nothing else.
+    """
+    x, y = pd.Series(x).astype(float), pd.Series(y).astype(float)
+    keep = x.notna() & y.notna()
+    x, y = x[keep], y[keep]
+    n = len(x)
+    if n < 3:
+        return None
+    dx, dy = x - x.mean(), y - y.mean()
+    sxx = float((dx * dx).sum())
+    syy = float((dy * dy).sum())
+    sxy = float((dx * dy).sum())
+    if sxx <= 0 or syy <= 0:
+        return None
+    slope = sxy / sxx
+    residual_ss = max(syy - slope * sxy, 0.0)
+    return {
+        "n": n,
+        "slope": slope,
+        "intercept": float(y.mean() - slope * x.mean()),
+        "slope_err": (residual_ss / (n - 2) / sxx) ** 0.5,
+        "r": sxy / (sxx * syy) ** 0.5,
+    }
+
+
+def calibration_uncertainty(result):
+    """1-sigma uncertainty on each calibrated value, propagated through the
+    calibration this `result` describes.
+
+    Returns (sigma, components): a Series on the same index as
+    `result["calibrated"]` (NaN wherever that is), and a dict of the scalar
+    inputs, for display.
+
+    Writing the two-point calibration as a weighted blend of the two assigned
+    values makes the propagation fall out. With
+    f = (c - A_lo) / (A_hi - A_lo)  -- where a point sits between the bottles --
+
+        c = (1-f) A_lo + f A_hi
+        var(c) = ((1-f) sA_lo)^2 + (f sA_hi)^2
+               + (slope (1-f) sR_lo)^2 + (slope f sR_hi)^2
+
+    f is recovered from the calibrated value itself rather than from the
+    interpolated responses, which keeps this a pure function of what
+    calibrate_series already returns. Note f is not clamped to [0, 1]:
+    ambient air usually sits outside the bracket the two tanks span, and the
+    uncertainty genuinely does grow as you extrapolate away from them.
+
+    The two input uncertainties per bottle:
+
+    - **sA**, the assigned value's uncertainty, straight from cals.yaml's
+      `<GAS>_unc`. Missing means the roster does not state one, and it is
+      treated as 0 -- an underestimate, but inventing a number would be worse.
+      This term is almost entirely *systematic*: it shifts a whole flight
+      together rather than scattering point to point.
+    - **sR**, how well the drift model reproduces that bottle's response,
+      as sqrt(loo^2 + closure^2). Both halves are needed and neither alone is
+      right. The leave-one-out RMS is the honest scatter under a model that
+      interpolates through every node (`linear`, where closure is 0 by
+      construction). The closure RMS is the error the model *itself*
+      introduces by not passing through the nodes -- 0 under `linear`, but
+      the dominant term under `constant`. So this is the answer to "does the
+      uncertainty depend on the calibration method": it does, through here.
+
+    What this does NOT include, deliberately: the single-sample noise of the
+    ambient measurement (nothing in the calibration constrains it -- it would
+    have to come from the raw trace's high-frequency scatter), and any
+    inflation over the extrapolated spans, which are flagged separately by
+    `result["extrapolated"]` rather than being folded into a number that would
+    then look like ordinary uncertainty.
+    """
+    calibrated = result["calibrated"]
+    if not result.get("ok"):
+        return pd.Series(float("nan"), index=calibrated.index), {}
+
+    bottles, slope = result["bottles"], result["slope"]
+
+    closure_rms = {}
+    for _, state, closure, _ in result.get("residuals", []):
+        closure_rms.setdefault(state, []).append(closure)
+    closure_rms = {state: (sum(c * c for c in v) / len(v)) ** 0.5
+                   for state, v in closure_rms.items() if v}
+
+    def response_sigma(state):
+        loo = result.get("loo_rms", {}).get(state, 0.0) or 0.0
+        closure = closure_rms.get(state, 0.0) or 0.0
+        return (loo * loo + closure * closure) ** 0.5
+
+    low, high = result["low_state"], result["high_state"]
+    components = {
+        "mode": result["mode"],
+        "assigned_unc": {s: bottles[s].get("assigned_unc") for s in {low, high}},
+        "response_sigma": {s: response_sigma(s) for s in {low, high}},
+    }
+
+    if result["mode"] == "offset":
+        # c = m + (A - R(t)): no gain term, so the two uncertainties simply
+        # add in quadrature and the result is the same for every row.
+        s_a = bottles[low].get("assigned_unc") or 0.0
+        s_r = response_sigma(low)
+        sigma = pd.Series((s_a * s_a + s_r * s_r) ** 0.5, index=calibrated.index)
+        return sigma.mask(calibrated.isna()), components
+
+    a_lo, a_hi = bottles[low]["assigned"], bottles[high]["assigned"]
+    s_a_lo = bottles[low].get("assigned_unc") or 0.0
+    s_a_hi = bottles[high].get("assigned_unc") or 0.0
+    s_r_lo, s_r_hi = response_sigma(low), response_sigma(high)
+
+    f = (calibrated - a_lo) / (a_hi - a_lo)
+    g = 1.0 - f
+    var = ((g * s_a_lo) ** 2 + (f * s_a_hi) ** 2
+           + (slope * g * s_r_lo) ** 2 + (slope * f * s_r_hi) ** 2)
+    return var.pow(0.5).mask(calibrated.isna()), components
 
 
 def export_calibrated_csv(path, df, result, value_col, gas_key,

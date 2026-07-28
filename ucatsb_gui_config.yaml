@@ -1,14 +1,14 @@
 CO2:
   warmup_min: 30
   pressure_tol_mbar: 0.1
-  flag_air_s: 45
+  flag_air_s: 50
   cal1_window_s:
   - -15
   - 0
   cal2_window_s:
   - -15
   - 0
-  drift_model: linear
+  drift_model: smooth
   drift_smooth_events: 3
 N2O:
   warmup_min: 30
@@ -20,7 +20,7 @@ N2O:
   cal2_window_s:
   - -15
   - 0
-  drift_model: linear
+  drift_model: smooth
   drift_smooth_events: 3
 CH4:
   warmup_min: 30
