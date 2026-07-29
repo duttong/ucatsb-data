@@ -238,8 +238,7 @@ Feb 2025 flight. But the same nearest-roster-tank heuristic misfires where the
 offset is real gain error (it names `DT0040700` on Jul 2026), so `span_gain`
 is reported beside it and the wording only ever asks the reader to check.
 `load_cal_roster` (all tanks) exists solely to feed this; bottle *matching*
-still uses `load_cal_bottles` (the two plumbed tanks) for the reason in the
-section below.
+still sees only the two plumbed tanks, for the reason in the section below.
 
 Gases with `has_masking=False` (Ozone) short-circuit to `ok=False` with a
 displayable `reason` before any pandas work, as do "no cal events survive the
@@ -257,11 +256,14 @@ e.g. `CO2: 418.947` / `CO2_unc: 0.021`), and a `cals: {cal0: ..., cal1: ...}`
 block naming which *two* of those serials are actually plumbed in for the
 current run. Bottle *matching* only ever sees two tanks, never the roster:
 `select_cal_bottles(roster, serials)` is the single implementation of that
-rule, and both entry points go through it — `load_cal_bottles` (cals.yaml's
-own `cals:` pair, via `load_cal_assignment`) and the GUI's per-flight
-selection. This is deliberate, not an oversight: an unrelated roster tank
-could otherwise coincidentally match a measured value more closely and
-produce a wrong identification.
+rule and the only way to build a `cal_bottles` dict. This is deliberate, not
+an oversight: an unrelated roster tank could otherwise coincidentally match a
+measured value more closely and produce a wrong identification.
+
+A `load_cal_bottles` helper (roster + `cals:` pair, composed) used to sit
+beside it as a second entry point. It was deleted with the CO2 CLI that was
+its only caller — the GUI reads the pairing per flight, so the `cals:` block
+is a *default* that nothing loads directly any more.
 
 `cals.yaml`'s `cals:` block is now only the **default** pairing. Because it
 describes the tanks plumbed in *now*, it is wrong for any older flight, so
@@ -913,8 +915,7 @@ pair — picking a tank outside the current `cals:` block is the entire point.
 - `self.cal_bottles` is **derived state**: `_rebuild_cal_bottles` recomputes
   it from `cal_selection` via `select_cal_bottles`, which is the one place
   implementing "matching may only see the plumbed tanks" (see the section on
-  `cals.yaml` above — `load_cal_bottles` now goes through it too). Never
-  assign `cal_bottles` directly.
+  `cals.yaml` above). Never assign `cal_bottles` directly.
 - `cal0`/`cal1` name a *set*, not a wiring. `match_cal_serial` identifies the
   tank in each window by measured concentration, so swapping the two combos
   changes nothing — said out loud in the tab's tooltip because the labels

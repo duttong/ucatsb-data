@@ -294,24 +294,13 @@ def select_cal_bottles(roster, serials):
     return {serial: roster[serial] for serial in dict.fromkeys(serials) if serial in roster}
 
 
-def load_cal_bottles(path: Path):
-    """Load the two plumbed cal bottles named in cals.yaml's `cals:` block,
-    with their nominal gas concentrations, as {serial: {...}} (or {}).
-
-    cals.yaml is a local copy of ~/code/ucats-b/cals.yaml -- resync it by hand
-    if the roster changes. This is the default pairing only; see
-    load_cal_assignment.
-    """
-    return select_cal_bottles(load_cal_roster(path), load_cal_assignment(path).values())
-
-
 def load_cal_roster(path: Path):
     """Load EVERY tank in cals.yaml's roster, not just the two named in the
     `cals:` block.
 
     This exists solely for the mismatch advisory (see cal_mismatch_notes) --
-    it must never feed bottle matching, which stays restricted to
-    load_cal_bottles for the reason documented there.
+    it must never feed bottle matching, which goes through select_cal_bottles
+    for the reason documented there.
     """
     data = _read_cals_yaml(path)
     return {k: v for k, v in data.items() if k != "cals" and isinstance(v, dict)}
