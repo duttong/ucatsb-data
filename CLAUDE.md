@@ -54,8 +54,9 @@ module so both stay in sync.
    `find_intervals` + `merge_close_intervals` turn that boolean mask into
    discrete cal-event windows, bridging events split by a single dropped
    sample (gap ≤ `CAL_MERGE_GAP_S`).
-3. Warm-up (first N minutes) and out-of-spec detector pressure
-   (`|d1_P_mbars - 140| > tol`) masks are computed and **applied to the raw
+3. Warm-up (first N minutes), out-of-spec detector pressure
+   (`|d1_P_mbars - 140| > tol`) and — when **Pumps on** is set —
+   pumps-off (`j_pumps != 1`) masks are computed and **applied to the raw
    data before cal means are estimated** (`exclude_mask` param on
    `cal_mean_points`) — not just drawn as bands. A cal point can disappear
    entirely if its averaging window has no unmasked data left. This was a
@@ -481,8 +482,18 @@ a gas is ever added.
 `yaml.safe_dump` write anchors (`&id001`/`*id001`) into the conf file, and
 makes an in-place edit of one gas's window silently change the others.
 
-New masking settings default to a **no-op value** (`flag_air_s: 0`) rather
-than a physically plausible one. `load_config` fills missing keys from
+`require_pumps` (the **Pumps on** toggle) joins `exclude_mask`, so like the
+warm-up and pressure masks it drops cal points as well as blanking the output
+— pumps-off data is not ambient air at all. Three properties worth keeping:
+a missing `j_pumps` value counts as pumps-off (an unknown pump state is not
+evidence the pumps were running); a file whose schema lacks the column
+disables the control outright, in `load_csv`, and Qt restores that child's own
+enabled state when `mask_box` is re-enabled; and it **must** default off,
+because a lab/bench run is pumps-off end to end (the 2026-07-26 file is 100%)
+and enabling it there excludes every row and every cal point.
+
+New masking settings default to a **no-op value** (`flag_air_s: 0`,
+`require_pumps: False`) rather than a physically plausible one. `load_config` fills missing keys from
 `DEFAULT_GAS_SETTINGS`, so a non-zero default would silently change the
 output of every already-saved config on first launch after the upgrade.
 

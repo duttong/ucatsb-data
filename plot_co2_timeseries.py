@@ -15,6 +15,7 @@ RIGHT_AXIS_COLOR = "#8e44ad"   # purple, distinct from the red/orange masking sh
 CAL_SHADE_COLOR = "#898781"
 PRESSURE_EXCLUDE_COLOR = "#d03b3b"
 WARMUP_EXCLUDE_COLOR = "#ffa64d"   # light orange
+PUMPS_EXCLUDE_COLOR = "#8e7cc3"    # violet, distinct from the other bands
 POST_CAL_FLUSH_COLOR = "#2fa88a"   # teal, distinct from the warm-up/pressure shades
 CAL0_COLOR = "#eda100"   # golden
 CAL1_COLOR = "#0d366b"   # dark blue

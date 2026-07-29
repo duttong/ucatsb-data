@@ -53,6 +53,7 @@ RIGHT_AXIS_COLOR = "#8e44ad"   # purple, distinct from the red/orange masking sh
 CAL_SHADE_COLOR = "#898781"
 PRESSURE_EXCLUDE_COLOR = "#d03b3b"
 WARMUP_EXCLUDE_COLOR = "#ffa64d"   # light orange
+PUMPS_EXCLUDE_COLOR = "#8e7cc3"    # violet, distinct from the other bands
 STATS_BOX_COLOR = "#111111"
 CAL0_COLOR = "#eda100"   # golden
 CAL1_COLOR = "#0d366b"   # dark blue
@@ -86,7 +87,7 @@ GASES = {
 
 REQUIRED_COLUMNS = [
     "datetime", "d1_P_mbars", "d2_P_mbars", "d1_T_gas", "d2_T_gas",
-    "j_sol_cals", "j_sol_aircal",
+    "j_sol_cals", "j_sol_aircal", "j_pumps",
 ] + [g["value_col"] for g in GASES.values()]
 
 # Columns already exposed via a specific named control (gas traces, the
@@ -151,6 +152,7 @@ CORR_COLORMAP = "turbo"
 
 DEFAULT_GAS_SETTINGS = {
     "warmup_min": 30,
+    "require_pumps": False,
     "pressure_tol_mbar": 10.0,
     "flag_air_s": 0,
     "cal1_window_s": [-15, -1],
@@ -601,6 +603,13 @@ class UcatsbGui(QMainWindow):
         self.setWindowTitle(f"UCATS-B Viewer - {csv_path.name}")
         self.file_label.setText(csv_path.name)
         self.file_label.setToolTip(str(csv_path))
+        # A flight whose schema predates j_pumps can't offer the filter. The
+        # explicit disable survives mask_box's setEnabled(has_masking), since
+        # Qt restores a child's own enabled state when its parent comes back.
+        self.pumps_check.setEnabled("j_pumps" in df.columns)
+        if "j_pumps" not in df.columns:
+            self.pumps_check.setChecked(False)
+
         self.corr_file_label.setText(csv_path.name)
         self.corr_file_label.setToolTip(str(csv_path))
         self._populate_corr_combos()
@@ -1111,7 +1120,31 @@ class UcatsbGui(QMainWindow):
             "export; the raw trace keeps them. 0 disables it."
         )
         self.flag_air_spin.valueChanged.connect(self.on_control_changed)
-        mask_form.addRow("Flag Air\n(after cal):", self.flag_air_spin)
+
+        # Pumps toggle and Flag Air share one spanning row, the toggle to the
+        # left of the spin box. Spanning rather than a two-column form row for
+        # the reason the drift-model row is: a stretching field squeezes the
+        # label column to nothing in a 300 px panel.
+        air_row = QHBoxLayout()
+        air_row.setSpacing(6)
+        self.pumps_check = QCheckBox("Pumps on")
+        self.pumps_check.setToolTip(
+            "Keep only data recorded with the sample pumps running\n"
+            "(j_pumps = 1). Air measured with the pumps off is not\n"
+            "ambient air.\n\n"
+            "Off by default, and it has to be: a lab test or bench\n"
+            "calibration runs with the pumps off from end to end (the\n"
+            "2026-07-26 file is 100% pumps-off), and enabling this there\n"
+            "would leave nothing at all. Turn it on for a real flight.\n\n"
+            "Rows with no j_pumps value count as pumps-off -- an unknown\n"
+            "pump state is not evidence the pumps were running."
+        )
+        self.pumps_check.toggled.connect(self.on_control_changed)
+        air_row.addWidget(self.pumps_check)
+        air_row.addStretch(1)
+        air_row.addWidget(QLabel("Flag Air:"))
+        air_row.addWidget(self.flag_air_spin)
+        mask_form.addRow(air_row)
 
         # Warm-up, detector pressure and the cal timing are properties of the
         # instrument on this flight rather than of the species, so the same
@@ -1440,6 +1473,7 @@ class UcatsbGui(QMainWindow):
         triggering on_control_changed (and re-saving/redrawing) per field."""
         self._loading = True
         self.warmup_spin.setValue(settings["warmup_min"])
+        self.pumps_check.setChecked(bool(settings.get("require_pumps", False)))
         self.pressure_tol_spin.setValue(settings["pressure_tol_mbar"])
         self.flag_air_spin.setValue(settings["flag_air_s"])
         self.cal1_start_spin.setValue(settings["cal1_window_s"][0])
@@ -1459,6 +1493,7 @@ class UcatsbGui(QMainWindow):
         from the config on the next control change."""
         return {
             "warmup_min": self.warmup_spin.value(),
+            "require_pumps": self.pumps_check.isChecked(),
             "pressure_tol_mbar": self.pressure_tol_spin.value(),
             "flag_air_s": self.flag_air_spin.value(),
             "cal1_window_s": [self.cal1_start_spin.value(), self.cal1_end_spin.value()],
@@ -1618,8 +1653,8 @@ class UcatsbGui(QMainWindow):
     # The drift model and its smoothing window are the only per-gas settings
     # left out -- they are a judgement about that gas's cal record (how noisy
     # its injections are), not a description of the flight.
-    COPIED_SETTING_KEYS = ("warmup_min", "pressure_tol_mbar", "flag_air_s",
-                           "cal1_window_s", "cal2_window_s")
+    COPIED_SETTING_KEYS = ("warmup_min", "require_pumps", "pressure_tol_mbar",
+                           "flag_air_s", "cal1_window_s", "cal2_window_s")
     COPY_SETTINGS_LABEL = "Copy settings to all gases"
 
     def on_copy_masking_to_all(self):
@@ -1980,6 +2015,14 @@ class UcatsbGui(QMainWindow):
         warmup_end = df["datetime"].iloc[0] + pd.Timedelta(minutes=warmup_minutes)
         warmup = df["datetime"] < warmup_end
 
+        # Pumps off: not ambient air at all, so this joins exclude_mask -- it
+        # drops cal points as well as blanking the output, exactly like the
+        # warm-up and pressure masks. A missing j_pumps reading counts as off:
+        # an unknown pump state is not evidence the pumps were running.
+        require_pumps = bool(settings.get("require_pumps", False)) and "j_pumps" in df.columns
+        pumps_off = (df["j_pumps"].fillna(0) != 1 if require_pumps
+                     else pd.Series(False, index=df.index))
+
         cal_intervals, cal_points = [], []
         post_cal_flush = pd.Series(False, index=df.index)
         if has_masking:
@@ -2001,13 +2044,14 @@ class UcatsbGui(QMainWindow):
                 tuple(settings["cal1_window_s"]),
                 tuple(settings["cal2_window_s"]),
                 cal_bottles=self.cal_bottles, gas_key=gas_key,
-                exclude_mask=bad_pressure | warmup,
+                exclude_mask=bad_pressure | warmup | pumps_off,
             )
 
         self._analysis[gas_key] = {
             "cal": cal, "cal_switch": cal_switch, "not_air": not_air,
             "warmup": warmup, "bad_pressure": bad_pressure,
-            "exclude_mask": bad_pressure | warmup,
+            "pumps_off": pumps_off, "require_pumps": require_pumps,
+            "exclude_mask": bad_pressure | warmup | pumps_off,
             "cal_intervals": cal_intervals, "cal_points": cal_points,
             "post_cal_flush": post_cal_flush,
             "has_masking": has_masking,
@@ -2080,6 +2124,8 @@ class UcatsbGui(QMainWindow):
             shade_intervals(ax, df["datetime"], not_air, CAL_SHADE_COLOR, alpha=0.3)
             shade_intervals(ax, df["datetime"], warmup, WARMUP_EXCLUDE_COLOR, alpha=0.15)
             shade_intervals(ax, df["datetime"], bad_pressure, PRESSURE_EXCLUDE_COLOR, alpha=0.15)
+            shade_intervals(ax, df["datetime"], analysis["pumps_off"],
+                            PUMPS_EXCLUDE_COLOR, alpha=0.16)
             # Shaded whether or not the calibrated trace is showing: the band
             # is how you find out these rows exist before turning it on.
             shade_intervals(ax, df["datetime"], post_cal_flush, POST_CAL_FLUSH_COLOR, alpha=0.22)
@@ -2212,6 +2258,11 @@ class UcatsbGui(QMainWindow):
                 notes.append(
                     f"light red = excluded (d1_P_mbars outside {D1_P_TARGET_MBARS:.0f}±{pressure_tol:.2f} mbar)"
                 )
+            if analysis["pumps_off"].any():
+                notes.append(
+                    f"violet = excluded ({int(analysis['pumps_off'].sum())} rows with the "
+                    f"pumps off, j_pumps ≠ 1)"
+                )
             if post_cal_flush.any():
                 notes.append(
                     f"teal = air dropped from calibrated only "
@@ -2279,6 +2330,8 @@ class UcatsbGui(QMainWindow):
             ax_aux.set_facecolor("#fcfcfb")
             shade_intervals(ax_aux, df["datetime"], warmup, WARMUP_EXCLUDE_COLOR, alpha=0.15)
             shade_intervals(ax_aux, df["datetime"], bad_pressure, PRESSURE_EXCLUDE_COLOR, alpha=0.15)
+            shade_intervals(ax_aux, df["datetime"], analysis["pumps_off"],
+                            PUMPS_EXCLUDE_COLOR, alpha=0.16)
 
             aux_unit = aux_ylabel.split("(")[-1].rstrip(")") if "(" in aux_ylabel else ""
             self._register_stats_trace("aux:left", f"{aux_col} (above, left)",
