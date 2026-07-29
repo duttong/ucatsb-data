@@ -38,9 +38,11 @@ one fixed CO2 figure. `ucatsb_gui.py` imports from it rather than
 duplicating: `drop_presync_rows`, `find_intervals`, `merge_close_intervals`,
 `shade_intervals`, `cal_mean_points`, `load_cal_roster`,
 `load_cal_assignment`, `select_cal_bottles`, `most_common_serial`,
-`mean_std_label`, `CALS_YAML_PATH`, plus the calibration functions below. Any
-change to masking/cal-detection/calibration behavior belongs in that shared
-module so both stay in sync.
+`mean_std_label`, `CALS_YAML_PATH`, plus the calibration functions below and
+the two export writers (`export_companion_csv`, `export_icartt`, with
+`icartt_time_base`/`icartt_filename`/`DEFAULT_ICARTT_META`). Any change to
+masking/cal-detection/calibration behavior belongs in that shared module so
+both stay in sync.
 
 ### Data pipeline (per redraw)
 
@@ -119,7 +121,7 @@ record.** Three masks are blanked from it as the very last step — `cal_mask`
 (rows inside a cal period, plus the switch-over sample: the GUI passes
 `not_air`), `flush_mask`, and `exclude_mask` (warm-up +
 out-of-spec detector pressure) — so the calibrated trace and the exported
-`<col>_cal` column contain good air and nothing else. Nothing is lost by
+`<gas>_cal` column contain good air and nothing else. Nothing is lost by
 this: `cal_slope`/`cal_intercept` are still emitted on every row, so the
 calibrated value of a blanked row can be recomputed by anyone who wants it
 (to check closure, say), and the raw column is untouched. The result exposes
@@ -425,9 +427,12 @@ file is exactly as it was. So:
   name first — applying one silently and asking via `_choose_config_file`
   when there are several, with a "start from defaults" option.
 - **There is no template.** `load_config(None)` gives `DEFAULT_GAS_SETTINGS`,
-  and `ucatsb_gui_config.yaml` now holds *only* `recent_files`. Seeding one
-  flight's settings from another silently is what per-dataset configs exist to
-  prevent, and the same argument already applied to the tank pairing.
+  and `ucatsb_gui_config.yaml` holds no analysis settings at all — only
+  `recent_files` and `icartt` (see the Export tab). Seeding one flight's
+  settings from another silently is what per-dataset configs exist to prevent,
+  and the same argument already applied to the tank pairing. The ICARTT
+  metadata is the deliberate exception, and is not a *setting*: it describes
+  the campaign, not the analysis.
 - `config_path` is the name Save offers; `config_loaded_from` is the file
   actually opened, or None when the dataset started from defaults. They differ
   exactly in that case, which is what the Cal Tanks readout reports.
@@ -445,11 +450,13 @@ only refreshes the button, and `_confirm_discard()` prompts (Save / Discard /
 Cancel) from `closeEvent`, `on_load_data_clicked` and `_open_recent_now`.
 
 **`save_config` writes a *fresh* document, so an omitted argument is a
-deletion.** `cals:` goes only to a dataset config; `recent_files:` only to the
-app-level file (`_save_app_config`, which passes `{}` for the gas blocks
-because that file no longer carries any). An app-level write that forgets
-`recent_files=` wipes the list — the same trap `_controls_to_settings()` has
-for per-gas keys.
+deletion.** `cals:` goes only to a dataset config; `recent_files:` and
+`icartt:` only to the app-level file (`_save_app_config`, which passes `{}`
+for the gas blocks because that file no longer carries any). That file now has
+**two** blocks, and `_save_app_config` passes both every time: a write that
+forgets `recent_files=` wipes the list, and one that forgets `icartt_meta=`
+wipes the metadata — the same trap `_controls_to_settings()` has for per-gas
+keys.
 
 `_initializing`/`_loading` flags exist specifically to suppress redraw/save
 during programmatic widget setup (e.g. `setChecked` on a freshly-constructed
@@ -662,6 +669,187 @@ Anything iterating gases must not assume a cal-bottle gas: check
   the axes, which would make masking it pointless on the figure that most
   needed the help. The raw trace still runs off-scale, and the note says how
   many readings that is.
+
+### Export tab: two products from one set of "gas blocks"
+
+Its own tab, like Cal Tanks and for the same reason: both files are
+whole-flight deliverables covering **every** gas, while every control in the
+left panel is per gas. The old per-gas "Export calibrated CSV…" button in the
+Calibration group box is gone, and `export_calibrated_csv` with it — a per-gas
+button was quietly the reason the old export could only ever describe one gas.
+
+`_export_gas_blocks()` builds one dict per available gas and both writers
+consume it, so the two files can never disagree about what a gas's calibrated
+record is. Each block carries `raw`, `final` + `final_kind`
+(`"calibrated"`, or `"filtered"` for a floor-only gas), optional
+`sigma`/`slope`/`intercept`, a `masks` dict, and `reason` when a gas that
+should have a calibration lacks one. Each gas is analysed through
+`_analysis_for`/`_calibration_for` with **its own** saved settings, exactly as
+the Correlations tab does, so a gas nobody selected this session still exports
+correctly.
+
+**Every Series in a block is on the RAW file's row numbering**, via
+`_to_raw_rows`. `drop_presync_rows` both trims leading rows *and*
+`reset_index(drop=True)`, so `self.df` row 0 is raw row `presync_dropped`;
+an unshifted Series would line every gas up a few dozen rows early, silently
+and plausibly. `self.raw_df` (datetime + the gas value columns only, kept at
+load) is what those rows are put back onto.
+
+- **The companion CSV is exactly as long as the raw file**, pre-sync rows
+  included — blank in the derived columns and flagged in a `presync` column.
+  That row-for-row promise is the whole feature: the two files are meant to be
+  opened side by side, or pasted together, in Excel or Igor with no alignment
+  step, and a quiet offset between two files that *look* alignable is a very
+  effective way to corrupt an analysis.
+- **The raw echo columns come from `self.raw_df`, not from `self.df`.** A
+  pre-sync row has an unreliable *clock*, not an unreliable *reading*, so
+  blanking its measurement would make a column that claims to echo the source
+  disagree with it. The derived columns are blank there; the echo is not.
+- **Masks are written as `Int64` 1/0, not bool.** pandas writes `True`/`False`,
+  which Igor loads as a text wave and Excel as text. The nullable dtype leaves
+  the pre-sync rows genuinely empty rather than claiming `0` for rows where
+  the mask was never evaluated.
+- **`comment_header` defaults False**, unlike the old exporter: neither Excel
+  nor Igor skips a leading `#` block without being told to. With it off the
+  provenance goes to a sidecar `<stem>_notes.txt`, so it is never simply lost.
+- **A gas with no calibration still exports.** The CSV keeps its raw column
+  and its masks (the answer to "which rows are air" does not need a
+  calibration), and the notes give the reason. The ICARTT file drops the
+  variable entirely rather than shipping uncalibrated counts under a
+  calibrated-looking name.
+
+#### ICARTT specifics (format index 1001)
+
+The delivered record is the good ambient one: every row `calibrate_series`
+blanked is written as `-99999`, which is exactly what that flag means, so no
+mask columns are written or needed.
+
+- **`icartt_time_base(datetimes, skip_leading)` — `skip_leading` is not
+  optional in practice; pass `presync_dropped`.** Those rows carry the stale
+  pre-sync clock, which runs *ahead* of the true time, so left in they set the
+  running maximum hours into the future and every genuine row after the
+  backward jump then fails the strictly-increasing test. On the Feb 2025 file
+  that is 5013 rows rejected instead of 1435. `_export_time_base()` wraps it
+  so no call site can forget; `export_icartt` takes the same argument.
+- **ICARTT's independent variable must increase strictly, and this record does
+  not.** The datetime column has duplicate timestamps (1435 in the Feb 2025
+  file — the same duplication `interp_hold` works around), and a duplicate
+  makes the file *invalid*, not merely untidy. Those rows are dropped and the
+  count is reported in the success dialog and in a special comment, rather
+  than being discovered later by an archive's validator.
+- **`_one_line` vs `_field`.** Header lines 2–5 and the keyword values are
+  free text where commas are legal and expected — `Dutton, Geoff` is the form
+  the standard asks the PI name to take — so they only get newlines collapsed.
+  Only the `name, unit, description` variable-definition lines sit in a
+  comma-delimited position, and only those get commas replaced.
+- **Line 1's count includes itself and the column-header line**, and the
+  column-header line is the *last normal comment*, inside that section's
+  count. Off-by-one here is the most common validator failure.
+- **The data interval is declared as `0` (non-uniform) unless the diffs really
+  are all equal** — a nominal 1 Hz the file does not keep to would be a claim
+  about the data, not a description of it.
+- **`UNCERTAINTY` is derived, not typed.** The median 1σ per gas comes from
+  `calibration_uncertainty`; the metadata box is appended after it. It is the
+  one required keyword this program already knows the answer to, and a
+  hand-typed value goes stale the moment a drift model or cal window changes.
+- `ULOD_FLAG`/`LLOD_FLAG` (-7777/-8888) are constants of the format and are
+  hardcoded; only the LOD *values* are metadata (default `N/A`).
+
+**The writer matches the sister UCATS instrument's delivered files**
+(`~/Downloads/SABRE-UCATS-GC_WB57_20230303_R0.ict` was the reference), not
+generic ICARTT practice, wherever the two differ — anyone processing a
+campaign meets one convention across both instruments:
+
+- **`ICARTT_MISSING = -99999`, not the more common `-9999`.** It is not fixed
+  by the standard — it is declared per variable on header line 12 and readers
+  honour what is declared — so matching the house style costs nothing.
+- **Variable lines carry four fields**, `name, unit, standard_name,
+  description`. `standard_name` comes from `GASES[gas]["standard_name"]`
+  (`Gas_CO2_InSitu_S_DMF`). A gas without one gets the field **empty, not
+  missing**: dropping it would shift the description into field 2 and make
+  position mean different things on different lines. Every gas now has one, so
+  nothing exercises that path — keep it anyway, since a new gas arrives without
+  a name until someone looks it up.
+
+  The names are not free text: they come from the **NASA ESDS Atmospheric
+  Composition Variable Standard Names Convention** (ACVSNC), which ICARTT V2.0
+  requires, as
+  `MeasurementCategory_CoreName_AcquisitionMethod_DescriptiveAttributes`. For
+  the `Gas` category the attributes are MeasurementSpecificity (`S` = single
+  species, `M` = multiple, `NA`) then Reporting (`DMF` = molar fraction wrt dry
+  air, `AMF` = wrt ambient, `DVMR`/`AVMR` the volumetric mixing ratios on those
+  two bases, `None` = not stated).
+  Two of the five gases are not `Gas_..._DMF`, both deliberately
+  (2026-07-29, on the PI's instruction):
+
+  - **H2O is `Met_H2OMF_InSitu_None`** — water vapour is not in the `Gas`
+    category at all. It belongs to `Met`, whose format is
+    `Met_CoreName_AcquisitionMethod_None` with no descriptive attributes.
+    `H2OMF` is "mole fraction of water vapor with respect to ambient air";
+    `H2OMRV` (volumetric mixing ratio) and `H2OMR` (mass mixing ratio to dry
+    air) are the alternatives if the sensor is ever stated differently. This
+    replaces an earlier deliberate blank.
+  - **Ozone is `Gas_O3_InSitu_S_AVMR`**, not `..._DMF`: a volumetric mixing
+    ratio against *ambient* air, water vapour included, because nothing dries
+    the 2B monitor's sample stream. Settled with Eric on 2026-07-29 after the
+    entry had been `DMF` and then briefly `None`; unlike the other gases it
+    could not be copied from the sister GC file, which has no ozone variable.
+- **Units gain the trailing `v`** (`ppmv`/`ppbv`) via `ICARTT_UNITS`, for the
+  ICARTT header only. Plot labels keep `ppm`/`ppb`.
+- **The 1σ variable is `<species>e_<suffix>`** (`CO2e_UCATSB`), not
+  `_unc`, and reuses its parent's standard name exactly as those files do —
+  which the ACVSNC also requires: "when uncertainty is reported as a separate
+  variable, the uncertainty variable should share the same standard name as
+  the corresponding measurement variable."
+- **Header line 9 has three fields** — `Time_Start, seconds, <description>` —
+  not two with the description crammed into the unit.
+- **Nothing about the analysis is written to the file.** The special-comments
+  section carries the author's text and nothing else. It used to also append
+  the source file name, every gas's masking/drift settings and the counts of
+  rows dropped for the format's sake; that was removed on request
+  (2026-07-29) as internal to the experimenters — the settings especially are
+  a working record of how the analysis was tuned, not something a data user
+  should be reading in a delivered file. `export_icartt` therefore takes
+  neither `source_path` nor a settings note. The omission counts still reach
+  the user through the returned summary dict and the post-export dialog,
+  which is now their only route.
+- **`_verbatim_lines` vs `_one_line`.** `special_comments` and
+  `revision_history` are whole *sections*, written through with their line
+  breaks (and the blank line inside the special comments) intact; the section
+  line count is taken from the resulting list so the two cannot disagree.
+  Every other field is a keyword *value* occupying exactly one line.
+- **The revision history accumulates.** The delivered R0 file lists both
+  `RA: Preliminary data` and `R0: Revised data`. It is a block the user
+  maintains, not a note about the current revision, so it is free text; only
+  when empty does the current revision get a placeholder line.
+- **`icartt_filename` keeps hyphens and strips underscores.** `_` separates
+  the file name's own fields, while a hyphenated data ID is normal
+  (`SABRE-UCATS-GC_WB57_...`); the first version stripped all non-alphanumerics
+  and silently mangled it to `SABREUCATSGC`.
+
+#### ICARTT metadata lives in the APP-level config
+
+`icartt:` in `ucatsb_gui_config.yaml`, not in a `<dataset>_conf.yaml`
+(explicitly requested): PI, affiliation, project and stipulations are
+properties of the campaign, so per-flight storage would mean retyping them for
+every file. Its own **Save defaults** button on the tab, its own
+`_saved_icartt_meta` snapshot, and its own `_confirm_discard_icartt` on close
+— kept separate from `_is_dirty()`/`_confirm_discard` because the two Save
+buttons write *different files*, and one prompt offering to "save" would have
+to pick one and silently not write the other. Dirty state is a comparison, not
+a flag, for the same reason as `_is_dirty()`.
+
+`_save_app_config` must pass **both** `recent_files=` and `icartt_meta=` every
+time: `save_config` writes a fresh document, so a recent-file update that
+forgets the metadata deletes it, and vice versa. Adding a metadata field means
+adding it to `DEFAULT_ICARTT_META` *and* `ICARTT_FIELDS` — `_icartt_meta_from_controls`
+rebuilds the dict wholesale from the widgets, the same trap
+`_controls_to_settings()` has.
+
+The Export tab joins the `_dirty`/`_preserve` dispatch in `_draw_current_tab`
+even though it draws no figure: it reads every gas's analysis to build its
+readiness summary, and going through the dispatch stops a spin-box nudge from
+recomputing five gases while the tab merely happens to be open.
 
 ### Cal Tanks tab
 

@@ -901,92 +901,537 @@ def calibration_uncertainty(result):
     return var.pow(0.5).mask(calibrated.isna()), components
 
 
-def export_calibrated_csv(path, df, result, value_col, gas_key,
-                          source_path=None, settings=None, analysis=None):
-    """Write the calibrated series with its provenance and per-row flags.
+# --------------------------------------------------------------------------
+# Exports
+#
+# Two products, from the same per-gas "blocks" (see export_companion_csv for
+# the structure), because they answer different questions:
+#
+#   * the companion CSV is for working with the flight -- every row of the raw
+#     file, every mask, both the raw and the derived value, aimed at Excel and
+#     Igor Pro;
+#   * the ICARTT file is for delivering it -- the archive format, good ambient
+#     data only, everything else expressed as the format's missing value.
+#
+# Both live here rather than in the GUI so the CLI and any future batch script
+# can produce byte-identical files, the same argument that put the masking and
+# calibration here.
+# --------------------------------------------------------------------------
 
-    Every row is written, flagged, rather than pre-filtering to ambient: the
-    consumer can filter, but silently dropping rows from a calibration
-    product would hide what was excluded and why. The leading `#` comment
-    block records what produced the numbers -- read it back with
+# -7777 (above the upper limit of detection) and -8888 (below the lower) are
+# fixed by the ICARTT standard. Nothing in this pipeline emits them -- no
+# detection limit is established for these instruments -- but the header must
+# declare them, so they are named here rather than being literals in the
+# writer.
+#
+# The missing-data value is NOT fixed by the standard; it is declared per
+# variable on header line 12, and a reader honours whatever is declared. -99999
+# rather than the more common -9999 to match the sister UCATS instrument's
+# delivered files (SABRE-UCATS-GC_WB57_20230303_R0.ict), so that anyone
+# processing both instruments' files for a campaign meets one convention.
+ICARTT_MISSING = -99999
+ICARTT_ULOD_FLAG = -7777
+ICARTT_LLOD_FLAG = -8888
+
+# Mixing-ratio units are written with the trailing "v" in the delivered UCATS
+# files (ppmv/ppbv/pptv). The plot labels keep the shorter form, so the
+# translation happens on the way into the ICARTT header only.
+ICARTT_UNITS = {"ppm": "ppmv", "ppb": "ppbv", "ppt": "pptv"}
+
+# File Format Index 1001: ASCII, one independent variable (time), no bounded
+# or auxiliary variables. What airborne 1 Hz in-situ data is archived as.
+ICARTT_FFI = 1001
+
+# Everything the ICARTT header carries that cannot be derived from the data.
+# Blank rather than plausibly pre-filled: a wrong-but-reasonable PI name or
+# mission would travel into an archived file unnoticed, whereas a blank one
+# is visible to whoever reads the file. The two exceptions describe this
+# repo's instrument rather than any flight, so they can be stated safely.
+DEFAULT_ICARTT_META = {
+    "data_id": "UCATSB",
+    "location_id": "",
+    "pi_name": "",
+    "pi_affiliation": "",
+    "data_source": "UCATS-B airborne in-situ trace gas measurements",
+    "mission": "",
+    "pi_contact_info": "",
+    "platform": "",
+    "location": "",
+    "associated_data": "N/A",
+    "instrument_info": "",
+    "data_info": "",
+    "uncertainty": "",
+    "ulod_value": "N/A",
+    "llod_value": "N/A",
+    "dm_contact_info": "",
+    "project_info": "",
+    "stipulations_on_use": "",
+    "other_comments": "",
+    "revision": "R0",
+    # Two fields written VERBATIM, line breaks and all (see _verbatim_lines).
+    # `revision_history` is one `R#: description` per line and **accumulates**
+    # across revisions -- the delivered R0 file carries both `RA: Preliminary
+    # data` and `R0: Revised data`, so this is a block the user maintains, not
+    # a note about the current revision alone.
+    "revision_history": "",
+    # The special-comments section, in full: free text, and in the delivered
+    # files it is where the error-estimate explanation and the "contact the
+    # PIs" request live. Blank lines inside it are meaningful and preserved.
+    # Nothing is appended to it -- see export_icartt.
+    "special_comments": "",
+    "var_suffix": "UCATSB",
+}
+
+# Order matters: the ICARTT standard requires these keywords, one per line, in
+# this sequence, at the head of the normal comments. (label, meta key) -- the
+# LOD flag lines are constants and are inserted by the writer.
+ICARTT_KEYWORDS = (
+    ("PI_CONTACT_INFO", "pi_contact_info"),
+    ("PLATFORM", "platform"),
+    ("LOCATION", "location"),
+    ("ASSOCIATED_DATA", "associated_data"),
+    ("INSTRUMENT_INFO", "instrument_info"),
+    ("DATA_INFO", "data_info"),
+    ("UNCERTAINTY", "uncertainty"),
+)
+
+
+def _one_line(text):
+    """Collapse to a single line.
+
+    The format is line-oriented and the header declares its own line count,
+    so a newline pasted into a metadata box would invalidate the file. Every
+    user-typed value goes through here on the way out. Commas are left alone:
+    the header lines and the keyword values are free text, and "Dutton,
+    Geoff" is precisely the form the standard asks the PI name to take.
+    """
+    if text is None:
+        return ""
+    return " ".join(str(text).split())
+
+
+def _field(text):
+    """One line, and no commas either -- for the one place a value sits in a
+    comma-delimited position: the `name, unit, standard_name, description`
+    variable definition lines. A comma in a description there would read as an
+    extra field to anything splitting the line."""
+    return _one_line(text).replace(",", ";")
+
+
+def _verbatim_lines(text):
+    """Split free-form multi-line metadata into the lines it will occupy.
+
+    For the two blocks the delivered files maintain by hand -- the special
+    comments and the revision history -- where the line breaks (and the blank
+    line inside the special comments) are the author's, not noise to be
+    collapsed. Only trailing whitespace goes; the section's declared line
+    count is taken from the length of this list, so the two cannot disagree.
+    """
+    if not text or not str(text).strip():
+        return []
+    return [line.rstrip() for line in str(text).replace("\r\n", "\n").split("\n")]
+
+
+def icartt_time_base(datetimes, skip_leading=0):
+    """(start date, seconds-from-midnight Series, usable-row mask).
+
+    Seconds are counted from midnight UTC on the date of the first usable
+    sample and keep counting past 86400 for a flight that crosses midnight,
+    which is what the format asks for -- wrapping would make time run
+    backwards.
+
+    The mask is the rows ICARTT can actually represent: its independent
+    variable must increase strictly, and this record does not. The datetime
+    column contains duplicate timestamps (1435 of them in the Feb 2025 file,
+    the same duplication interp_hold has to work around), and a duplicate or
+    backward step makes the file invalid rather than merely untidy -- so the
+    offending rows are identified here and reported to the user by the
+    writer, instead of being discovered by an archive's validator later.
+
+    **`skip_leading` is not optional in practice: pass the number of rows
+    drop_presync_rows removed.** Those rows carry the stale pre-sync clock
+    readings, which run *ahead* of the true time; left in, they set the
+    running maximum hours into the future and every genuine row after the
+    backward jump then fails the strictly-increasing test. On the Feb 2025
+    file that is the difference between 1435 rows rejected and 5013.
+    """
+    times = pd.to_datetime(pd.Series(list(datetimes))).reset_index(drop=True)
+    valid = times.notna()
+    if skip_leading:
+        valid.iloc[:skip_leading] = False
+    if not valid.any():
+        return None, pd.Series(dtype=float), pd.Series(dtype=bool)
+    midnight = times[valid].iloc[0].normalize()
+    # NaN on the skipped rows rather than a number: their clock was wrong, so
+    # a seconds-from-midnight value for them would be a plausible-looking lie.
+    seconds = (times - midnight).dt.total_seconds().where(valid)
+    # cummax over the valid values gives the largest second count seen so far;
+    # shifted, that is the value the current row has to beat. Invalid rows
+    # drop out and leave the running maximum where it was.
+    prev_max = seconds.cummax().shift().fillna(float("-inf"))
+    keep = valid & (seconds > prev_max)
+    return midnight.date(), seconds, keep
+
+
+# `<gas>_cal` for a calibrated gas, `<gas>_filtered` for one that only has its
+# physical floor applied. The two are not the same claim and must not share a
+# column name -- a reader who sorts on "_cal" must not pick up a gas that was
+# never calibrated. Keyed off final_kind through one function so the column
+# the notes describe is always the column that was written.
+FINAL_COLUMN_SUFFIX = {"calibrated": "cal", "filtered": "filtered"}
+
+
+def _column_for(block):
+    return f"{block['gas']}_{FINAL_COLUMN_SUFFIX[block['final_kind']]}"
+
+
+def companion_notes(gas_blocks, source_path=None, presync_rows=0):
+    """The provenance block for the companion CSV: what produced it, what the
+    columns mean, and how many rows each mask covers."""
+    import datetime as _dt
+
+    notes = [
+        "UCATS-B derived data - companion to the raw acquisition CSV.",
+        f"generated: {_dt.datetime.now().isoformat(timespec='seconds')}",
+        f"source: {source_path or 'unknown'}",
+        "One row per row of the source CSV, in the same order, so the two "
+        "files can be opened side by side or pasted together without any "
+        "alignment step.",
+        "Mask columns are 1 = true, 0 = false, blank = not determined.",
+    ]
+    if presync_rows:
+        notes.append(
+            f"The first {presync_rows} row(s) were recorded before the "
+            f"datalogger's clock synced and are excluded from every analysis; "
+            f"they are kept here, blank and flagged in `presync`, only so the "
+            f"row numbering matches the source file.")
+    for block in gas_blocks:
+        gas = block["gas"]
+        unit = block.get("unit", "")
+        if block.get("final_kind") == "calibrated":
+            notes.append(
+                f"{gas}: {_column_for(block)} is the calibrated GOOD "
+                f"AMBIENT record ({unit}) -- blank wherever the instrument was "
+                f"not sampling air, or was sampling it in a state the masking "
+                f"settings exclude. The raw {block['value_col']} is untouched "
+                f"on every row, and {gas}_cal_slope/{gas}_cal_intercept are "
+                f"given everywhere, so a blank row can be recomputed.")
+        elif block.get("final_kind") == "filtered":
+            notes.append(
+                f"{gas}: {_column_for(block)} is {block['value_col']} "
+                f"({unit}) with readings below the sensor's physical floor "
+                f"removed. This gas has no cal bottles, so it is not "
+                f"calibrated here.")
+        else:
+            notes.append(f"{gas}: not calibrated -- {block.get('reason', 'no calibration')}")
+        for name, mask in block.get("masks", {}).items():
+            if mask is not None and bool(mask.any()):
+                notes.append(f"{gas}_{name}: {int(mask.sum())} row(s)")
+    return notes
+
+
+def export_companion_csv(path, datetimes, gas_blocks, source_path=None,
+                         include_raw=True, include_masks=True,
+                         include_coefficients=True, include_uncertainty=True,
+                         presync_rows=0, comment_header=False,
+                         time_seconds=None):
+    """Write the derived record for every gas, one row per row of the RAW CSV.
+
+    A companion to the acquisition file rather than a replacement: it adds the
+    masks and the filtered/calibrated values, repeats the raw columns only on
+    request, and is the same length as the file it complements, so the two
+    open side by side in Excel or Igor with no alignment step. That row-for-row
+    promise is why the pre-sync rows dropped by drop_presync_rows are still
+    present here, blank and flagged, rather than silently absent: a quiet
+    offset of a few dozen rows between two files that look alignable is a very
+    effective way to corrupt an analysis.
+
+    Each entry of `gas_blocks` is a dict with `gas`, `value_col`, `unit`,
+    `raw`, optionally `final`/`final_kind`/`sigma`/`slope`/`intercept`, a
+    `masks` dict of named boolean Series, and `reason` when a gas that should
+    have a calibration has none. **Every Series must already be indexed on the
+    raw file's row numbering** -- reconciling the trimmed analysis frame with
+    the untrimmed file is the caller's job (the GUI's `_to_raw_rows`), since
+    only the caller knows how many rows came off the front.
+
+    `comment_header` defaults False: the stated consumers are Excel and Igor
+    Pro, and neither skips a leading `#` block without being told to. With it
+    off the provenance goes to a sidecar `<stem>_notes.txt` instead, so it is
+    never simply lost. Turn it on for a file meant to be read back with
     pd.read_csv(path, comment="#").
+    """
+    columns = {"datetime": pd.Series(list(datetimes))}
+    if time_seconds is not None:
+        # Seconds from midnight UTC, the same time base the ICARTT file uses.
+        # Kept alongside the timestamp because Igor and Excel both plot a
+        # numeric axis far more readily than a parsed date.
+        columns["time_s"] = time_seconds
+    if presync_rows:
+        flag = pd.Series(0, index=columns["datetime"].index)
+        flag.iloc[:presync_rows] = 1
+        columns["presync"] = flag
+
+    for block in gas_blocks:
+        gas = block["gas"]
+        if include_raw:
+            columns[block["value_col"]] = block["raw"]
+        if block.get("final") is not None:
+            columns[_column_for(block)] = block["final"]
+        if include_uncertainty and block.get("sigma") is not None:
+            columns[f"{gas}_cal_unc"] = block["sigma"]
+        if include_coefficients and block.get("slope") is not None:
+            columns[f"{gas}_cal_slope"] = block["slope"]
+            columns[f"{gas}_cal_intercept"] = block["intercept"]
+        if include_masks:
+            for name, mask in block.get("masks", {}).items():
+                if mask is None:
+                    continue
+                # Int64, not bool: pandas would write True/False, which Igor
+                # loads as a text wave and Excel as text. The nullable dtype
+                # leaves the pre-sync rows genuinely empty rather than
+                # claiming 0 for rows where the mask was never evaluated.
+                columns[f"{gas}_{name}"] = mask.astype("boolean").astype("Int64")
+
+    out = pd.DataFrame(columns)
+    notes = companion_notes(gas_blocks, source_path, presync_rows)
+
+    path = Path(path)
+    with open(path, "w") as fh:
+        if comment_header:
+            fh.write("".join(f"# {line}\n" for line in notes))
+        out.to_csv(fh, index=False)
+    sidecar = None
+    if not comment_header:
+        sidecar = path.with_name(f"{path.stem}_notes.txt")
+        sidecar.write_text("\n".join(notes) + "\n")
+    return {"path": path, "notes_path": sidecar, "rows": len(out),
+            "columns": list(out.columns)}
+
+
+def icartt_filename(meta, start_date):
+    """`dataID_locationID_YYYYMMDD_R#.ict`, the archive naming convention."""
+    meta = {**DEFAULT_ICARTT_META, **(meta or {})}
+
+    def slug(value, fallback):
+        # Hyphens kept, underscores not: `_` separates the fields of the file
+        # name itself, while a hyphenated data ID is normal and is what the
+        # delivered UCATS files use (`SABRE-UCATS-GC_WB57_20230303_R0.ict`).
+        # Stripping hyphens here silently mangled that into `SABREUCATSGC`.
+        cleaned = "".join(c for c in str(value or "") if c.isalnum() or c == "-")
+        return cleaned.strip("-") or fallback
+
+    data_id = slug(meta["data_id"], "UCATSB")
+    location_id = slug(meta["location_id"], "Aircraft")
+    revision = slug(meta["revision"], "R0")
+    return f"{data_id}_{location_id}_{start_date:%Y%m%d}_{revision}.ict"
+
+
+def _icartt_variables(gas_blocks, meta, include_sigma):
+    """(name, definition-line, values) per dependent variable.
+
+    Only the *final* series is offered -- calibrated where there is a
+    calibration, floor-filtered where there is not. The raw counts are
+    deliberately absent: ICARTT is the delivery format, and an uncalibrated
+    column beside a calibrated one in an archived file is an invitation to
+    plot the wrong one.
+
+    The definition line is `name, unit, standard_name, description` -- four
+    fields, matching the delivered UCATS files. A gas with no `standard_name`
+    gets the field **empty rather than missing**: inventing an entry from the
+    controlled vocabulary would be worse than admitting there isn't one, but
+    dropping the field outright would shift the description into field 2 and
+    make position mean different things on different lines of the same file.
+
+    An uncertainty variable is named `<species>e_<suffix>` (`CO2e_UCATSB`),
+    the sister instrument's convention, and reuses its parent's standard name
+    exactly as those files do.
+    """
+    suffix = "".join(c for c in str(meta.get("var_suffix") or "") if c.isalnum())
+    variables = []
+
+    def define(name, block, description):
+        unit = block.get("unit", "")
+        return ", ".join([name, ICARTT_UNITS.get(unit, unit),
+                          _field(block.get("standard_name") or ""),
+                          _field(description)])
+
+    for block in gas_blocks:
+        if block.get("final") is None:
+            continue
+        short = block.get("short", block["gas"])
+        name = f"{short}_{suffix}" if suffix else short
+        kind = ("calibrated against onboard reference cylinders"
+                if block["final_kind"] == "calibrated"
+                else "as measured, below-floor readings removed, uncalibrated")
+        variables.append((
+            name,
+            define(name, block, f"{block.get('long_name', short)}; {kind}"),
+            block["final"]))
+        if include_sigma and block.get("sigma") is not None:
+            error_name = f"{short}e_{suffix}" if suffix else f"{short}e"
+            variables.append((
+                error_name,
+                define(error_name, block,
+                       f"ERROR 1-sigma on {name}; propagated from the assigned "
+                       f"cylinder values and the calibration scatter"),
+                block["sigma"]))
+    return variables
+
+
+def _icartt_uncertainty_line(gas_blocks, meta):
+    """The UNCERTAINTY keyword value: the median 1-sigma actually computed for
+    each gas, with the user's own text after it.
+
+    Derived rather than typed because it is the one required keyword whose
+    answer this program already knows -- and a hand-typed uncertainty in an
+    archived file goes stale the moment a drift model or a cal window changes.
+    """
+    parts = []
+    for block in gas_blocks:
+        sigma = block.get("sigma")
+        if sigma is None or not sigma.notna().any():
+            continue
+        median = float(sigma.dropna().median())
+        parts.append(f"{block.get('short', block['gas'])}: {median:.3g} "
+                     f"{block.get('unit', '')} (median 1-sigma)")
+    typed = _one_line(meta.get("uncertainty"))
+    if typed:
+        parts.append(typed)
+    return "; ".join(parts) or "N/A"
+
+
+def export_icartt(path, datetimes, gas_blocks, meta=None, include_sigma=True,
+                  drop_empty_rows=True, skip_leading=0):
+    """Write an ICARTT (.ict) file, format index 1001.
+
+    The delivered record is the good ambient one: every row is written with
+    the missing-value flag wherever `calibrate_series` blanked it, which is
+    exactly what the format's -99999 means, so no separate mask columns are
+    needed and none are written.
+
+    **Everything in the file comes from `meta` or from the data.** Nothing
+    about how the analysis was run is written -- no source file name, no
+    masking or drift settings, no counts of what was dropped. Those are the
+    experimenters' working record, not a data user's business, and they have
+    their own homes (the flight's conf file, the companion CSV's notes, and
+    the summary dict below).
+
+    Returns a summary dict -- rows written, rows the time base could not
+    represent, rows dropped as empty, and the variables emitted -- because
+    the caller has to be able to tell the user that a file which validated
+    cleanly is nonetheless shorter than the flight. That reporting is now the
+    *only* place those counts appear.
     """
     import datetime as _dt
 
-    lines = [
-        f"# UCATS-B calibrated {gas_key}",
-        f"# generated: {_dt.datetime.now().isoformat(timespec='seconds')}",
-        f"# source: {source_path or 'unknown'}",
-        f"# column: {value_col}  mode: {result['mode']}",
-    ]
-    for state, info in sorted(result["bottles"].items()):
-        lines.append(
-            f"# cal state {state}: serial={info['serial']} "
-            f"assigned={info['assigned']} unc={info['assigned_unc']} "
-            f"events={len(info['times'])} rejected={len(info['rejected'])}"
-        )
-    if result.get("span_gain") is not None:
-        lines.append(f"# span gain: {result['span_gain']:.6f}")
-    for state, rms in sorted(result.get("loo_rms", {}).items()):
-        lines.append(f"# leave-one-out RMS, state {state}: {rms:.6f}")
-    if settings:
-        lines.append("# settings: " + ", ".join(f"{k}={v}" for k, v in sorted(settings.items())))
-    for warning in result.get("warnings", []):
-        lines.append(f"# WARNING: {warning}")
-    lines.append("# is_extrapolated=True means the calibration was held flat "
-                 "past the last cal event of a bottle, or spans a long gap.")
-    flushed = result.get("flushed")
-    in_cal = result.get("in_cal")
-    lines.append(f"# {value_col}_cal is the calibrated GOOD AMBIENT record. It is "
-                 f"blank wherever the instrument was not sampling air (is_cal_period "
-                 f"or is_post_cal_flush), wherever the air it was sampling is "
-                 f"excluded by the masking settings (is_masked: warm-up or "
-                 f"out-of-spec detector pressure), and also wherever the raw "
-                 f"{value_col} is itself missing or the calibration is undefined. The raw "
-                 f"{value_col} is left untouched on every row, and cal_slope/"
-                 f"cal_intercept are given for every row, so the calibrated "
-                 f"value of a blanked row can be recomputed if it is wanted.")
-    if in_cal is not None and in_cal.any():
-        lines.append(f"# is_cal_period=True: cal gas was flowing "
-                     f"({int(in_cal.sum())} rows), so it is not air.")
-    if flushed is not None and flushed.any():
-        lines.append(f"# is_post_cal_flush=True: within the post-cal flush window "
-                     f"({int(flushed.sum())} rows) -- the detector was still "
-                     f"clearing cal gas, so the air reading is not yet the atmosphere.")
-    masked = result.get("excluded")
-    if masked is not None and masked.any():
-        lines.append(f"# is_masked=True: excluded by the masking settings "
-                     f"({int(masked.sum())} rows) -- instrument warm-up or "
-                     f"detector pressure outside tolerance.")
+    meta = {**DEFAULT_ICARTT_META, **(meta or {})}
+    # skip_leading: the pre-sync rows. See icartt_time_base -- omitting it
+    # does not fail loudly, it just quietly rejects most of the flight.
+    start_date, seconds, usable = icartt_time_base(datetimes, skip_leading)
+    if start_date is None:
+        raise ValueError("No usable timestamps: cannot build an ICARTT time base.")
 
-    out = pd.DataFrame({
-        "datetime": df["datetime"],
-        value_col: df[value_col],
-        f"{value_col}_cal": result["calibrated"],
-        "cal_slope": result["slope"],
-        "cal_intercept": result["intercept"],
-        "is_extrapolated": result["extrapolated"],
-    })
-    if flushed is not None:
-        out["is_post_cal_flush"] = flushed
-    # is_cal_period comes from the calibration result rather than the analysis
-    # so it is present even without one -- the header explains a blank
-    # <col>_cal in terms of this column, so it must not be able to go missing.
-    if in_cal is not None:
-        out["is_cal_period"] = in_cal
-    # Same reasoning for is_masked: the header explains a blank <col>_cal in
-    # terms of it, so it comes from the calibration result (which did the
-    # blanking) and only falls back to the analysis dict.
-    excluded = result.get("excluded")
-    if excluded is None and analysis is not None:
-        excluded = analysis["exclude_mask"]
-    if excluded is not None:
-        out["is_masked"] = excluded
+    variables = _icartt_variables(gas_blocks, meta, include_sigma)
+    if not variables:
+        raise ValueError("No gas has a usable series to export.")
+
+    frame = pd.DataFrame({name: pd.Series(list(values))
+                          for name, _, values in variables})
+    frame.insert(0, "Time_Start", seconds)
+    keep = usable.copy()
+    n_unusable = int((~keep).sum())
+    n_empty = 0
+    if drop_empty_rows:
+        has_data = frame[[name for name, *_ in variables]].notna().any(axis=1)
+        n_empty = int((keep & ~has_data).sum())
+        keep &= has_data
+    frame = frame[keep]
+    if frame.empty:
+        raise ValueError("Nothing left to write: no row has data on a usable "
+                         "timestamp.")
+
+    # Declare the interval only when it really is uniform. A gap-free 1 Hz
+    # record gets "1"; anything else gets the format's "non-uniform" 0 rather
+    # than a nominal rate the file does not actually keep to.
+    diffs = frame["Time_Start"].diff().dropna().round(3).unique()
+    interval = f"{diffs[0]:g}" if len(diffs) == 1 else "0"
+    # Integer seconds are what a 1 Hz logger produces; only fall back to a
+    # decimal format if some timestamp actually needs it.
+    time_fmt = "%d" if float(frame["Time_Start"].mod(1).abs().max()) == 0 else "%.1f"
+
+    today = _dt.date.today()
+    revision = _one_line(meta["revision"]) or "R0"
+    normal = [f"{label}: {_one_line(meta[key]) or 'N/A'}"
+              for label, key in ICARTT_KEYWORDS]
+    # UNCERTAINTY is the one keyword we can answer from the data.
+    normal[-1] = f"UNCERTAINTY: {_icartt_uncertainty_line(gas_blocks, meta)}"
+    normal += [
+        f"ULOD_FLAG: {ICARTT_ULOD_FLAG}",
+        f"ULOD_VALUE: {_one_line(meta['ulod_value']) or 'N/A'}",
+        f"LLOD_FLAG: {ICARTT_LLOD_FLAG}",
+        f"LLOD_VALUE: {_one_line(meta['llod_value']) or 'N/A'}",
+        f"DM_CONTACT_INFO: {_one_line(meta['dm_contact_info']) or 'N/A'}",
+        f"PROJECT_INFO: {_one_line(meta['project_info']) or 'N/A'}",
+        f"STIPULATIONS_ON_USE: {_one_line(meta['stipulations_on_use']) or 'N/A'}",
+        f"OTHER_COMMENTS: {_one_line(meta['other_comments']) or 'N/A'}",
+        f"REVISION: {revision}",
+    ]
+    # The revision history is a block the user maintains, one `R#: text` per
+    # line, and it ACCUMULATES: the delivered R0 file lists RA above R0. Only
+    # if it is empty does the current revision get a placeholder line of its
+    # own, so a first export is still a valid file.
+    normal += _verbatim_lines(meta["revision_history"]) or [f"{revision}: N/A"]
+    # The column-header line is itself the LAST normal comment line -- part of
+    # the count on the line above it, not a separate section.
+    normal.append(", ".join(["Time_Start"] + [name for name, *_ in variables]))
+
+    # The author's special comments, verbatim, and NOTHING ELSE. This section
+    # used to also carry the source file name, the masking/drift settings each
+    # gas was analysed with, and the counts of rows dropped for the format's
+    # sake. That is all internal to the experimenters: the settings in
+    # particular are a working record of how the analysis was tuned, not
+    # something a data user needs or should be reading in a delivered file.
+    # None of it is lost -- the omission counts are returned in the summary
+    # dict and shown to the user after the export, and the settings live in
+    # the flight's own conf file and in the companion CSV's notes.
+    special = _verbatim_lines(meta["special_comments"])
+
+    after = [
+        _one_line(meta["pi_name"]),
+        _one_line(meta["pi_affiliation"]),
+        _one_line(meta["data_source"]),
+        _one_line(meta["mission"]),
+        "1, 1",
+        f"{start_date:%Y, %m, %d}, {today:%Y, %m, %d}",
+        interval,
+        # Three fields -- name, unit, description -- as the delivered UCATS
+        # files write it, not two with the description crammed into the unit.
+        "Time_Start, seconds, ELAPSED TIME IN SECONDS FROM 00:00:00 GMT ON "
+        "THE FLIGHT DATE",
+        str(len(variables)),
+        ", ".join("1" for _ in variables),
+        ", ".join(str(ICARTT_MISSING) for _ in variables),
+    ]
+    after += [definition for _, definition, _ in variables]
+    after += [str(len(special))] + special
+    after += [str(len(normal))] + normal
+
+    # Line 1 counts itself, so the total is everything after it plus one.
+    lines = [f"{len(after) + 1}, {ICARTT_FFI}"] + after
 
     with open(path, "w") as fh:
         fh.write("\n".join(lines) + "\n")
-        out.to_csv(fh, index=False)
-    return path
+        for row in frame.itertuples(index=False):
+            values = [time_fmt % row[0]]
+            for value in row[1:]:
+                values.append(str(ICARTT_MISSING) if pd.isna(value)
+                              else f"{value:.4f}")
+            fh.write(", ".join(values) + "\n")
+
+    return {"path": Path(path), "rows": len(frame), "header_lines": len(lines),
+            "unusable_times": n_unusable, "empty_rows": n_empty,
+            "start_date": start_date,
+            "variables": [name for name, *_ in variables]}
 
 
 def _shade_flagged(ax, datetimes, mask, color=CAL_SHADE_COLOR):

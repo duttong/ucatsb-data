@@ -24,7 +24,7 @@ from PyQt5.QtWidgets import (
     QGroupBox, QComboBox, QDoubleSpinBox, QSpinBox, QLabel,
     QButtonGroup, QRadioButton, QPushButton, QFileDialog, QMessageBox,
     QTabWidget, QCheckBox, QAction, QStackedWidget, QMenu,
-    QDialog, QDialogButtonBox,
+    QDialog, QDialogButtonBox, QLineEdit, QPlainTextEdit, QScrollArea,
 )
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg, NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
@@ -38,7 +38,9 @@ from plot_co2_timeseries import (
     most_common_serial, mean_std_label, calibrate_series, post_cal_flush_mask,
     cal_switch_mask, below_floor_mask, O3_VALID_MIN_PPB, H2O_VALID_MIN_PPM,
     box_stats, calibration_uncertainty, linear_fit,
-    plot_calibration_panels, export_calibrated_csv,
+    plot_calibration_panels,
+    export_companion_csv, export_icartt, icartt_filename, icartt_time_base,
+    DEFAULT_ICARTT_META,
     CALS_YAML_PATH, CAL_DRIFT_MODELS, CAL_DEFAULT_SMOOTH_EVENTS,
     POST_CAL_FLUSH_COLOR,
 )
@@ -65,10 +67,39 @@ MUTED_COLOR = "#52514e"
 D1_P_TARGET_MBARS = 140.0
 CAL_MERGE_GAP_S = 2   # bridge cal periods split by a single dropped-flag sample
 
+# `short`, `standard_name` and `long_name` exist for the exports: the ICARTT
+# variable name is `<short>_<suffix>` (so Ozone is delivered as O3, the name
+# every archive uses), `standard_name` is the controlled-vocabulary field the
+# sister UCATS files carry as the third field of each variable definition
+# (`Gas_N2O_InSitu_S_DMF`), and `long_name` is the description after it.
+# `short`/`long_name` default sensibly from the gas key; `standard_name` has
+# no default and is simply omitted from the line when absent, since inventing
+# a controlled-vocabulary entry is worse than leaving it out.
+#
+# The names come from the NASA ESDS Atmospheric Composition Variable Standard
+# Names Convention, which ICARTT V2.0 requires:
+#   MeasurementCategory_CoreName_AcquisitionMethod_DescriptiveAttributes
+# and for the `Gas` category the attributes are MeasurementSpecificity
+# (S = single species) then Reporting (DMF = molar fraction wrt DRY air; AMF
+# is the same wrt ambient air; DVMR/AVMR are the volumetric mixing ratios on
+# those two bases; None = not stated). Two entries here are not `Gas_..._DMF`
+# and neither is an oversight:
+#
+# - **H2O is not a `Gas` name at all.** Water vapour lives in the convention's
+#   `Met` category, whose format is Met_CoreName_AcquisitionMethod_None with
+#   no descriptive attributes. `H2OMF` is "mole fraction of water vapor with
+#   respect to ambient air"; `H2OMRV` (volumetric mixing ratio) and `H2OMR`
+#   (mass mixing ratio to dry air) are the alternatives if the sensor turns
+#   out to be stated differently.
+# - **Ozone reports `AVMR`, not `DMF`** -- a volumetric mixing ratio against
+#   AMBIENT air, water vapour included. The 2B monitor measures the sample as
+#   it comes in and nothing dries it, so a dry-air basis would be a claim
+#   about the sample stream that this pipeline does not make. Settled with
+#   Eric, 2026-07-29; it was briefly `DMF` and then `None`.
 GASES = {
-    "CO2": {"value_col": "d1_CO2_ppm", "ylabel": "CO2 (ppm)", "title": "UCATS-B CO2 (uncalibrated) timeseries", "detector": "d1"},
-    "N2O": {"value_col": "d1_N2O_ppb", "ylabel": "N2O (ppb)", "title": "UCATS-B N2O (uncalibrated) timeseries", "detector": "d1"},
-    "CH4": {"value_col": "d2_CH4_ppb", "ylabel": "CH4 (ppb)", "title": "UCATS-B CH4 (uncalibrated) timeseries", "detector": "d2"},
+    "CO2": {"value_col": "d1_CO2_ppm", "ylabel": "CO2 (ppm)", "title": "UCATS-B CO2 (uncalibrated) timeseries", "detector": "d1", "standard_name": "Gas_CO2_InSitu_S_DMF", "long_name": "Carbon dioxide dry air mole fraction"},
+    "N2O": {"value_col": "d1_N2O_ppb", "ylabel": "N2O (ppb)", "title": "UCATS-B N2O (uncalibrated) timeseries", "detector": "d1", "standard_name": "Gas_N2O_InSitu_S_DMF", "long_name": "Nitrous oxide dry air mole fraction"},
+    "CH4": {"value_col": "d2_CH4_ppb", "ylabel": "CH4 (ppb)", "title": "UCATS-B CH4 (uncalibrated) timeseries", "detector": "d2", "standard_name": "Gas_CH4_InSitu_S_DMF", "long_name": "Methane dry air mole fraction"},
     # Ozone comes from its own dedicated sensor, not an Aeris detector, and
     # isn't run through the cal-bottle system -- has_masking=False skips the
     # warm-up/pressure-tol/cal-window machinery entirely for this gas, and
@@ -79,11 +110,19 @@ GASES = {
     # below it the sensor is faulting, not measuring. Declared per gas rather
     # than special-cased by name so the filtering code stays generic -- any
     # gas that gains a floor gets the same raw/filtered treatment.
-    "Ozone": {"value_col": "oz_o3best", "ylabel": "O3 (ppb)", "title": "UCATS-B O3 timeseries", "detector": None, "has_masking": False, "valid_min": O3_VALID_MIN_PPB},
+    "Ozone": {"value_col": "oz_o3best", "ylabel": "O3 (ppb)", "title": "UCATS-B O3 timeseries", "detector": None, "has_masking": False, "valid_min": O3_VALID_MIN_PPB, "short": "O3", "standard_name": "Gas_O3_InSitu_S_AVMR", "long_name": "Ozone mole fraction"},
     # Water vapour, from its own instrument (`w_*` columns) -- like Ozone it
     # has no cal bottles, so has_masking=False and it is plotted as recorded.
-    "H2O": {"value_col": "w_H2Obest", "ylabel": "H2O (ppm)", "title": "UCATS-B H2O timeseries", "detector": None, "has_masking": False, "valid_min": H2O_VALID_MIN_PPM},
+    "H2O": {"value_col": "w_H2Obest", "ylabel": "H2O (ppm)", "title": "UCATS-B H2O timeseries", "detector": None, "has_masking": False, "valid_min": H2O_VALID_MIN_PPM, "standard_name": "Met_H2OMF_InSitu_None", "long_name": "Water vapour mole fraction"},
 }
+
+
+def gas_unit(gas_key: str) -> str:
+    """The unit out of a gas's ylabel ("CO2 (ppm)" -> "ppm"). One source for
+    the plot labels, the cal-window box titles and both export formats, so a
+    unit cannot be right on the figure and wrong in a delivered file."""
+    ylabel = GASES[gas_key]["ylabel"]
+    return ylabel.split("(")[-1].rstrip(")") if "(" in ylabel else ""
 
 REQUIRED_COLUMNS = [
     "datetime", "d1_P_mbars", "d2_P_mbars", "d1_T_gas", "d2_T_gas",
@@ -225,6 +264,29 @@ def load_recent_files(path: Path) -> list:
     return list(dict.fromkeys(p for p in loaded if isinstance(p, str)))[:RECENT_FILES_MAX]
 
 
+def load_icartt_meta(path: Path) -> dict:
+    """The default ICARTT header metadata from the app-level config, filled
+    out from DEFAULT_ICARTT_META.
+
+    App-level rather than per-dataset, and deliberately so for now: the PI,
+    affiliation, project and stipulations are the same on every flight of a
+    campaign, so making them per-flight would mean retyping them for each
+    file. The fields that genuinely vary per flight (the mission, the
+    location) are still editable before each export -- they are just not
+    saved with the flight. Only unknown keys are dropped, so a config written
+    by a later version that adds a field is not corrupted by this one.
+    """
+    loaded = _read_yaml(path).get("icartt")
+    meta = copy.deepcopy(DEFAULT_ICARTT_META)
+    if isinstance(loaded, dict):
+        # Stripped on the way in so a hand-edited YAML with a trailing space
+        # cannot make the form read dirty the moment it is loaded --
+        # _icartt_is_dirty compares against stripped widget text.
+        meta.update({k: ("" if v is None else str(v).strip())
+                     for k, v in loaded.items() if k in DEFAULT_ICARTT_META})
+    return meta
+
+
 def load_cal_selection(path: Path, default: dict) -> dict:
     """The flight's `cals: {cal0: ..., cal1: ...}` choice from its
     <dataset>_conf.yaml, falling back to `default` (cals.yaml's own block).
@@ -244,23 +306,49 @@ def load_cal_selection(path: Path, default: dict) -> dict:
     return selection
 
 
-def save_config(path: Path, config: dict, cal_selection: dict = None,
-                recent_files: list = None):
-    """Write the per-gas blocks, plus whichever of the two non-gas blocks
-    belongs in this file: the tank selection for a flight's own conf, the
-    recent-file list for the app-level config. Never both -- see
-    load_cal_selection and load_recent_files for why each lives where it does.
+class _BlockStyleDumper(yaml.SafeDumper):
+    """A SafeDumper that writes multi-line strings as YAML block scalars.
 
-    This writes a *fresh* document, so an omitted block is a deletion: any
-    app-level write that forgets `recent_files=` wipes the list, the same trap
-    the per-gas settings have with _controls_to_settings().
+    The default quoted style renders an embedded newline as a blank line
+    inside a quoted scalar, which round-trips correctly but is close to
+    unreadable — and the ICARTT special-comments block is meant to be
+    hand-edited in this file. A Dumper subclass rather than a global
+    `add_representer` call so nothing else's YAML output changes.
+    """
+
+
+def _represent_str(dumper, data):
+    if "\n" in data:
+        return dumper.represent_scalar("tag:yaml.org,2002:str", data, style="|")
+    return dumper.represent_scalar("tag:yaml.org,2002:str", data)
+
+
+_BlockStyleDumper.add_representer(str, _represent_str)
+
+
+def save_config(path: Path, config: dict, cal_selection: dict = None,
+                recent_files: list = None, icartt_meta: dict = None):
+    """Write the per-gas blocks, plus whichever of the non-gas blocks belongs
+    in this file: the tank selection for a flight's own conf, the recent-file
+    list and the ICARTT header metadata for the app-level config. Never both
+    kinds -- see load_cal_selection, load_recent_files and load_icartt_meta
+    for why each lives where it does.
+
+    This writes a *fresh* document, so an omitted block is a deletion: an
+    app-level write that forgets `recent_files=` wipes the list and one that
+    forgets `icartt_meta=` wipes the metadata, the same trap the per-gas
+    settings have with _controls_to_settings(). _save_app_config passes both,
+    every time, for exactly that reason.
     """
     doc = dict(config)
     if cal_selection:
         doc = {"cals": dict(cal_selection), **doc}
+    if icartt_meta:
+        doc = {"icartt": dict(icartt_meta), **doc}
     if recent_files:
         doc = {"recent_files": list(recent_files), **doc}
-    path.write_text(yaml.safe_dump(doc, sort_keys=False))
+    path.write_text(yaml.dump(doc, Dumper=_BlockStyleDumper, sort_keys=False,
+                              default_flow_style=False, width=100))
 
 
 class PlotPane(QWidget):
@@ -450,6 +538,9 @@ class UcatsbGui(QMainWindow):
 
         self.csv_path = None
         self.df = None
+        # Set by load_csv; see there for why the Export tab needs them.
+        self.raw_df = None
+        self.presync_dropped = 0
         self.available_gases = {}
         self.other_columns = []
 
@@ -463,6 +554,12 @@ class UcatsbGui(QMainWindow):
         self.config_loaded_from = None
         self.config = load_config(None)
         self.recent_files = load_recent_files(config_path)
+        # ICARTT header metadata: app-level, not per-dataset (see
+        # load_icartt_meta), with its own Save button on the Export tab and
+        # its own saved-state snapshot -- the per-dataset Save writes a
+        # different file entirely, so one dirty state cannot serve both.
+        self.icartt_meta = load_icartt_meta(config_path)
+        self._saved_icartt_meta = copy.deepcopy(self.icartt_meta)
         # None until a dataset is open; _is_dirty() stays False before that.
         self._saved_state = None
         self.current_gas = None
@@ -483,8 +580,12 @@ class UcatsbGui(QMainWindow):
         self.drift_model = DEFAULT_GAS_SETTINGS["drift_model"]
         self.drift_smooth_events = DEFAULT_GAS_SETTINGS["drift_smooth_events"]
         self.show_calibrated = False
-        self._dirty = {"main": True, "cal": True, "corr": True}
-        self._preserve = {"main": False, "cal": False, "corr": False}
+        # "export" joins the plot panes so the tab's readiness summary is
+        # invalidated by refresh() like everything else -- the masking
+        # controls stay visible beside it, so a spin-box nudge has to be able
+        # to change what it says about which gases will export.
+        self._dirty = {"main": True, "cal": True, "corr": True, "export": True}
+        self._preserve = {"main": False, "cal": False, "corr": False, "export": False}
         self.cal_roster = load_cal_roster(CALS_YAML_PATH)
         # cals.yaml's own pairing is the default only; a flight's conf file
         # overrides it, and the Cal Tanks tab edits it.
@@ -576,9 +677,9 @@ class UcatsbGui(QMainWindow):
         # Read every column, not just REQUIRED_COLUMNS, so the "Other" aux
         # trace catch-all has the full remaining roster of CSV fields to
         # offer regardless of what any given flight's schema contains.
-        df = pd.read_csv(csv_path)
-        df["datetime"] = pd.to_datetime(df["datetime"])
-        df = drop_presync_rows(df)
+        raw = pd.read_csv(csv_path)
+        raw["datetime"] = pd.to_datetime(raw["datetime"])
+        df = drop_presync_rows(raw)
 
         # Columns not already exposed via a named control -- offered through
         # the "Other" catch-all combo box. "datetime" is excluded too since
@@ -588,6 +689,20 @@ class UcatsbGui(QMainWindow):
         # Validation above passed -- safe to commit the new dataset now.
         self.csv_path = csv_path
         self.df = df
+        # The timestamps and gas columns as read, before drop_presync_rows,
+        # plus the number of rows it took off the front. Kept for the Export
+        # tab alone: the companion CSV promises to be the same length as the
+        # file it complements, and drop_presync_rows resets the index, so the
+        # offset is the only thing that can put a derived Series back onto the
+        # raw file's row numbers. The gas columns are kept too because the
+        # exported raw echo must equal the source column *exactly* -- a
+        # pre-sync row has an unreliable clock, not an unreliable reading, so
+        # blanking its measurement would make the echo disagree with the file
+        # it claims to echo. Narrow slice, not the whole frame: nothing else
+        # about those rows is ever wanted.
+        self.raw_df = raw[["datetime"] + [info["value_col"]
+                                          for info in available_gases.values()]].copy()
+        self.presync_dropped = len(raw) - len(df)
         self.available_gases = available_gases
         self.other_columns = other_columns
         self.current_gas = next(iter(available_gases))
@@ -949,13 +1064,16 @@ class UcatsbGui(QMainWindow):
         self._rebuild_recent_menus()
 
     def _save_app_config(self):
-        """Write the app-level config. Always carries recent_files -- see
-        save_config: an omitted block is a deletion."""
+        """Write the app-level config. Always carries BOTH of its blocks --
+        see save_config: it writes a fresh document, so whichever block this
+        forgets is deleted. A recent-file update must not wipe the ICARTT
+        metadata, nor the reverse."""
         try:
-            # Only the recent-files list: this file no longer carries analysis
-            # settings, so it has no gas blocks to write.
+            # No gas blocks: this file carries no analysis settings, only the
+            # recent-file list and the ICARTT header defaults.
             save_config(self.default_config_path, {},
-                        recent_files=self.recent_files)
+                        recent_files=self.recent_files,
+                        icartt_meta=self.icartt_meta)
         except OSError as e:
             print(f"Warning: could not write {self.default_config_path}: {e}")
 
@@ -1230,11 +1348,10 @@ class UcatsbGui(QMainWindow):
         self.calibrated_check.toggled.connect(self.on_calibrated_toggled)
         cal_form.addRow(self.calibrated_check)
 
-        self.export_button = QPushButton("Export calibrated CSV…")
-        self.export_button.clicked.connect(self.on_export_clicked)
-        self.export_button.setEnabled(False)
-        cal_form.addRow(self.export_button)
-
+        # No export button here any more: exporting is now the Export tab's
+        # job, where it can cover every gas at once. This panel is per-gas,
+        # and a per-gas button was quietly the reason the old export could
+        # only ever describe one of them.
         vbox.addWidget(self.cal_box)
 
         vbox.addStretch(1)
@@ -1284,8 +1401,7 @@ class UcatsbGui(QMainWindow):
         title = f"{info} Cal ({label})" if info else f"Cal ({label})"
         value = nominal.get(self.current_gas)
         if value is not None:
-            unit = GASES[self.current_gas]["ylabel"].split("(")[-1].rstrip(")")
-            title += f" {value:g} {unit}"
+            title += f" {value:g} {gas_unit(self.current_gas)}"
         return title
 
     def _build_tabs(self):
@@ -1318,11 +1434,14 @@ class UcatsbGui(QMainWindow):
         # one trace over a time span, which a tracer-tracer scatter is not.
         self.corr_pane.stats_action.setVisible(False)
 
+        self.export_pane = self._build_export_pane()
+
         self.tabs = QTabWidget()
         self.tabs.addTab(self.main_pane, "Timeseries")
         self.tabs.addTab(self.cal_pane, "Calibration")
         self.tabs.addTab(self.corr_pane, "Correlations")
         self.tabs.addTab(self.tanks_pane, "Cal Tanks")
+        self.tabs.addTab(self.export_pane, "Export")
         # Connected after every addTab call -- the first one fires
         # currentChanged before the other tabs exist.
         self.tabs.currentChanged.connect(self.on_tab_changed)
@@ -1459,7 +1578,7 @@ class UcatsbGui(QMainWindow):
         for gas, info in GASES.items():
             if not info.get("has_masking", True):
                 continue
-            unit = info["ylabel"].split("(")[-1].rstrip(")")
+            unit = gas_unit(gas)
             cells = []
             for serial in serials:
                 nominal = self.cal_roster.get(serial, {})
@@ -1483,6 +1602,295 @@ class UcatsbGui(QMainWindow):
         else:
             self.tank_conf_label.setText(
                 f"Not saved yet — Save… offers {self.config_path.name}")
+
+    # The ICARTT header metadata form: (key, label, height, tooltip), where
+    # height 0 is a single-line box and anything else a text area that tall.
+    # Ordered as the file itself is -- the four header lines, then the
+    # required normal-comment keywords in the sequence the standard fixes --
+    # so the panel reads like the file it produces and a field can be checked
+    # against a delivered header without hunting.
+    #
+    # Most multi-line boxes are a convenience only: their value is flattened
+    # to one line on write (`_one_line`), since each keyword occupies exactly
+    # one line and a stray newline would invalidate the header's line count.
+    # **`special_comments` and `revision_history` are the exceptions** -- they
+    # are whole sections rather than keyword values, and their line breaks are
+    # written through verbatim (`_verbatim_lines`), which is why they get the
+    # tallest boxes.
+    ICARTT_FIELDS = (
+        ("data_id", "Data ID", 0,
+         "First part of the file name — the mission/instrument data product, "
+         "e.g. SABRE-UCATSB. The ICARTT standard calls it common practice to "
+         "prefix the project acronym, and requires the ID to match whatever "
+         "the archiving data center has registered, so check it against the "
+         "mission's data-management instructions rather than inventing one. "
+         "Hyphens are kept; underscores separate the file name's own fields "
+         "and are stripped."),
+        ("location_id", "Location ID", 0,
+         "Second part of the file name — normally the platform, e.g. WB57."),
+        ("pi_name", "PI name(s)", 0,
+         "Header line 2. LAST, FIRST — several PIs separated by semicolons, "
+         "as in HINTSA, ERIC; MOORE, FRED."),
+        ("pi_affiliation", "PI affiliation", 0, "Header line 3."),
+        ("data_source", "Data source", 0,
+         "Header line 4 — the instrument or measurement this file reports."),
+        ("mission", "Mission", 0, "Header line 5 — the campaign name."),
+        ("pi_contact_info", "PI contact info", 72,
+         "Address, phone, email of the PI."),
+        ("platform", "Platform", 0, "The aircraft or other platform."),
+        ("location", "Location", 0,
+         "Where the data were taken. The delivered UCATS files point at the "
+         "nav file here: \"Aircraft location in separate file\"."),
+        ("associated_data", "Associated data", 72,
+         "Other files needed to use this one (e.g. MMS-1HZ), or N/A."),
+        ("instrument_info", "Instrument info", 96,
+         "How the measurement is made."),
+        ("data_info", "Data info", 96,
+         "Anything a user needs to know to use the numbers correctly — the "
+         "UCATS files state the units of each species here."),
+        ("uncertainty", "Uncertainty (extra notes)", 72,
+         "The median 1-sigma per gas is computed and written automatically.\n"
+         "Anything typed here is appended to it."),
+        ("ulod_value", "ULOD value", 0,
+         "Upper limit of detection, or N/A. The flag value itself is fixed by "
+         "the format."),
+        ("llod_value", "LLOD value", 0,
+         "Lower limit of detection, or N/A."),
+        ("dm_contact_info", "DM contact info", 72,
+         "The data manager, if that is not the PI."),
+        ("project_info", "Project info", 96,
+         "The project, its dates and its purpose."),
+        ("stipulations_on_use", "Stipulations on use", 96,
+         "Terms the PI puts on using the data."),
+        ("other_comments", "Other comments", 96, "Anything else."),
+        ("revision", "Revision", 0,
+         "The revision THIS file is. RA for preliminary, R0 for the first "
+         "revised release, R1 next, and so on. Goes in the file name too."),
+        ("revision_history", "Revision history", 120,
+         "One `R#: description` per line, written into the file verbatim.\n"
+         "It ACCUMULATES — an R0 file still lists its RA line above the R0 "
+         "one.\nLeave empty and the current revision gets a placeholder line."),
+        ("special_comments", "Special comments", 300,
+         "Free text written into the file verbatim, line breaks and blank "
+         "lines included.\nThis is where the delivered UCATS files explain "
+         "their error estimates and ask users to contact the PIs.\n"
+         "This box is the whole section — nothing is added to it."),
+        ("var_suffix", "Variable name suffix", 0,
+         "Appended to each species name, e.g. CO2_UCATSB; the 1-sigma "
+         "variable becomes CO2e_UCATSB. Convention is the instrument or PI."),
+    )
+
+    def _build_export_pane(self):
+        """The Export tab: the two delivery products, and control over what
+        goes into them.
+
+        Its own tab rather than a button in the control panel, for the same
+        reason as Cal Tanks: everything in that panel is per gas, while both
+        of these files cover the whole flight and every gas at once. The old
+        per-gas "Export calibrated CSV" button is gone -- it could only ever
+        describe the gas that happened to be selected.
+        """
+        pane = QWidget()
+        outer = QVBoxLayout(pane)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        inner = QWidget()
+        vbox = QVBoxLayout(inner)
+        scroll.setWidget(inner)
+        outer.addWidget(scroll)
+
+        summary_box = QGroupBox("What will be exported")
+        summary_layout = QVBoxLayout(summary_box)
+        self.export_summary_label = QLabel("No file loaded.")
+        self.export_summary_label.setTextFormat(Qt.PlainText)
+        self.export_summary_label.setStyleSheet("font-family: Menlo, monospace;")
+        self.export_summary_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        summary_layout.addWidget(self.export_summary_label)
+        vbox.addWidget(summary_box)
+
+        # ---- companion CSV
+        csv_box = QGroupBox("Derived CSV (companion to the raw file)")
+        csv_layout = QVBoxLayout(csv_box)
+        csv_intro = QLabel(
+            "Every gas, and one row for every row of the raw CSV — including "
+            "the pre-sync rows, blank — so the two files line up exactly and "
+            "can be opened side by side, or pasted together, in Excel or Igor. "
+            "Masks are written as 1/0."
+        )
+        csv_intro.setWordWrap(True)
+        csv_layout.addWidget(csv_intro)
+
+        self.csv_raw_check = QCheckBox("Include the raw value columns")
+        self.csv_raw_check.setChecked(True)
+        self.csv_raw_check.setToolTip(
+            "The raw columns are already in the source file. Keeping them "
+            "here makes this file usable on its own; unchecking keeps it\n"
+            "strictly complementary.")
+        self.csv_masks_check = QCheckBox("Include the mask columns")
+        self.csv_masks_check.setChecked(True)
+        self.csv_unc_check = QCheckBox("Include 1σ uncertainty columns")
+        self.csv_unc_check.setChecked(True)
+        self.csv_coeff_check = QCheckBox("Include cal slope / intercept columns")
+        self.csv_coeff_check.setChecked(True)
+        self.csv_coeff_check.setToolTip(
+            "Given on every row, so the calibrated value of a blanked row can "
+            "be recomputed by anyone who wants to check it.")
+        self.csv_comment_check = QCheckBox("Put the provenance notes in the CSV as # lines")
+        self.csv_comment_check.setChecked(False)
+        self.csv_comment_check.setToolTip(
+            "Off by default: neither Excel nor Igor skips a leading comment "
+            "block without being told to.\nWith it off the notes are written "
+            "to a <name>_notes.txt beside the CSV instead.")
+        for widget in (self.csv_raw_check, self.csv_masks_check,
+                       self.csv_unc_check, self.csv_coeff_check,
+                       self.csv_comment_check):
+            csv_layout.addWidget(widget)
+
+        self.export_csv_button = QPushButton("Export CSV…")
+        self.export_csv_button.setEnabled(False)
+        self.export_csv_button.clicked.connect(self.on_export_csv_clicked)
+        csv_row = QHBoxLayout()
+        csv_row.addWidget(self.export_csv_button)
+        csv_row.addStretch(1)
+        csv_layout.addLayout(csv_row)
+        vbox.addWidget(csv_box)
+
+        # ---- ICARTT
+        ict_box = QGroupBox("ICARTT (.ict)")
+        ict_layout = QVBoxLayout(ict_box)
+        ict_intro = QLabel(
+            "The archive format (file format index 1001). Good ambient data "
+            "only: every row this analysis blanked is written as the format's "
+            "missing value, -99999, which is what that flag means — so no mask "
+            "columns are written or needed. Time is seconds from midnight UTC."
+        )
+        ict_intro.setWordWrap(True)
+        ict_layout.addWidget(ict_intro)
+
+        self.icartt_sigma_check = QCheckBox("Include a 1σ uncertainty variable per gas")
+        self.icartt_sigma_check.setChecked(True)
+        self.icartt_drop_check = QCheckBox("Drop rows with no value for any gas")
+        self.icartt_drop_check.setChecked(True)
+        self.icartt_drop_check.setToolTip(
+            "A row that is -99999 in every column carries nothing but a "
+            "timestamp. Uncheck to keep the time base unbroken.")
+        ict_layout.addWidget(self.icartt_sigma_check)
+        ict_layout.addWidget(self.icartt_drop_check)
+
+        meta_box = QGroupBox("Header metadata")
+        meta_form = QFormLayout(meta_box)
+        # QFormLayout defaults to FieldsStayAtSizeHint on macOS, which pins
+        # every box to ~200 px and truncates the values regardless of how much
+        # room the tab actually has. These fields hold addresses, PI lists and
+        # sentences, so they get the full width instead.
+        meta_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        meta_note = QLabel(
+            "Saved in ucatsb_gui_config.yaml and reused for every flight — "
+            "these are properties of the campaign, not of one dataset, so "
+            "they are deliberately not written to a <dataset>_conf.yaml. "
+            "Edits here are not stored until Save defaults is pressed; "
+            "exporting uses what is in the boxes either way."
+        )
+        meta_note.setWordWrap(True)
+        meta_note.setStyleSheet(f"color: {MUTED_COLOR};")
+        meta_form.addRow(meta_note)
+
+        self.icartt_widgets = {}
+        for key, label, height, tooltip in self.ICARTT_FIELDS:
+            if height:
+                widget = QPlainTextEdit()
+                # Fixed, not a maximum: with only a maximum the form layout
+                # hands back whatever it likes (the special-comments box asked
+                # for 260 px and got 192, so the seeded text scrolled). The
+                # whole pane is inside a QScrollArea, so a tall box costs
+                # nothing but scrolling.
+                widget.setFixedHeight(height)
+                widget.textChanged.connect(self.on_icartt_meta_changed)
+            else:
+                widget = QLineEdit()
+                widget.textChanged.connect(self.on_icartt_meta_changed)
+            widget.setToolTip(tooltip)
+            meta_form.addRow(f"{label}:", widget)
+            self.icartt_widgets[key] = widget
+        ict_layout.addWidget(meta_box)
+
+        ict_row = QHBoxLayout()
+        self.icartt_save_button = QPushButton(self.ICARTT_SAVE_LABEL)
+        self.icartt_save_button.clicked.connect(self.on_save_icartt_meta)
+        self.export_icartt_button = QPushButton("Export ICARTT…")
+        self.export_icartt_button.setEnabled(False)
+        self.export_icartt_button.clicked.connect(self.on_export_icartt_clicked)
+        ict_row.addWidget(self.export_icartt_button)
+        ict_row.addWidget(self.icartt_save_button)
+        ict_row.addStretch(1)
+        ict_layout.addLayout(ict_row)
+        vbox.addWidget(ict_box)
+
+        vbox.addStretch(1)
+        self._apply_icartt_meta_to_controls(self.icartt_meta)
+        return pane
+
+    ICARTT_SAVE_LABEL = "Save defaults"
+
+    def _apply_icartt_meta_to_controls(self, meta):
+        """Populate the metadata form without marking it dirty -- the same
+        _loading guard the per-gas controls use, for the same reason
+        (setText fires textChanged immediately)."""
+        was_loading = self._loading
+        self._loading = True
+        for key, widget in self.icartt_widgets.items():
+            value = str(meta.get(key, "") or "")
+            if isinstance(widget, QPlainTextEdit):
+                widget.setPlainText(value)
+            else:
+                widget.setText(value)
+        self._loading = was_loading
+        self._update_icartt_save_state()
+
+    def _icartt_meta_from_controls(self):
+        """Every field must be listed in ICARTT_FIELDS: this rebuilds the dict
+        wholesale from the widgets, so a key with no widget would be dropped
+        on the next edit -- the same trap _controls_to_settings() has."""
+        return {
+            key: (widget.toPlainText() if isinstance(widget, QPlainTextEdit)
+                  else widget.text()).strip()
+            for key, widget in self.icartt_widgets.items()
+        }
+
+    def _icartt_is_dirty(self):
+        """A comparison against what was last saved, not a flag -- same
+        reasoning as _is_dirty(), and kept separate from it because the two
+        Save buttons write different files. Folding this into _current_state()
+        would make the per-dataset Save claim to cover app-level metadata it
+        does not write."""
+        return self._icartt_meta_from_controls() != self._saved_icartt_meta
+
+    def _update_icartt_save_state(self):
+        if not hasattr(self, "icartt_save_button"):
+            return
+        dirty = self._icartt_is_dirty()
+        self.icartt_save_button.setText(self.ICARTT_SAVE_LABEL + (" •" if dirty else ""))
+        self.icartt_save_button.setToolTip(
+            ("Unsaved changes. " if dirty else "No unsaved changes. ")
+            + f"Save writes these fields to {self.default_config_path.name} "
+              "as the defaults for every flight. Exporting uses whatever is "
+              "in the boxes, saved or not.")
+
+    def on_icartt_meta_changed(self):
+        if self._loading or self._initializing:
+            return
+        self._update_icartt_save_state()
+
+    def on_save_icartt_meta(self):
+        """Write the metadata to the app-level config as the new defaults."""
+        self.icartt_meta = self._icartt_meta_from_controls()
+        self._save_app_config()
+        self._saved_icartt_meta = copy.deepcopy(self.icartt_meta)
+        self._update_icartt_save_state()
+        self._flash_button(self.icartt_save_button,
+                           f"Saved to {self.default_config_path.name}",
+                           self._update_icartt_save_state)
+        return True
 
     def _apply_settings_to_controls(self, settings: dict):
         """Populate the controls from a per-gas settings dict without
@@ -1659,8 +2067,27 @@ class UcatsbGui(QMainWindow):
             return bool(self.on_save_clicked())
         return True
 
+    def _confirm_discard_icartt(self):
+        """Ask before losing unsaved ICARTT metadata. Asked separately from
+        _confirm_discard because the two Save buttons write different files:
+        one prompt offering to "save" would have to pick one of them, and
+        would silently not write the other."""
+        if not self._icartt_is_dirty():
+            return True
+        answer = QMessageBox.question(
+            self, "Unsaved ICARTT metadata",
+            f"The ICARTT header metadata has changed since it was last saved "
+            f"to {self.default_config_path.name}.\n\nSave it before quitting?",
+            QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
+            QMessageBox.Save)
+        if answer == QMessageBox.Cancel:
+            return False
+        if answer == QMessageBox.Save:
+            return bool(self.on_save_icartt_meta())
+        return True
+
     def closeEvent(self, event):
-        if self._confirm_discard("quitting"):
+        if self._confirm_discard("quitting") and self._confirm_discard_icartt():
             event.accept()
         else:
             event.ignore()
@@ -1764,9 +2191,15 @@ class UcatsbGui(QMainWindow):
     def _flash_button(self, button, message, restore, msec=1600):
         """Confirm an action in the button itself. A modal dialog for a
         one-click settings copy would cost more attention than the action is
-        worth, and a status bar would be invisible next to the button."""
+        worth, and a status bar would be invisible next to the button.
+
+        `restore` may be a callable, for a button whose resting label is
+        computed (the Save buttons carry a dirty marker) -- restoring a
+        literal string would drop a change made during the flash.
+        """
         button.setText(message)
-        QTimer.singleShot(msec, lambda: button.setText(restore))
+        QTimer.singleShot(msec, restore if callable(restore)
+                          else (lambda: button.setText(restore)))
 
     def on_cal_tank_changed(self, key, _index):
         """A different tank for cal0/cal1 -- rewrites which bottles matching
@@ -1847,29 +2280,230 @@ class UcatsbGui(QMainWindow):
             return
         self.refresh(preserve_view=True)
 
-    def on_export_clicked(self):
-        result = self._get_calibration()
-        if not (result and result.get("ok")):
+    # ---------------------------------------------------------------- export
+
+    def _to_raw_rows(self, series):
+        """Put a Series computed on the trimmed analysis frame back onto the
+        RAW file's row numbering.
+
+        drop_presync_rows both removes leading rows and resets the index, so
+        self.df row 0 is raw row `presync_dropped`. Everything the Export tab
+        writes goes through here, because the companion CSV's entire promise
+        is that its row N is the source file's row N -- an unshifted Series
+        would line every gas up a few dozen rows early, silently and
+        plausibly.
+        """
+        shifted = series.reset_index(drop=True)
+        offset = self.presync_dropped
+        if not offset:
+            return shifted
+        shifted.index = shifted.index + offset
+        return shifted.reindex(range(offset + len(shifted)))
+
+    def _export_gas_blocks(self):
+        """One block per gas in this file, for either exporter.
+
+        Built for every available gas rather than the one on display -- both
+        products are whole-flight deliverables, and the per-gas control panel
+        is the only reason the old export could describe just one. Each gas
+        is analysed with its own saved settings via _analysis_for /
+        _calibration_for, exactly as the Correlations tab does, so a gas
+        nobody has selected this session still exports correctly.
+        """
+        blocks = []
+        for gas_key in self.available_gases:
+            info = GASES[gas_key]
+            block = {
+                "gas": gas_key,
+                "short": info.get("short", gas_key),
+                "long_name": info.get("long_name", gas_key),
+                "standard_name": info.get("standard_name"),
+                "value_col": info["value_col"],
+                "unit": gas_unit(gas_key),
+                "raw": self.raw_df[info["value_col"]],
+                "masks": {},
+            }
+            if not info.get("has_masking", True):
+                # No cal bottles: the physical floor is the only correction
+                # there is, and calling the result "calibrated" would claim
+                # something nobody established.
+                rejected = self._rejected_mask(gas_key)
+                block["final"] = self._to_raw_rows(
+                    self.df[info["value_col"]].mask(rejected))
+                block["final_kind"] = "filtered"
+                block["masks"]["below_floor"] = self._to_raw_rows(rejected)
+                blocks.append(block)
+                continue
+
+            analysis = self._analysis_for(gas_key)
+            result = self._calibration_for(gas_key)
+            if result and result.get("ok"):
+                sigma, _ = self._uncertainty_for(gas_key)
+                block["final"] = self._to_raw_rows(result["calibrated"])
+                block["final_kind"] = "calibrated"
+                block["sigma"] = self._to_raw_rows(sigma)
+                block["slope"] = self._to_raw_rows(result["slope"])
+                block["intercept"] = self._to_raw_rows(result["intercept"])
+                block["masks"] = {
+                    "is_cal_period": self._to_raw_rows(result["in_cal"]),
+                    "is_post_cal_flush": self._to_raw_rows(result["flushed"]),
+                    "is_masked": self._to_raw_rows(result["excluded"]),
+                    "is_extrapolated": self._to_raw_rows(result["extrapolated"]),
+                }
+            else:
+                # No calibration is not a reason to export nothing for this
+                # gas: the masks are still the answer to "which rows are air",
+                # and they are what the raw column needs beside it.
+                block["reason"] = (result or {}).get("reason", "no calibration")
+                block["masks"] = {
+                    "is_cal_period": self._to_raw_rows(analysis["not_air"]),
+                    "is_post_cal_flush": self._to_raw_rows(analysis["post_cal_flush"]),
+                    "is_masked": self._to_raw_rows(analysis["exclude_mask"]),
+                }
+            blocks.append(block)
+        return blocks
+
+    def _update_export_summary(self):
+        """What the exports would contain right now, gas by gas.
+
+        Recomputed through the same _analysis_for/_calibration_for caches the
+        plots use, so the tab cannot claim a gas will export calibrated while
+        the Calibration tab is showing that it has no usable bottles.
+        """
+        if not hasattr(self, "export_summary_label"):
             return
-        default = ""
-        if self.csv_path:
-            default = str(self.csv_path.with_name(
-                f"{self.csv_path.stem}_{self.current_gas}_calibrated.csv"))
+        for widget in (self.export_csv_button, self.export_icartt_button):
+            widget.setEnabled(self.df is not None)
+        if self.df is None:
+            self.export_summary_label.setText("No file loaded.")
+            return
+
+        lines = []
+        for block in self._export_gas_blocks():
+            gas = block["gas"]
+            if block.get("final_kind") == "calibrated":
+                n = int(block["final"].notna().sum())
+                lines.append(f"{gas:<6} calibrated      {n:>7,} good ambient rows")
+            elif block.get("final_kind") == "filtered":
+                n = int(block["final"].notna().sum())
+                removed = int(block["masks"]["below_floor"].sum())
+                lines.append(f"{gas:<6} filtered only   {n:>7,} rows"
+                             + (f"   ({removed} below floor removed)" if removed else ""))
+            else:
+                lines.append(f"{gas:<6} NOT calibrated  {block.get('reason', '')}")
+        rows = len(self.raw_df)
+        lines.append("")
+        lines.append(f"{rows:,} rows in {self.csv_path.name}"
+                     + (f"  ({self.presync_dropped} pre-sync, blank in the CSV export)"
+                        if self.presync_dropped else ""))
+        _, _, usable = self._export_time_base()
+        unusable = int((~usable).sum())
+        if unusable:
+            lines.append(f"{unusable:,} row(s) have repeated or backward "
+                         f"timestamps and cannot go in the ICARTT file.")
+        self.export_summary_label.setText("\n".join(lines))
+
+    def _export_time_base(self):
+        """(start date, seconds-from-midnight, usable-row mask) for the raw
+        row set. Wrapped so the pre-sync count is passed at every call site --
+        forgetting it does not raise, it silently rejects most of the flight
+        (see icartt_time_base)."""
+        return icartt_time_base(self.raw_df["datetime"], self.presync_dropped)
+
+    def _export_default_path(self, suffix):
+        if not self.csv_path:
+            return ""
+        return str(self.csv_path.with_name(f"{self.csv_path.stem}{suffix}"))
+
+    def on_export_csv_clicked(self):
+        """Write the companion CSV: every gas, every row of the raw file."""
+        if self.df is None:
+            return
         path_str, _ = QFileDialog.getSaveFileName(
-            self, "Export calibrated CSV", default, "CSV Files (*.csv);;All Files (*)")
+            self, "Export derived CSV", self._export_default_path("_derived.csv"),
+            "CSV Files (*.csv);;All Files (*)")
+        if not path_str:
+            return
+        _, seconds, _ = self._export_time_base()
+        try:
+            summary = export_companion_csv(
+                Path(path_str), self.raw_df["datetime"], self._export_gas_blocks(),
+                source_path=self.csv_path,
+                include_raw=self.csv_raw_check.isChecked(),
+                include_masks=self.csv_masks_check.isChecked(),
+                include_coefficients=self.csv_coeff_check.isChecked(),
+                include_uncertainty=self.csv_unc_check.isChecked(),
+                presync_rows=self.presync_dropped,
+                comment_header=self.csv_comment_check.isChecked(),
+                time_seconds=seconds,
+            )
+        except OSError as e:
+            QMessageBox.warning(self, "Export CSV", f"Could not write {path_str}:\n{e}")
+            return
+        message = (f"Wrote {summary['path'].name}\n\n"
+                   f"{summary['rows']:,} rows × {len(summary['columns'])} columns.")
+        if summary["notes_path"]:
+            message += (f"\n\nThe provenance and column notes went to "
+                        f"{summary['notes_path'].name} rather than into the CSV, "
+                        f"so it opens cleanly in Excel and Igor.")
+        QMessageBox.information(self, "Export CSV", message)
+
+    def on_export_icartt_clicked(self):
+        """Write the ICARTT file, after warning about anything the format
+        will silently drop."""
+        if self.df is None:
+            return
+        meta = self._icartt_meta_from_controls()
+        missing = [label for label, key in
+                   (("PI name", "pi_name"), ("PI affiliation", "pi_affiliation"),
+                    ("Mission", "mission"), ("Platform", "platform"),
+                    ("Location ID", "location_id"))
+                   if not str(meta.get(key, "")).strip()]
+        if missing:
+            answer = QMessageBox.question(
+                self, "Incomplete metadata",
+                "These header fields are empty and will be written as N/A "
+                "(or defaulted in the file name):\n\n  " + "\n  ".join(missing)
+                + "\n\nAn archive will usually reject a file like this. "
+                  "Export anyway?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if answer != QMessageBox.Yes:
+                return
+
+        start_date, _, _ = self._export_time_base()
+        default = ""
+        if self.csv_path and start_date is not None:
+            default = str(self.csv_path.with_name(icartt_filename(meta, start_date)))
+        path_str, _ = QFileDialog.getSaveFileName(
+            self, "Export ICARTT", default, "ICARTT Files (*.ict);;All Files (*)")
         if not path_str:
             return
         try:
-            export_calibrated_csv(
-                Path(path_str), self.df, result,
-                GASES[self.current_gas]["value_col"], self.current_gas,
-                self.csv_path, self._controls_to_settings(),
-                analysis=self._get_analysis(),
+            summary = export_icartt(
+                Path(path_str), self.raw_df["datetime"], self._export_gas_blocks(),
+                meta=meta,
+                include_sigma=self.icartt_sigma_check.isChecked(),
+                drop_empty_rows=self.icartt_drop_check.isChecked(),
+                skip_leading=self.presync_dropped,
             )
-        except OSError as e:
-            QMessageBox.warning(self, "Export", f"Could not write {path_str}:\n{e}")
-        else:
-            QMessageBox.information(self, "Export", f"Wrote {path_str}")
+        except (OSError, ValueError) as e:
+            QMessageBox.warning(self, "Export ICARTT", f"Could not write {path_str}:\n{e}")
+            return
+        message = (f"Wrote {summary['path'].name}\n\n"
+                   f"{summary['rows']:,} data rows, {summary['header_lines']} "
+                   f"header lines.\nVariables: "
+                   + ", ".join(summary["variables"]))
+        # Said out loud rather than left in the header: a file that is shorter
+        # than the flight is the one thing about this format most likely to be
+        # noticed later and mistaken for lost data.
+        if summary["unusable_times"]:
+            message += (f"\n\n{summary['unusable_times']:,} row(s) omitted — "
+                        f"repeated or backward timestamps, which ICARTT's "
+                        f"independent variable cannot represent.")
+        if summary["empty_rows"]:
+            message += (f"\n\n{summary['empty_rows']:,} row(s) omitted as "
+                        f"having no value for any variable.")
+        QMessageBox.information(self, "Export ICARTT", message)
 
     def on_aux_changed(self, checked: bool):
         if not checked:
@@ -1939,6 +2573,8 @@ class UcatsbGui(QMainWindow):
             name = "corr"
         elif widget is self.main_pane:
             name = "main"
+        elif widget is self.export_pane:
+            name = "export"
         else:
             return
         if not self._dirty.get(name):
@@ -1948,6 +2584,11 @@ class UcatsbGui(QMainWindow):
             self.redraw_cal(preserve_view=preserve)
         elif name == "corr":
             self.redraw_corr(preserve_view=preserve)
+        elif name == "export":
+            # Not a plot, but it does read every gas's analysis, so it goes
+            # through the same dirty dispatch rather than recomputing five
+            # gases on every spin-box nudge while the tab happens to be open.
+            self._update_export_summary()
         else:
             self.redraw(preserve_view=preserve)
         self._dirty[name] = False
@@ -2173,17 +2814,15 @@ class UcatsbGui(QMainWindow):
         # legible rather than silently swapped in.
         calibration = self._get_calibration() if self.show_calibrated else None
         show_cal = bool(calibration and calibration.get("ok"))
-        self.export_button.setEnabled(bool(
-            (self._get_calibration() or {}).get("ok") if has_masking else False))
 
         # Registered as they are plotted rather than scraped back off the Axes
         # afterwards: the artists carry no units and no stable identity, and a
         # trace that is conditionally drawn would be easy to miss.
         self._stats_traces = {}
-        gas_unit = gas["ylabel"].split("(")[-1].rstrip(")") if "(" in gas["ylabel"] else ""
+        unit = gas_unit(self.current_gas)
         self._register_stats_trace(
             "main:raw", f"{self.current_gas} (raw)", ax, df["datetime"],
-            df[value_col], gas_unit)
+            df[value_col], unit)
 
         # A gas with a physical floor (Ozone) gets the same two-trace
         # treatment as a calibrated one -- raw blue underneath, the kept data
@@ -2206,7 +2845,7 @@ class UcatsbGui(QMainWindow):
             filtered = df[value_col].mask(rejected)
             self._register_stats_trace(
                 "main:filtered", f"{self.current_gas} (filtered)", ax,
-                df["datetime"], filtered, gas_unit)
+                df["datetime"], filtered, unit)
             keep = filtered.notna() | rejected
             filtered_line, = ax.plot(df["datetime"][keep], filtered[keep],
                                      color=CALIBRATED_COLOR, linewidth=1.2)
@@ -2222,7 +2861,7 @@ class UcatsbGui(QMainWindow):
             calibrated = calibration["calibrated"]
             self._register_stats_trace(
                 "main:cal", f"{self.current_gas} (calibrated)", ax,
-                df["datetime"], calibrated, gas_unit)
+                df["datetime"], calibrated, unit)
             keep = calibrated.notna() | calibration["blanked"]
             cal_df = pd.DataFrame({"datetime": df["datetime"][keep],
                                    "v": calibrated[keep]})
@@ -2250,7 +2889,7 @@ class UcatsbGui(QMainWindow):
                   else f"{gas['ylabel']} (ambient)"]
         if filtered_line is not None:
             handles.append(filtered_line)
-            labels.append(f"filtered (≥ {GASES[self.current_gas]['valid_min']:g} {gas_unit})")
+            labels.append(f"filtered (≥ {GASES[self.current_gas]['valid_min']:g} {unit})")
         if cal_line is not None:
             handles.append(cal_line)
             labels.append(f"calibrated ({calibration['mode']})")
@@ -2322,7 +2961,7 @@ class UcatsbGui(QMainWindow):
             floor = GASES[self.current_gas]["valid_min"]
             notes.append(
                 f"red = filtered, blue = raw; {int(rejected.sum())} reading"
-                f"{'' if rejected.sum() == 1 else 's'} below {floor:g} {gas_unit} "
+                f"{'' if rejected.sum() == 1 else 's'} below {floor:g} {unit} "
                 f"removed (sensor fault, not a measurement)"
             )
         notes_text = None
@@ -2512,7 +3151,7 @@ class UcatsbGui(QMainWindow):
         if result is None:
             return
         gas = GASES[self.current_gas]
-        unit = gas["ylabel"].split("(")[-1].rstrip(")")
+        unit = gas_unit(self.current_gas)
 
         # Only the response/coefficient/residual y-ranges are worth holding,
         # and only while they still mean the same thing -- a different gas or
@@ -2561,7 +3200,7 @@ class UcatsbGui(QMainWindow):
         none is just what Ozone is.
         """
         gas = GASES[gas_key]
-        unit = gas["ylabel"].split("(")[-1].rstrip(")")
+        unit = gas_unit(gas_key)
         if not gas.get("has_masking", True):
             # Filtered, matching the red trace on the timeseries: a -2292 ppb
             # fault is not a point on a tracer-tracer plot, it is an outlier

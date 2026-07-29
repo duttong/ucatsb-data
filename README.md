@@ -50,11 +50,12 @@ Left panel:
 - **Trace Above** — optionally add a smaller panel above the main plot: Detector Pressure, T_gas, or "Other". Detector Pressure/T_gas pull from whichever detector the active gas comes from (`d1` for CO2/N2O, `d2` for CH4). "Other" opens a combo box listing every remaining column in the loaded CSV (`oz_o3`, `oz_p`, `oz_t`, `j_sol_cals`, …), so anything in the file can be plotted without a dedicated control. A second combo box overlays any of those columns on a right-hand axis. "No Figure" returns to the single full-size plot.
 - **Data Masking** — warm-up exclusion (minutes from the start of the record), **End-flight exclude** (minutes from the *end* of the record — the descent is the busiest, least representative part of a flight, so trimming the tail is as routine as trimming the warm-up; default 0, measured back from the last timestamp there is, and shaded and labelled orange together with the warm-up as one exclusion at each end) and detector pressure tolerance (±mbar around 140 mbar). These are applied to the raw data *before* cal means are computed, not just drawn as bands — a cal point can disappear entirely if its averaging window has no valid data left. **Pumps on** (default off) keeps only data recorded with the sample pumps running (`j_pumps = 1`) — air measured with the pumps off is not ambient air. It has to default to off: a lab test or bench calibration runs pumps-off from end to end (the 2026-07-26 file is 100% pumps-off), and enabling it there would leave nothing at all. A row with no `j_pumps` value counts as pumps-off, since an unknown pump state is not evidence the pumps were running; a file whose schema predates the column greys the toggle out. Like warm-up and pressure it feeds the cal means as well as the plot, and its spans are shaded violet. **Flag Air** (0–90 s, default 0 = off) additionally drops the air data immediately following each cal injection, while the detector cells are still clearing cal gas; unlike the other two it affects only the calibrated product, never the cal means or the raw trace. See [Post-cal flush](#post-cal-flush-flag-air). **Copy settings to all gases** applies these three values *and both cal mean windows* to every calibrated gas (CO2/N2O/CH4 — Ozone has no masking at all), since they describe the instrument on this flight rather than the species. Only the drift model and its smoothing window are left alone, being a judgement about how noisy that gas's own cal record is. Settings remain per-gas; the button is a shortcut, not a mode.
 - **Cal Mean Windows** — one box per cal bottle, titled dynamically from `cals.yaml`: e.g. "50% Cal (CB09960) 206.51 ppm", or just "Cal (CC470901) 402.037 ppm" for a tank with no `info` label. The mole fraction shown is that tank's assigned value for whichever gas is currently active. Each box has a start/end offset in seconds relative to the last point in that calibration period (`Cal_p`), e.g. `-10 s` to `2 s` = `[Cal_p-10s, Cal_p+2s]` (positive values are allowed, reaching past `Cal_p`). Settings are saved per-gas to the flight's own `<dataset>_conf.yaml` (see [Per-flight settings](#per-flight-settings-dataset_confyaml)) and reloaded whenever that dataset is opened again.
-- **Calibration** — drift model and smoothing window for the two-point calibration, a toggle to overlay the calibrated series on the main plot, and a CSV export. See [Calibration](#calibration) below.
+- **Calibration** — drift model and smoothing window for the two-point calibration, and a toggle to overlay the calibrated series on the main plot. See [Calibration](#calibration) below. Writing files out is the [Export](#export) tab's job, not this panel's — both products cover every gas at once, while everything here is per gas.
 
-The **Timeseries**, **Calibration** and **Cal Tanks** tabs share this one
-control panel — every control affects all three. The **Correlations** tab
-brings its own panel instead (see [Correlations](#correlations)).
+The **Timeseries**, **Calibration**, **Cal Tanks** and **Export** tabs share
+this one control panel — every control affects all of them. The
+**Correlations** tab brings its own panel instead (see
+[Correlations](#correlations)).
 
 Zooming/panning (via the matplotlib toolbar) is preserved across masking, averaging, and upper-trace changes — only the Home button, a gas change, and a cal-tank change reset to full scale.
 
@@ -103,9 +104,10 @@ whatever you named it is found; `File > Load Configuration…` opens one by name
 from anywhere, or switches configuration without reloading the CSV.
 
 A dataset with no config starts from the **shipped defaults**. There is no
-app-level template: `ucatsb_gui_config.yaml` now holds only the recent-files
-list, and inheriting one flight's tuning into another silently is exactly what
-per-dataset configs exist to prevent.
+app-level template: `ucatsb_gui_config.yaml` holds no analysis settings at all
+— only the recent-files list and the [ICARTT header
+metadata](#header-metadata) — and inheriting one flight's tuning into another
+silently is exactly what per-dataset configs exist to prevent.
 
 ### Cal Tanks tab
 
@@ -318,7 +320,8 @@ It behaves differently from the warm-up and pressure masks, deliberately:
   which is disjoint from the cal-mean windows, so no cal point can be lost to
   it and the calibration coefficients are identical with it on or off.
 - **The export flags rather than deletes.** Flagged rows are written with
-  `is_post_cal_flush=True`, a blank `<col>_cal`, and the raw column untouched.
+  `<gas>_is_post_cal_flush=1`, a blank `<gas>_cal`, and the raw column
+  untouched.
 
 How long the flush actually takes is instrument- and flight-specific — measure
 it rather than assuming. On the two reference flights, the median offset from
@@ -422,22 +425,148 @@ period can be recomputed if it is ever wanted.
   calibration's inputs. The toggle is session-only and defaults off, so the app
   never starts up showing calibrated data without being asked. Note this is
   *this repo's* calibration, not the CSV's own `*c_ppm`/`*c_ppb` columns.
-- **Export calibrated CSV…** writes every row (flagged, never pre-filtered)
-  with `<col>_cal`, `cal_slope`, `cal_intercept`, `is_extrapolated`,
-  `is_post_cal_flush`, `is_cal_period` and `is_masked`, behind a `#` comment
-  block recording the source file, tank serials and assigned values, span
-  gain, leave-one-out RMS, control settings, any warnings, and what a blank
-  `<col>_cal` means. Read it back with `pd.read_csv(path, comment="#")`.
+
+Writing this calibration out to a file is the [Export](#export) tab's job.
 
 ### When there is no calibration
 
-The tab shows a single centred sentence instead of panels, and the export
-button is disabled. This happens for Ozone (its own sensor, not run through the
+The tab shows a single centred sentence instead of panels, and the Export tab
+reports the gas as `NOT calibrated` with the same reason. This happens for
+Ozone (its own sensor, not run through the
 cal-bottle system), when no cal events survive the current masking (the message
 quotes the warm-up and tolerance in force, so it is directly actionable), and
 when `cals.yaml` has no assigned value for the active gas. A flight with only
 one usable tank degrades to an offset-only correction (`mode: offset`, slope
 fixed at 1) rather than refusing outright, and says so in the header.
+
+## Export
+
+The **Export** tab writes two files, both covering **all five gases** (CO2,
+N2O, CH4, O3, H2O — whichever the loaded CSV actually has). It is its own tab
+rather than a button in the left panel because both products are whole-flight
+deliverables, while every control in that panel is per gas.
+
+At the top, **What will be exported** lists each gas as it stands under the
+current settings — calibrated, filtered-only, or `NOT calibrated` with the
+reason — along with the row counts, so you can see what you are about to write
+before you write it.
+
+### Derived CSV — the companion to the raw file
+
+Meant to sit **beside** the acquisition CSV, not replace it. It has **one row
+for every row of the raw file, in the same order**, so the two can be opened
+side by side, or pasted together, in Excel or Igor Pro with no alignment step
+at all. The pre-sync rows the analysis drops (see [Data
+assumptions](#data-assumptions)) are still present, blank in the derived
+columns and flagged in a `presync` column, precisely so that promise holds — a
+quiet offset of a few dozen rows between two files that *look* alignable is an
+effective way to corrupt an analysis.
+
+Columns, per gas:
+
+| Column | What it is |
+|---|---|
+| `<gas>_cal` | the calibrated good-ambient record (blank where it is not good ambient) |
+| `<gas>_cal_unc` | 1σ on that value |
+| `<gas>_cal_slope`, `<gas>_cal_intercept` | the coefficients, on **every** row, so a blank row can be recomputed |
+| `<gas>_is_cal_period`, `<gas>_is_post_cal_flush`, `<gas>_is_masked`, `<gas>_is_extrapolated` | why a row is blank |
+| `<gas>_filtered`, `<gas>_below_floor` | for O3 and H2O, which have no cal bottles — the raw value with below-floor faults removed |
+
+plus `datetime`, `time_s` (seconds from midnight UTC, which Igor and Excel
+both plot far more readily than a parsed date), and the raw value columns
+under their original names.
+
+- **Masks are written as 1/0**, not `True`/`False`, which Igor loads as a text
+  wave and Excel as text. A blank mask cell means "not evaluated" (a pre-sync
+  row), not "false".
+- **The raw echo columns are exact copies of the source columns**, pre-sync
+  rows included — those rows have an unreliable *clock*, not an unreliable
+  *reading*. Uncheck *Include the raw value columns* to keep the file strictly
+  complementary.
+- **The provenance notes go to a sidecar `<name>_notes.txt` by default**,
+  because neither Excel nor Igor skips a leading `#` comment block without
+  being told to. Tick *Put the provenance notes in the CSV as # lines* for a
+  self-contained file you read back with `pd.read_csv(path, comment="#")`.
+- **A gas with no calibration still exports** its raw column and its masks —
+  which rows were air is a useful answer whether or not there is a
+  calibration — and the notes say why it is uncalibrated.
+
+### ICARTT (.ict)
+
+The archive format (file format index 1001), for delivering the flight. Good
+ambient data only: every row the analysis blanked is written as the format's
+missing value, `-99999`, which is exactly what that flag means — so no mask
+columns are written or needed. Time is seconds from midnight UTC on the data
+start date, counting past 86400 for a flight that crosses midnight. A gas with
+no calibration is left out of the file entirely, rather than delivered as
+uncalibrated counts under a calibrated-looking name.
+
+Two things it will tell you about after writing, and both are worth reading:
+
+- **Rows with repeated or backward timestamps are dropped** (1,435 of them in
+  the Feb 2025 file). ICARTT's independent variable must increase strictly, so
+  a duplicate makes the file *invalid* rather than merely untidy. Better to
+  see the count here than to have an archive's validator find it.
+- **Rows with no value for any gas are dropped** by default — a row that is
+  `-99999` in every column carries nothing but a timestamp. Untick *Drop rows
+  with no value for any gas* to keep the time base unbroken.
+
+The file follows the conventions of the **sister UCATS instrument's delivered
+files** rather than generic ICARTT practice, so a campaign's UCATS and UCATS-B
+files can be processed the same way: missing data is `-99999`, units carry the
+trailing `v` (`ppmv`/`ppbv`), variable lines are
+`name, unit, standard_name, description`, and the 1σ variable for a species is
+`<species>e_<suffix>` — `CO2e_UCATSB` beside `CO2_UCATSB`.
+
+The `standard_name` field is not free text: it comes from the NASA ESDS
+Atmospheric Composition Variable Standard Names Convention that ICARTT V2.0
+requires, built as
+`MeasurementCategory_CoreName_AcquisitionMethod_DescriptiveAttributes`. For a
+trace gas the attributes are the measurement specificity (`S` for a single
+species) and how the value is reported (`DMF` = molar fraction with respect to
+dry air), giving `Gas_CO2_InSitu_S_DMF` for CO2, N2O and CH4.
+
+Two gases depart from that pattern. **H2O is `Met_H2OMF_InSitu_None`**: water
+vapour is not a `Gas` name in the convention at all, but a `Met` one, and
+`H2OMF` is a mole fraction with respect to ambient air. **Ozone is
+`Gas_O3_InSitu_S_AVMR`**: a volumetric mixing ratio with respect to ambient
+air, since nothing dries the 2B monitor's sample stream. Both live in
+`GASES[gas]["standard_name"]`.
+
+#### Header metadata
+
+The **Header metadata** form fills in everything the header carries that
+cannot be derived from the data, in the order the file itself uses. Two fields
+are computed for you rather than typed:
+
+- `UNCERTAINTY` gets the **median 1σ actually computed for each gas**, with
+  anything you type appended after it. A hand-typed uncertainty goes stale the
+  moment a drift model or cal window changes.
+- `ULOD_FLAG`/`LLOD_FLAG` are constants of the format (-7777 / -8888); only
+  the LOD *values* are yours to set, and default to `N/A`.
+
+Two fields are written into the file **verbatim**, line breaks and all,
+because they are whole sections rather than single keyword values:
+
+- **Special comments** — free text, and in the delivered UCATS files this is
+  where the error estimates are explained and users are asked to contact the
+  PIs. What you type is the whole section; nothing is appended to it.
+- **Revision history** — one `R#: description` per line, and it
+  **accumulates**: an R0 file still lists its RA line above the R0 one. Add a
+  line here each time you bump `Revision`.
+
+`Data ID`, `Location ID` and `Revision` also build the suggested file name,
+`dataID_locationID_YYYYMMDD_R#.ict` (hyphens are kept, so `SABRE-UCATSB`
+works; underscores are stripped, since `_` separates the name's own fields). Leaving the PI, mission, platform or
+location ID blank is allowed but prompts first, since an archive will normally
+reject a file like that.
+
+**The metadata is saved in `ucatsb_gui_config.yaml`, not in the flight's own
+config** — the PI, affiliation, project and stipulations are properties of the
+campaign, so storing them per flight would mean retyping them for every file.
+**Save defaults** is what writes them; a `•` on the button means there are
+unsaved changes, and quitting with changes prompts. Exporting always uses
+what is in the boxes, saved or not, so a one-off mission name needs no save.
 
 ## Correlations
 
@@ -602,6 +731,6 @@ roster changes.
 |---|---|
 | `ucatsb_gui.py` | PyQt5 interactive viewer |
 | `plot_co2_timeseries.py` | Shared masking/cal-detection logic + standalone static-figure CLI |
-| `ucatsb_gui_config.yaml` | Per-gas masking/averaging settings, auto-saved by the GUI; the template a newly-opened flight starts from, plus the recent-files list. **Local and gitignored** — it holds absolute paths from whichever machine ran it, and the app recreates it from `DEFAULT_GAS_SETTINGS` when it is absent |
+| `ucatsb_gui_config.yaml` | App-level, holding no analysis settings at all: the recent-files list and the [ICARTT header metadata](#header-metadata). Analysis settings live per dataset (see [Per-flight settings](#per-flight-settings-configs)). **Local and gitignored** — it holds absolute paths from whichever machine ran it, and the app recreates it when absent |
 | `<dataset>_conf.yaml` | Written beside each loaded CSV: that flight's own per-gas settings **and** its cal-tank pairing |
 | `cals.yaml` | Full cal tank roster + which two are assigned for the current run (local copy of `~/code/ucats-b/cals.yaml`) |
