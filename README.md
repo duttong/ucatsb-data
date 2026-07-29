@@ -42,7 +42,7 @@ Left panel:
   forgotten, and is dropped only if opening it actually fails. Two datasets
   with the same name in different directories are disambiguated by their
   parent directory (`ucatsb-20250218All.csv — 20250218`). The list lives in
-  `ucatsb_gui_config.yaml`, never in a flight's conf, and opening a recent
+  `.ucatsb_gui_state.yaml`, never in a flight's conf, and opening a recent
   file restores that flight's own settings as any other load does. Launching
   with no argument still starts empty — nothing is opened for you.
 - **Save…** — writes the current settings to a config file (see [Per-flight settings](#per-flight-settings-configs)). **Nothing is saved automatically**; a `•` on the button means there are unsaved changes.
@@ -104,10 +104,10 @@ whatever you named it is found; `File > Load Configuration…` opens one by name
 from anywhere, or switches configuration without reloading the CSV.
 
 A dataset with no config starts from the **shipped defaults**. There is no
-app-level template: `ucatsb_gui_config.yaml` holds no analysis settings at all
-— only the recent-files list and the [ICARTT header
-metadata](#header-metadata) — and inheriting one flight's tuning into another
-silently is exactly what per-dataset configs exist to prevent.
+app-level template: neither app-level file holds analysis settings at all —
+only the [ICARTT header metadata](#header-metadata) and the recent-files list —
+and inheriting one flight's tuning into another silently is exactly what
+per-dataset configs exist to prevent.
 
 ### Cal Tanks tab
 
@@ -564,6 +564,8 @@ reject a file like that.
 **The metadata is saved in `ucatsb_gui_config.yaml`, not in the flight's own
 config** — the PI, affiliation, project and stipulations are properties of the
 campaign, so storing them per flight would mean retyping them for every file.
+That file is tracked in the repository, so a fresh clone arrives with the
+campaign already filled in rather than needing it retyped per machine.
 **Save defaults** is what writes them; a `•` on the button means there are
 unsaved changes, and quitting with changes prompts. Exporting always uses
 what is in the boxes, saved or not, so a one-off mission name needs no save.
@@ -731,6 +733,7 @@ roster changes.
 |---|---|
 | `ucatsb_gui.py` | PyQt5 interactive viewer |
 | `plot_co2_timeseries.py` | Shared masking/cal-detection logic + standalone static-figure CLI |
-| `ucatsb_gui_config.yaml` | App-level, holding no analysis settings at all: the recent-files list and the [ICARTT header metadata](#header-metadata). Analysis settings live per dataset (see [Per-flight settings](#per-flight-settings-configs)). **Local and gitignored** — it holds absolute paths from whichever machine ran it, and the app recreates it when absent |
+| `ucatsb_gui_config.yaml` | App-level and **shared through the repository**: the [ICARTT header metadata](#header-metadata), which describes the campaign rather than one machine. No analysis settings — those live per dataset (see [Per-flight settings](#per-flight-settings-configs)). Written only by **Save defaults** |
+| `.ucatsb_gui_state.yaml` | App-level and **local, gitignored, hidden**: the recent-files list, which is absolute paths from whichever machine ran it. Rewritten on every dataset load — which is why it is not in the file above — and recreated when absent |
 | `<dataset>_conf.yaml` | Written beside each loaded CSV: that flight's own per-gas settings **and** its cal-tank pairing |
 | `cals.yaml` | Full cal tank roster + which two are assigned for the current run (local copy of `~/code/ucats-b/cals.yaml`) |

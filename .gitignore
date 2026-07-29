@@ -3,11 +3,18 @@ __pycache__/
 *.csv
 *.png
 
-# Local viewer state: per-gas settings and the recent-files list, which holds
-# absolute paths from whichever machine ran it. The app recreates it from
-# DEFAULT_GAS_SETTINGS when absent, and the analysis state that matters
-# travels with each flight in its own <dataset>_conf.yaml.
-ucatsb_gui_config.yaml
+# Local viewer state: the recent-files list, which holds absolute paths from
+# whichever machine ran it. Hidden because the app maintains it and there is
+# nothing in it to hand-edit; it is recreated when absent.
+#
+# Its companion `ucatsb_gui_config.yaml` is deliberately NOT ignored: that
+# file holds the ICARTT header metadata, which describes the campaign rather
+# than one machine, so a fresh clone should arrive with it already filled in.
+# Splitting the two is what makes tracking it practical -- the recent list is
+# rewritten on every dataset load, and while they shared a file that file was
+# permanently modified in the working tree.
+.ucatsb_gui_state.yaml
 
-# Written beside each loaded CSV by the viewer.
+# Written beside each loaded CSV by the viewer: per-flight analysis settings
+# travel with the flight, not with the repository.
 *_conf.yaml

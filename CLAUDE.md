@@ -253,11 +253,12 @@ the GUI's Cal Tanks tab overrides it per flight and stores the choice in
 records a tank swap on the *current* run; it is no longer the only way to
 analyse a flight that flew something else.
 
-Not every roster tank has an `info` field (a rough round-number label like
-`50%`/`100%` for the original two tanks; the newer ones added don't have an
-obvious equivalent) — `_cal_box_title` in `ucatsb_gui.py` treats it as
-optional and still shows the serial + mole fraction without it, so don't
-reintroduce a hard dependency on `info` being present.
+`info` is a rough round-number label (`50%`/`100%`) used only to title the
+cal-window boxes. Every tank in the roster carries one as of 2026-07-29, but
+it stays **optional**: `_cal_box_title` in `ucatsb_gui.py` shows the serial +
+mole fraction without it rather than losing the title, so don't reintroduce a
+hard dependency on `info` being present — the next tank added to the roster
+may well arrive without one.
 
 ### Cal bottle identity is matched by concentration, not trusted from config
 
@@ -427,8 +428,8 @@ file is exactly as it was. So:
   name first — applying one silently and asking via `_choose_config_file`
   when there are several, with a "start from defaults" option.
 - **There is no template.** `load_config(None)` gives `DEFAULT_GAS_SETTINGS`,
-  and `ucatsb_gui_config.yaml` holds no analysis settings at all — only
-  `recent_files` and `icartt` (see the Export tab). Seeding one flight's
+  and neither app-level file holds analysis settings at all — only `icartt`
+  (see the Export tab) and `recent_files`. Seeding one flight's
   settings from another silently is what per-dataset configs exist to prevent,
   and the same argument already applied to the tank pairing. The ICARTT
   metadata is the deliberate exception, and is not a *setting*: it describes
@@ -512,10 +513,12 @@ New masking settings default to a **no-op value** (`flag_air_s: 0`,
 `DEFAULT_GAS_SETTINGS`, so a non-zero default would silently change the
 output of every already-saved config on first launch after the upgrade.
 
-**Verification scripts must pass `config_path=` to a scratch file *and* load
-a scratch copy of the CSV.** `UcatsbGui` writes the real
-`ucatsb_gui_config.yaml` (the recent-files list) whenever a dataset loads, so
-point that at a scratch path. Settings themselves are no longer written
+**Verification scripts must pass `config_path=` *and* `state_path=` to scratch
+files *and* load a scratch copy of the CSV.** `UcatsbGui` writes the real
+`.ucatsb_gui_state.yaml` (the recent-files list) whenever a dataset loads, so
+point that at a scratch path; `config_path` matters less now that only Save
+defaults writes it, but a test exercising that button would edit a *tracked*
+file. Settings themselves are no longer written
 without Save, but a test that exercises Save writes a config beside the CSV —
 so copy the CSV into the scratchpad rather than pointing the test at
 `~/Data/UCATSb/...`. Drive Save by monkeypatching
@@ -838,7 +841,27 @@ campaign meets one convention across both instruments:
   (`SABRE-UCATS-GC_WB57_...`); the first version stripped all non-alphanumerics
   and silently mangled it to `SABREUCATSGC`.
 
-#### ICARTT metadata lives in the APP-level config
+#### ICARTT metadata lives in the APP-level config — the SHARED one
+
+There are **two** app-level files beside the script, split by whether their
+contents are worth sharing, and the split is what lets the first one be
+tracked in git at all:
+
+- **`ucatsb_gui_config.yaml` — ICARTT metadata, tracked.** The campaign's PI,
+  affiliation, project and stipulations are the same on every machine, so a
+  fresh clone should arrive with them filled in. Written by exactly one
+  thing, `_save_shared_config`, called only from the **Save defaults** button.
+- **`.ucatsb_gui_state.yaml` — the recent-files list, gitignored.** Absolute
+  paths from one machine, useless to anyone else. Hidden because the app
+  maintains it and there is nothing in it to hand-edit. Written by
+  `_save_state`, called on **every dataset load** — which is precisely why it
+  cannot share a file with the tracked one: it would leave that file
+  permanently modified in the working tree, and commit one machine's paths.
+
+`load_recent_files(path, legacy_path=)` reads the shared config as a fallback
+so an upgrading user does not silently lose the list; the stale
+`recent_files:` block there is never written back, and the first
+`Save defaults` drops it.
 
 `icartt:` in `ucatsb_gui_config.yaml`, not in a `<dataset>_conf.yaml`
 (explicitly requested): PI, affiliation, project and stipulations are
@@ -850,9 +873,10 @@ buttons write *different files*, and one prompt offering to "save" would have
 to pick one and silently not write the other. Dirty state is a comparison, not
 a flag, for the same reason as `_is_dirty()`.
 
-`_save_app_config` must pass **both** `recent_files=` and `icartt_meta=` every
-time: `save_config` writes a fresh document, so a recent-file update that
-forgets the metadata deletes it, and vice versa. Adding a metadata field means
+`save_config` writes a **fresh document**, so an omitted block is a deletion.
+That used to be a live hazard here — while one file held both blocks, every
+write had to remember both or delete the other. One block per file retired it;
+don't reintroduce a writer that carries two. Adding a metadata field means
 adding it to `DEFAULT_ICARTT_META` *and* `ICARTT_FIELDS` — `_icartt_meta_from_controls`
 rebuilds the dict wholesale from the widgets, the same trap
 `_controls_to_settings()` has.

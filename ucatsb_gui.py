@@ -171,7 +171,23 @@ def aux_trace_info(selection: str, gas: str, other_column: str = None):
         return other_column, other_column
     return None
 
+# TWO app-level files beside the script, split by whether the contents are
+# worth sharing:
+#
+# - `ucatsb_gui_config.yaml` holds the ICARTT header metadata and is TRACKED
+#   IN GIT. PI, affiliation, project and stipulations describe the campaign,
+#   so every machine analysing a SABRE flight wants the same values and a
+#   fresh clone should arrive with them already filled in.
+# - `.ucatsb_gui_state.yaml` holds the recent-files list and is not. It is
+#   absolute paths from one machine, of no use to anyone else, and hidden
+#   because the app maintains it -- there is nothing in it to hand-edit.
+#
+# The split is what makes tracking the first file practical: the recent list
+# is rewritten on **every dataset load**, so while the two shared a file that
+# file was permanently modified in the working tree. The shared one is now
+# written only by the Export tab's "Save defaults" button.
 DEFAULT_CONFIG_PATH = Path(__file__).parent / "ucatsb_gui_config.yaml"
+DEFAULT_STATE_PATH = Path(__file__).parent / ".ucatsb_gui_state.yaml"
 RECENT_FILES_MAX = 10
 
 # What the Correlations tab can color points by: {key: (label, column,
@@ -250,15 +266,23 @@ def load_config(path: Path) -> dict:
     return config
 
 
-def load_recent_files(path: Path) -> list:
-    """The recently-opened datasets from the app-level config, newest first.
+def load_recent_files(path: Path, legacy_path: Path = None) -> list:
+    """The recently-opened datasets from the app-level state file, newest first.
 
     App-level and never per-flight, the mirror image of `cals:` (which is
     flight-only): "files I have been working on" is a property of the person,
     not of any one dataset, and writing it into a flight's conf would put a
     list of unrelated paths beside that flight's settings.
+
+    `legacy_path` is the shared config, where this list used to live before
+    the two were split. It is read only when the state file has nothing, and
+    never written back there -- the next save lands in the state file and the
+    stale block in the shared config is simply ignored from then on. Without
+    this a user upgrading loses a list they never asked to lose.
     """
     loaded = _read_yaml(path).get("recent_files")
+    if not isinstance(loaded, list) and legacy_path is not None:
+        loaded = _read_yaml(legacy_path).get("recent_files")
     if not isinstance(loaded, list):
         return []
     return list(dict.fromkeys(p for p in loaded if isinstance(p, str)))[:RECENT_FILES_MAX]
@@ -329,16 +353,17 @@ _BlockStyleDumper.add_representer(str, _represent_str)
 def save_config(path: Path, config: dict, cal_selection: dict = None,
                 recent_files: list = None, icartt_meta: dict = None):
     """Write the per-gas blocks, plus whichever of the non-gas blocks belongs
-    in this file: the tank selection for a flight's own conf, the recent-file
-    list and the ICARTT header metadata for the app-level config. Never both
-    kinds -- see load_cal_selection, load_recent_files and load_icartt_meta
-    for why each lives where it does.
+    in this file: the tank selection for a flight's own conf, the ICARTT
+    header metadata for the shared app config, the recent-file list for the
+    app state file. **One block per file** -- see load_cal_selection,
+    load_icartt_meta and load_recent_files for why each lives where it does.
 
-    This writes a *fresh* document, so an omitted block is a deletion: an
-    app-level write that forgets `recent_files=` wipes the list and one that
-    forgets `icartt_meta=` wipes the metadata, the same trap the per-gas
-    settings have with _controls_to_settings(). _save_app_config passes both,
-    every time, for exactly that reason.
+    This writes a *fresh* document, so an omitted block is a deletion, the
+    same trap the per-gas settings have with _controls_to_settings(). That
+    used to be a live hazard here, when the shared config carried both the
+    recent list and the metadata and every write had to remember both; the
+    split into two files retired it, and passing one block per call is now
+    the only correct use.
     """
     doc = dict(config)
     if cal_selection:
@@ -531,7 +556,8 @@ class PlotPane(QWidget):
 
 
 class UcatsbGui(QMainWindow):
-    def __init__(self, csv_path: Path = None, config_path: Path = DEFAULT_CONFIG_PATH):
+    def __init__(self, csv_path: Path = None, config_path: Path = DEFAULT_CONFIG_PATH,
+                 state_path: Path = DEFAULT_STATE_PATH):
         super().__init__()
         self.setWindowTitle("UCATS-B Viewer")
         self.resize(1300, 750)
@@ -544,16 +570,22 @@ class UcatsbGui(QMainWindow):
         self.available_gases = {}
         self.other_columns = []
 
-        # Two config files, with different jobs. The app-level one is now
-        # only the recent-files store -- it holds no analysis settings.
-        # config_path is the per-dataset config file Save writes to (and the
-        # name its dialog offers); config_loaded_from is the one actually
-        # opened, or None when the dataset started from defaults.
+        # THREE config files, with different jobs, and none of them holds
+        # analysis settings for another's business:
+        #   default_config_path  shared, tracked  -- ICARTT header metadata
+        #   state_path           local, hidden    -- the recent-files list
+        #   config_path          per dataset      -- this flight's settings
+        # config_path is the one Save writes to (and the name its dialog
+        # offers); config_loaded_from is the file actually opened, or None
+        # when the dataset started from defaults.
         self.default_config_path = config_path
+        self.state_path = state_path
         self.config_path = None
         self.config_loaded_from = None
         self.config = load_config(None)
-        self.recent_files = load_recent_files(config_path)
+        # legacy_path picks up a list left in the shared config by a version
+        # before the two files were split; see load_recent_files.
+        self.recent_files = load_recent_files(state_path, legacy_path=config_path)
         # ICARTT header metadata: app-level, not per-dataset (see
         # load_icartt_meta), with its own Save button on the Export tab and
         # its own saved-state snapshot -- the per-dataset Save writes a
@@ -1041,13 +1073,13 @@ class UcatsbGui(QMainWindow):
         self.recent_files = ([resolved]
                              + [p for p in self.recent_files if p != resolved])
         del self.recent_files[RECENT_FILES_MAX:]
-        self._save_app_config()
+        self._save_state()
         self._rebuild_recent_menus()
 
     def _forget_recent(self, csv_path: Path):
         resolved = str(Path(csv_path).resolve())
         self.recent_files = [p for p in self.recent_files if p != resolved]
-        self._save_app_config()
+        self._save_state()
         self._rebuild_recent_menus()
 
     # Both of these are triggered FROM an action that the work itself deletes:
@@ -1060,20 +1092,25 @@ class UcatsbGui(QMainWindow):
 
     def _clear_recent_now(self):
         self.recent_files = []
-        self._save_app_config()
+        self._save_state()
         self._rebuild_recent_menus()
 
-    def _save_app_config(self):
-        """Write the app-level config. Always carries BOTH of its blocks --
-        see save_config: it writes a fresh document, so whichever block this
-        forgets is deleted. A recent-file update must not wipe the ICARTT
-        metadata, nor the reverse."""
+    def _save_state(self):
+        """Write the local state file: the recent-files list, and nothing
+        else. Called on every dataset load, which is exactly why it is not
+        the shared config -- see DEFAULT_STATE_PATH."""
         try:
-            # No gas blocks: this file carries no analysis settings, only the
-            # recent-file list and the ICARTT header defaults.
-            save_config(self.default_config_path, {},
-                        recent_files=self.recent_files,
-                        icartt_meta=self.icartt_meta)
+            save_config(self.state_path, {}, recent_files=self.recent_files)
+        except OSError as e:
+            print(f"Warning: could not write {self.state_path}: {e}")
+
+    def _save_shared_config(self):
+        """Write the shared, git-tracked config: the ICARTT header metadata,
+        and nothing else. Only the Export tab's "Save defaults" button calls
+        this, so a tracked file does not churn as flights are opened."""
+        try:
+            # No gas blocks: this file carries no analysis settings.
+            save_config(self.default_config_path, {}, icartt_meta=self.icartt_meta)
         except OSError as e:
             print(f"Warning: could not write {self.default_config_path}: {e}")
 
@@ -1788,6 +1825,8 @@ class UcatsbGui(QMainWindow):
             "Saved in ucatsb_gui_config.yaml and reused for every flight — "
             "these are properties of the campaign, not of one dataset, so "
             "they are deliberately not written to a <dataset>_conf.yaml. "
+            "That file is shared through the repository, so a fresh checkout "
+            "arrives with the campaign already filled in. "
             "Edits here are not stored until Save defaults is pressed; "
             "exporting uses what is in the boxes either way."
         )
@@ -1882,9 +1921,11 @@ class UcatsbGui(QMainWindow):
         self._update_icartt_save_state()
 
     def on_save_icartt_meta(self):
-        """Write the metadata to the app-level config as the new defaults."""
+        """Write the metadata to the shared config as the new defaults. The
+        only writer of that file, which is what keeps a tracked file from
+        churning every time a dataset is opened."""
         self.icartt_meta = self._icartt_meta_from_controls()
-        self._save_app_config()
+        self._save_shared_config()
         self._saved_icartt_meta = copy.deepcopy(self.icartt_meta)
         self._update_icartt_save_state()
         self._flash_button(self.icartt_save_button,
