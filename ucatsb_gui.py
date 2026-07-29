@@ -24,6 +24,7 @@ from PyQt5.QtWidgets import (
     QGroupBox, QComboBox, QDoubleSpinBox, QSpinBox, QLabel,
     QButtonGroup, QRadioButton, QPushButton, QFileDialog, QMessageBox,
     QTabWidget, QCheckBox, QAction, QStackedWidget, QMenu,
+    QDialog, QDialogButtonBox,
 )
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg, NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
@@ -35,7 +36,7 @@ from plot_co2_timeseries import (
     shade_intervals, cal_mean_points, load_cal_roster, load_cal_assignment,
     select_cal_bottles,
     most_common_serial, mean_std_label, calibrate_series, post_cal_flush_mask,
-    cal_switch_mask, below_floor_mask, O3_VALID_MIN_PPB,
+    cal_switch_mask, below_floor_mask, O3_VALID_MIN_PPB, H2O_VALID_MIN_PPM,
     box_stats, calibration_uncertainty, linear_fit,
     plot_calibration_panels, export_calibrated_csv,
     CALS_YAML_PATH, CAL_DRIFT_MODELS, CAL_DEFAULT_SMOOTH_EVENTS,
@@ -71,13 +72,16 @@ GASES = {
     # isn't run through the cal-bottle system -- has_masking=False skips the
     # warm-up/pressure-tol/cal-window machinery entirely for this gas, and
     # detector=None disables the Detector Pressure/T_gas aux traces (there's
-    # no matching column to route to). Kept last so it sorts to the bottom
-    # of the Gas combo box.
+    # no matching column to route to). These two are kept last so they sort
+    # to the bottom of the Gas combo box, after the cal-bottle gases.
     # valid_min is a *physical floor*, not one of the maskable settings:
     # below it the sensor is faulting, not measuring. Declared per gas rather
     # than special-cased by name so the filtering code stays generic -- any
     # gas that gains a floor gets the same raw/filtered treatment.
     "Ozone": {"value_col": "oz_o3best", "ylabel": "O3 (ppb)", "title": "UCATS-B O3 timeseries", "detector": None, "has_masking": False, "valid_min": O3_VALID_MIN_PPB},
+    # Water vapour, from its own instrument (`w_*` columns) -- like Ozone it
+    # has no cal bottles, so has_masking=False and it is plotted as recorded.
+    "H2O": {"value_col": "w_H2Obest", "ylabel": "H2O (ppm)", "title": "UCATS-B H2O timeseries", "detector": None, "has_masking": False, "valid_min": H2O_VALID_MIN_PPM},
 }
 
 REQUIRED_COLUMNS = [
@@ -165,7 +169,7 @@ def flight_config_path(csv_path: Path) -> Path:
 
 
 def _read_yaml(path: Path) -> dict:
-    if not path.exists():
+    if path is None or not path.exists():
         return {}
     try:
         return yaml.safe_load(path.read_text()) or {}
@@ -174,18 +178,24 @@ def _read_yaml(path: Path) -> dict:
         return {}
 
 
-def load_config(path: Path, template: dict = None) -> dict:
-    """Load per-gas control settings, filling in anything missing from
-    `template` (the app-level config, for a flight being opened for the first
-    time) or from DEFAULT_GAS_SETTINGS. Gases with has_masking=False (Ozone)
-    never get an entry -- they don't use warm-up/pressure-tol/cal-window
-    settings at all.
+def load_config(path: Path) -> dict:
+    """Load per-gas control settings, filling anything missing from
+    DEFAULT_GAS_SETTINGS. `path=None` (or a file that does not exist) gives
+    the defaults outright, which is what a dataset with no saved config gets.
 
-    Gas blocks only. The tank selection shares the same file but is kept out
-    of this dict deliberately -- see load_cal_selection.
+    There is deliberately no template/seeding path: settings are never
+    written without an explicit Save, so there is no continuously-updated
+    app-level template to inherit from, and inheriting one flight's tuning
+    into another silently is what the per-dataset config files exist to
+    prevent.
+
+    Gas blocks only. Gases with has_masking=False (Ozone, H2O) never get an
+    entry -- they don't use warm-up/pressure-tol/cal-window settings at all.
+    The tank selection shares the same file but is kept out of this dict
+    deliberately -- see load_cal_selection.
     """
     config = {
-        gas: copy.deepcopy((template or {}).get(gas) or DEFAULT_GAS_SETTINGS)
+        gas: copy.deepcopy(DEFAULT_GAS_SETTINGS)
         for gas, info in GASES.items() if info.get("has_masking", True)
     }
     for gas, settings in config.items():
@@ -440,14 +450,18 @@ class UcatsbGui(QMainWindow):
         self.available_gases = {}
         self.other_columns = []
 
-        # Two config files, with different jobs: the app-level one is the
-        # template a never-before-opened flight starts from, and config_path
-        # is whatever is currently authoritative -- the flight's own
-        # <dataset>_conf.yaml once a dataset is loaded.
+        # Two config files, with different jobs. The app-level one is now
+        # only the recent-files store -- it holds no analysis settings.
+        # config_path is the per-dataset config file Save writes to (and the
+        # name its dialog offers); config_loaded_from is the one actually
+        # opened, or None when the dataset started from defaults.
         self.default_config_path = config_path
-        self.config_path = config_path
-        self.config = load_config(config_path)
+        self.config_path = None
+        self.config_loaded_from = None
+        self.config = load_config(None)
         self.recent_files = load_recent_files(config_path)
+        # None until a dataset is open; _is_dirty() stays False before that.
+        self._saved_state = None
         self.current_gas = None
         self.aux_selection = "No Figure"
         self.other_column = None
@@ -501,6 +515,11 @@ class UcatsbGui(QMainWindow):
         self.open_action.setShortcut("Ctrl+O")   # Qt maps this to ⌘O on macOS
         self.open_action.triggered.connect(self.on_load_data_clicked)
         self.recent_menu = QMenu(self)
+        self.load_config_action = QAction("Load Configuration…", self)
+        self.load_config_action.triggered.connect(self.on_load_config_clicked)
+        self.save_action = QAction("Save Configuration…", self)
+        self.save_action.setShortcut("Ctrl+S")
+        self.save_action.triggered.connect(self.on_save_clicked)
         self._build_menu_bar()
 
         central = QWidget()
@@ -570,7 +589,7 @@ class UcatsbGui(QMainWindow):
         self.other_column = other_columns[0] if other_columns else None
         self.right_axis_column = None
 
-        self._adopt_flight_config(csv_path)
+        self._load_flight_config(csv_path)
         # After the commit above, so a file that failed validation never
         # enters the list. main() loads through here too, which is why a
         # dataset opened from the command line is remembered as well.
@@ -613,30 +632,89 @@ class UcatsbGui(QMainWindow):
         if not self._initializing:
             self.refresh()
 
-    def _adopt_flight_config(self, csv_path: Path):
-        """Switch to this dataset's own <dataset>_conf.yaml, seeding it from
-        the app-level config the first time the flight is opened, and write it
-        out immediately so the file exists (with every gas in it) from the
-        moment the data is loaded rather than only once a control is touched.
+    def _config_candidates(self, csv_path: Path):
+        """Config files that belong to this dataset, default first.
 
-        If the dataset's directory can't be written to -- a read-only archive
-        or a mounted share -- the app falls back to the app-level config
-        rather than failing the load, and says so once. Losing per-flight
-        persistence is worth less than losing the ability to open the file.
+        Any `<dataset stem>*.yaml` beside the CSV: Save lets the name be
+        changed freely, so `..._conf.yaml`, `..._tight_conf.yaml` and
+        `..._v2.yaml` are all the same dataset's configs, while another
+        flight's are excluded by the stem.
         """
-        path = flight_config_path(csv_path)
-        template = load_config(self.default_config_path)
-        self.config = load_config(path, template=template)
-        self.cal_selection = load_cal_selection(path, self.default_cal_selection)
-        self._rebuild_cal_bottles()
+        default = flight_config_path(csv_path)
+        found = sorted(p for p in csv_path.parent.glob(f"{csv_path.stem}*.yaml")
+                       if p.is_file())
+        return ([default] if default in found else []) + [p for p in found if p != default]
 
-        self.config_path = path
-        try:
-            save_config(path, self.config, self.cal_selection)
-        except OSError as e:
-            print(f"Warning: could not write {path}: {e}")
-            self.config_path = self.default_config_path
+    def _load_flight_config(self, csv_path: Path):
+        """Apply a config for the dataset being opened -- **without writing
+        anything**.
+
+        Loading a dataset must leave the disk exactly as it found it: the
+        whole point of the explicit Save is that you can open a saved
+        analysis, experiment, and quit without disturbing it. So there is no
+        write here, and no seeding from an app-level template either -- a
+        flight with no config starts from DEFAULT_GAS_SETTINGS.
+
+        One config is applied silently; several bring up the chooser, since
+        picking for the user would be picking wrong half the time.
+        """
+        candidates = self._config_candidates(csv_path)
+        chosen = candidates[0] if len(candidates) == 1 else None
+        if len(candidates) > 1:
+            chosen = self._choose_config_file(csv_path, candidates)
+
+        self._apply_config_file(chosen, fallback_name=flight_config_path(csv_path))
+
+    def _apply_config_file(self, path: Path, fallback_name: Path = None):
+        """Load settings + tank selection from `path` (None = shipped
+        defaults) and take them as the new saved state."""
+        self.config = load_config(path) if path else load_config(None)
+        self.cal_selection = (load_cal_selection(path, self.default_cal_selection)
+                              if path else dict(self.default_cal_selection))
+        self._rebuild_cal_bottles()
+        # config_path is what Save offers as the default filename. With no
+        # config loaded that is the conventional name for this dataset, so
+        # the first Save lands where the next open will look.
+        self.config_path = path or fallback_name
+        self.config_loaded_from = path
+        self._snapshot_state()
         self._apply_cal_selection_to_controls()
+
+    def _choose_config_file(self, csv_path: Path, candidates):
+        """Ask which of several configs to open. Returns a path, or None for
+        "start from defaults". Cancel keeps the default (first) entry, since
+        the dataset is already committed by the time this runs."""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Choose configuration")
+        layout = QVBoxLayout(dialog)
+        label = QLabel(f"{csv_path.name} has {len(candidates)} saved "
+                       f"configurations. Which one should be opened?")
+        label.setWordWrap(True)
+        layout.addWidget(label)
+
+        group = QButtonGroup(dialog)
+        buttons = []
+        for i, path in enumerate(candidates):
+            rb = QRadioButton(path.name + ("   (default name)" if i == 0 else ""))
+            rb.setToolTip(str(path))
+            rb.setChecked(i == 0)
+            group.addButton(rb)
+            layout.addWidget(rb)
+            buttons.append((rb, path))
+        none_rb = QRadioButton("Start from defaults (open nothing)")
+        group.addButton(none_rb)
+        layout.addWidget(none_rb)
+
+        box = QDialogButtonBox(QDialogButtonBox.Open | QDialogButtonBox.Cancel)
+        box.accepted.connect(dialog.accept)
+        box.rejected.connect(dialog.reject)
+        layout.addWidget(box)
+
+        if dialog.exec_() != QDialog.Accepted:
+            return candidates[0]
+        if none_rb.isChecked():
+            return None
+        return next(path for rb, path in buttons if rb.isChecked())
 
     def _build_corr_controls(self):
         """Controls for the Correlations tab only (see the stack comment in
@@ -777,6 +855,8 @@ class UcatsbGui(QMainWindow):
                                               self.cal_selection.values())
 
     def on_load_data_clicked(self):
+        if not self._confirm_discard("loading another dataset"):
+            return
         start_dir = str(self.csv_path.parent) if self.csv_path else str(Path.cwd())
         path_str, _ = QFileDialog.getOpenFileName(
             self, "Load UCATS-B CSV", start_dir, "CSV Files (*.csv);;All Files (*)"
@@ -810,6 +890,9 @@ class UcatsbGui(QMainWindow):
         file_menu = self.menuBar().addMenu("&File")
         file_menu.addAction(self.open_action)
         self.file_recent_menu = file_menu.addMenu("Open Recent")
+        file_menu.addSeparator()
+        file_menu.addAction(self.load_config_action)
+        file_menu.addAction(self.save_action)
         self._rebuild_recent_menus()
 
     def _remember_recent(self, csv_path: Path):
@@ -844,7 +927,9 @@ class UcatsbGui(QMainWindow):
         """Write the app-level config. Always carries recent_files -- see
         save_config: an omitted block is a deletion."""
         try:
-            save_config(self.default_config_path, self.config,
+            # Only the recent-files list: this file no longer carries analysis
+            # settings, so it has no gas blocks to write.
+            save_config(self.default_config_path, {},
                         recent_files=self.recent_files)
         except OSError as e:
             print(f"Warning: could not write {self.default_config_path}: {e}")
@@ -911,6 +996,8 @@ class UcatsbGui(QMainWindow):
         path = Path(path_str)
         if path == self.csv_path:
             return
+        if not self._confirm_discard("loading another dataset"):
+            return
         self._try_load(path, forget_on_failure=True)
 
     def _build_controls(self):
@@ -921,9 +1008,15 @@ class UcatsbGui(QMainWindow):
         # The menu IS the button's action (no clicked handler): pressing it
         # opens "Open File… / recent files / Clear", and setMenu also gives
         # the button its native dropdown indicator.
+        load_row = QHBoxLayout()
+        load_row.setSpacing(6)
         load_button = QPushButton("Load Data")
         load_button.setMenu(self.recent_menu)
-        vbox.addWidget(load_button)
+        load_row.addWidget(load_button, 1)
+        self.save_button = QPushButton(self.SAVE_LABEL)
+        self.save_button.clicked.connect(self.on_save_clicked)
+        load_row.addWidget(self.save_button)
+        vbox.addLayout(load_row)
 
         # Just the name -- the panel is 300 px wide and a full path would
         # either clip or force the panel wider. The full path is the tooltip.
@@ -1320,8 +1413,12 @@ class UcatsbGui(QMainWindow):
             self.tank_conf_label.setText(
                 "No dataset loaded — this is cals.yaml's default pairing. "
                 "Load a flight to save a choice against it.")
+        elif self.config_loaded_from is not None:
+            self.tank_conf_label.setText(
+                f"From {self.config_loaded_from.name} — Save to keep changes")
         else:
-            self.tank_conf_label.setText(f"Saved in {self.config_path.name}")
+            self.tank_conf_label.setText(
+                f"Not saved yet — Save… offers {self.config_path.name}")
 
     def _apply_settings_to_controls(self, settings: dict):
         """Populate the controls from a per-gas settings dict without
@@ -1385,36 +1482,122 @@ class UcatsbGui(QMainWindow):
         self.drift_model = settings["drift_model"]
         self.drift_smooth_events = settings["drift_smooth_events"]
         self.smooth_spin.setEnabled(self.drift_model == "smooth")
-        self._save_settings()
+        self._mark_dirty()
         self.refresh(preserve_view=True)
 
-    def _save_settings(self):
-        """Persist to the flight's conf file, and to the app-level config as
-        the template the next never-before-opened flight starts from. Both,
-        because either alone loses something: the flight file alone means
-        every new flight reverts to shipped defaults, and the app-level file
-        alone is what the per-flight requirement exists to replace.
+    def _current_state(self):
+        """Everything a config file holds, as comparable plain data."""
+        return copy.deepcopy({"config": self.config, "cals": self.cal_selection})
 
-        Tank choices only ever reach the flight file (see load_cal_selection),
-        and the recent-file list only the app-level one (load_recent_files).
+    def _snapshot_state(self):
+        """Take the current settings as "saved" -- called after a load or a
+        successful save, and nowhere else."""
+        self._saved_state = self._current_state()
+        self._update_save_state()
+
+    def _is_dirty(self):
+        """Settings differ from the last load/save.
+
+        A comparison rather than a flag set by every handler: a flag has to be
+        cleared in as many places as it is set, and gets it wrong when a
+        change is undone. Editing a spin box back to where it started leaves
+        nothing to save, and this says so.
         """
-        targets = [self.config_path]
-        if self.config_path != self.default_config_path:
-            targets.append(self.default_config_path)
-        for path in targets:
-            # Each file gets only the block that belongs in it, keyed off what
-            # the path *is* rather than off loop position: when a dataset's
-            # directory is unwritable, config_path falls back to the app-level
-            # file, and the tank selection must not follow it there.
-            app_level = path == self.default_config_path
-            try:
-                save_config(
-                    path, self.config,
-                    cal_selection=None if app_level else self.cal_selection,
-                    recent_files=self.recent_files if app_level else None,
-                )
-            except OSError as e:
-                print(f"Warning: could not write {path}: {e}")
+        return self._saved_state is not None and self._current_state() != self._saved_state
+
+    def _update_save_state(self):
+        """Mark the Save button when there is something to save."""
+        if not hasattr(self, "save_button"):
+            return
+        dirty = self._is_dirty()
+        self.save_button.setText(self.SAVE_LABEL + (" •" if dirty else ""))
+        name = self.config_path.name if self.config_path else "a new file"
+        self.save_button.setToolTip(
+            ("Unsaved changes. " if dirty else "No unsaved changes. ")
+            + f"Save writes a config file — the dialog offers {name}, and any "
+              "other name saves a second configuration of the same dataset."
+        )
+
+    def _mark_dirty(self):
+        """Settings changed. Nothing is written -- this only updates the
+        Save button. Replaces the old auto-save so that opening a saved
+        analysis, experimenting and quitting leaves the file untouched."""
+        self._update_save_state()
+
+    def on_save_clicked(self):
+        """Write the current settings to a config file of the user's choosing.
+
+        Save-as every time, deliberately: the request was to keep several
+        configurations per dataset, so the filename is always offered for
+        editing rather than silently overwriting whatever was opened.
+        """
+        if self.df is None:
+            return
+        default = str(self.config_path or flight_config_path(self.csv_path))
+        path_str, _ = QFileDialog.getSaveFileName(
+            self, "Save configuration", default, "YAML Files (*.yaml);;All Files (*)")
+        if not path_str:
+            return False
+        path = Path(path_str)
+        try:
+            save_config(path, self.config, cal_selection=self.cal_selection)
+        except OSError as e:
+            QMessageBox.warning(self, "Save configuration",
+                                f"Could not write {path.name}:\n{e}")
+            return False
+        self.config_path = path
+        self.config_loaded_from = path
+        self._snapshot_state()
+        self._update_tank_readout()
+        return True
+
+    def on_load_config_clicked(self):
+        """Open a config file by name -- for one saved somewhere the
+        dataset-stem search would not find it, or to switch configurations
+        without reloading the CSV."""
+        if self.df is None:
+            return
+        if not self._confirm_discard("opening another configuration"):
+            return
+        start = str(self.config_path or self.csv_path.parent)
+        path_str, _ = QFileDialog.getOpenFileName(
+            self, "Load configuration", start, "YAML Files (*.yaml);;All Files (*)")
+        if not path_str:
+            return
+        self._apply_config_file(Path(path_str))
+        self._select_gas(self.current_gas)
+        self._update_tank_readout()
+        self.refresh()
+
+    def _confirm_discard(self, action_label):
+        """Ask before losing unsaved settings. True = go ahead.
+
+        Only ever asked when something actually changed, so the prompt stays
+        meaningful; "Don't Save" is the stated goal (quit without disturbing
+        the state you started from), and Cancel aborts whatever triggered it.
+        """
+        if not self._is_dirty():
+            return True
+        name = self.config_path.name if self.config_path else "this configuration"
+        answer = QMessageBox.question(
+            self, "Unsaved changes",
+            f"Settings have changed since {name} was opened.\n\n"
+            f"Save them before {action_label}?",
+            QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
+            QMessageBox.Save)
+        if answer == QMessageBox.Cancel:
+            return False
+        if answer == QMessageBox.Save:
+            return bool(self.on_save_clicked())
+        return True
+
+    def closeEvent(self, event):
+        if self._confirm_discard("quitting"):
+            event.accept()
+        else:
+            event.ignore()
+
+    SAVE_LABEL = "Save…"
 
     # What the button copies: the masking values and both cal mean windows.
     # The drift model and its smoothing window are the only per-gas settings
@@ -1449,7 +1632,7 @@ class UcatsbGui(QMainWindow):
             # window silently change the others.
             self.config[gas].update(
                 {key: copy.deepcopy(live[key]) for key in self.COPIED_SETTING_KEYS})
-        self._save_settings()
+        self._mark_dirty()
         # No refresh: the current gas's own settings are unchanged, so the
         # plots are still correct. The other gases redraw when selected.
         self._flash_button(self.copy_mask_button,
@@ -1527,7 +1710,7 @@ class UcatsbGui(QMainWindow):
         self.cal_selection[key] = serial
         self._rebuild_cal_bottles()
         self._update_tank_readout()
-        self._save_settings()
+        self._mark_dirty()
         # Full rescale, like a gas change and unlike every other control: the
         # Calibration tab's top panel plots measured MINUS ASSIGNED, so a new
         # tank shifts it by the difference in assigned values (11 ppm between
@@ -1541,7 +1724,7 @@ class UcatsbGui(QMainWindow):
         self.cal_selection = dict(self.default_cal_selection)
         self._rebuild_cal_bottles()
         self._apply_cal_selection_to_controls()
-        self._save_settings()
+        self._mark_dirty()
         self.refresh(preserve_view=False)
 
     def on_stats_box(self, ax, x0, x1, y0, y1):

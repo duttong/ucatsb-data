@@ -407,45 +407,46 @@ mask, calibration or setting, so going through `refresh()` would clear both
 per-gas caches and dirty every pane — making a marker-size nudge recompute
 two gases' analyses and redraw the timeseries.
 
-### Config persistence: two files with different jobs
+### Config persistence: explicit save only
 
 Settings live in one block per gas (`warmup_min`, `pressure_tol_mbar`,
 `flag_air_s`, `cal1_window_s`, `cal2_window_s`, `drift_model`,
-`drift_smooth_events`), auto-saved on every control change via
-`on_control_changed` → `_save_settings`, which writes **both**:
+`drift_smooth_events`) plus the flight's `cals:` pairing, in a YAML file
+beside the CSV. **Nothing is written without `on_save_clicked`.** The
+requirement driving this: open a saved analysis, experiment, quit — and the
+file is exactly as it was. So:
 
-- `<dataset>_conf.yaml` beside the loaded CSV (`flight_config_path`) — the
-  authoritative file for that flight, and the only one that carries the
-  cal-tank pairing. Created by `_adopt_flight_config` at load time, not
-  lazily on first edit, so the file exists (with every gas in it) as soon as
-  the data is open.
-- `ucatsb_gui_config.yaml` (`self.default_config_path`) — now a *template*:
-  what a flight that has no conf file yet starts from, so converged settings
-  carry to the next flight instead of reverting to `DEFAULT_GAS_SETTINGS`.
+- `_load_flight_config` **writes nothing** (the old `_adopt_flight_config`
+  created the file at load time; that is gone). It picks a config via
+  `_config_candidates` — any `<dataset stem>*.yaml` beside the CSV, default
+  name first — applying one silently and asking via `_choose_config_file`
+  when there are several, with a "start from defaults" option.
+- **There is no template.** `load_config(None)` gives `DEFAULT_GAS_SETTINGS`,
+  and `ucatsb_gui_config.yaml` now holds *only* `recent_files`. Seeding one
+  flight's settings from another silently is what per-dataset configs exist to
+  prevent, and the same argument already applied to the tank pairing.
+- `config_path` is the name Save offers; `config_loaded_from` is the file
+  actually opened, or None when the dataset started from defaults. They differ
+  exactly in that case, which is what the Cal Tanks readout reports.
+- Save is **save-as every time**: several configs per dataset was the point,
+  so the filename is always offered for editing rather than overwriting what
+  was opened.
 
-`self.config_path` is whichever is authoritative right now, and falls back to
-the app-level path if the dataset's directory is unwritable (`OSError` on
-the first save) — a read-only archive must not make a file unopenable.
+**Dirty state is a comparison, not a flag.** `_is_dirty()` deep-compares
+`_current_state()` (config + cal_selection) against `_saved_state`, snapshotted
+by `_snapshot_state()` at load and after a successful save — the only two
+places. A flag would need clearing in as many places as it is set and would
+still be wrong when a change is *undone*; the comparison reports "nothing to
+save" when a spin box goes back to where it started. `_mark_dirty()` therefore
+only refreshes the button, and `_confirm_discard()` prompts (Save / Discard /
+Cancel) from `closeEvent`, `on_load_data_clicked` and `_open_recent_now`.
 
-**The tank pairing is deliberately not in `self.config` and never templated.**
-It lives in `self.cal_selection`, is read by `load_cal_selection` and written
-by `save_config`'s optional `cal_selection` argument, and defaults to
-`cals.yaml`'s own `cals:` block for any flight without a conf file. Seeding it
-from the app-level file instead would apply the last-opened flight's tanks to
-a different flight silently — the one failure mode the Cal Tanks tab exists to
-prevent, and one that corrupts every calibrated number for every gas at once
-while still looking plausible.
-
-**Two non-gas blocks, each in exactly one file, and `save_config` writes a
-*fresh* document.** `cals:` goes only to a flight's conf; `recent_files:` only
-to the app-level one. So an omitted argument is a *deletion*: an app-level
-`save_config` that forgets `recent_files=` wipes the recent list, exactly the
-trap `_controls_to_settings()` has for per-gas keys. `_save_settings` decides
-per target from `path == self.default_config_path` rather than from loop
-position, because `config_path` *is* the app-level path when a dataset's
-directory turned out to be unwritable, and the tank selection must not follow
-it there. `_save_app_config()` is the only other writer and always passes the
-list.
+**`save_config` writes a *fresh* document, so an omitted argument is a
+deletion.** `cals:` goes only to a dataset config; `recent_files:` only to the
+app-level file (`_save_app_config`, which passes `{}` for the gas blocks
+because that file no longer carries any). An app-level write that forgets
+`recent_files=` wipes the list — the same trap `_controls_to_settings()` has
+for per-gas keys.
 
 `_initializing`/`_loading` flags exist specifically to suppress redraw/save
 during programmatic widget setup (e.g. `setChecked` on a freshly-constructed
@@ -455,8 +456,8 @@ depend on exist yet) — keep that guard pattern when adding new controls.
 **Adding a persisted setting requires four edits, not one.**
 `on_control_changed` assigns `self.config[gas] = self._controls_to_settings()`
 — a *fresh* dict — so a key missing from `_controls_to_settings()` is
-silently dropped from the file on the next control change, even though
-`load_config`'s `.update()` appeared to preserve it. Touch all of:
+silently dropped on the next control change (and from the next save), even
+though `load_config`'s `.update()` appeared to preserve it. Touch all of:
 `DEFAULT_GAS_SETTINGS`, `_controls_to_settings()`,
 `_apply_settings_to_controls()`, and the `setEnabled(has_masking)` list in
 `_select_gas()`. (A control added *inside* an existing group box — as
@@ -487,12 +488,13 @@ output of every already-saved config on first launch after the upgrade.
 
 **Verification scripts must pass `config_path=` to a scratch file *and* load
 a scratch copy of the CSV.** `UcatsbGui` writes the real
-`ucatsb_gui_config.yaml` on any programmatic `setValue`, so an offscreen test
-that drives controls will otherwise silently overwrite the user's saved
-settings — and then the numbers in the next run won't match, which is
-confusing to debug. Since loading a dataset now also writes
-`<dataset>_conf.yaml` into that dataset's directory, copy the CSV into the
-scratchpad first rather than pointing the test at `~/Data/UCATSb/...`.
+`ucatsb_gui_config.yaml` (the recent-files list) whenever a dataset loads, so
+point that at a scratch path. Settings themselves are no longer written
+without Save, but a test that exercises Save writes a config beside the CSV —
+so copy the CSV into the scratchpad rather than pointing the test at
+`~/Data/UCATSb/...`. Drive Save by monkeypatching
+`QFileDialog.getSaveFileName`, and the config chooser by patching
+`UcatsbGui._choose_config_file`; both are what `check_save.py` does.
 
 ### Correlations tab and `calibration_uncertainty`
 
@@ -600,12 +602,19 @@ when opening one actually fails (`_try_load(..., forget_on_failure=True)`).
 
 ### `valid_min`: a physical floor, not a maskable setting
 
-`GASES["Ozone"]["valid_min"] = O3_VALID_MIN_PPB` (−15 ppb) drives
+`GASES["Ozone"]["valid_min"] = O3_VALID_MIN_PPB` (−15 ppb) and
+`GASES["H2O"]["valid_min"] = H2O_VALID_MIN_PPM` (−5 ppm) drive
 `below_floor_mask`, via `UcatsbGui._rejected_mask(gas)`. Declared per gas
 rather than special-cased by name, so any gas that gains a floor gets the same
 raw/filtered treatment for free — and *not* a control, because it is a
 statement about when the sensor is faulting rather than a judgement the user
-should be tuning per flight.
+should be tuning per flight. The H2O floor is precautionary: the Jul 2026
+flight's minimum `w_H2Obest` is +14 ppm, so it currently removes nothing.
+
+The two floor gases are also the two with `has_masking=False` — no cal
+bottles, so no warm-up/pressure/cal-window machinery and no calibration.
+Anything iterating gases must not assume a cal-bottle gas: check
+`has_masking` (see the Correlations tab's `_corr_axis`).
 
 - **The floor is well below zero deliberately.** Real near-zero ozone scatters
   negative; the Feb 2025 flight has 168 readings in −15..0 ppb (noise about a

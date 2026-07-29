@@ -82,6 +82,12 @@ def merge_close_intervals(intervals, gap):
 # the low end upward and hide how noisy the instrument actually is.
 O3_VALID_MIN_PPB = -15.0
 
+# Same idea for the water vapour instrument. Precautionary rather than
+# demonstrated: the Jul 2026 flight has no w_H2Obest reading below -5 ppm at
+# all (its minimum is +14), so this removes nothing today and exists to catch
+# the fault mode when it appears.
+H2O_VALID_MIN_PPM = -5.0
+
 
 def below_floor_mask(values, floor):
     """Flag readings below a physical floor as instrument faults.

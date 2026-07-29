@@ -45,7 +45,8 @@ Left panel:
   `ucatsb_gui_config.yaml`, never in a flight's conf, and opening a recent
   file restores that flight's own settings as any other load does. Launching
   with no argument still starts empty — nothing is opened for you.
-- **Gas** — switch the main plot between CO2 (`d1_CO2_ppm`), N2O (`d1_N2O_ppb`), and CH4 (`d2_CH4_ppb`), all uncalibrated. Only gases whose column exists in the loaded CSV are offered.
+- **Save…** — writes the current settings to a config file (see [Per-flight settings](#per-flight-settings-configs)). **Nothing is saved automatically**; a `•` on the button means there are unsaved changes.
+- **Gas** — switch the main plot between CO2 (`d1_CO2_ppm`), N2O (`d1_N2O_ppb`), CH4 (`d2_CH4_ppb`), O3 (`oz_o3best`) and H2O (`w_H2Obest`), all uncalibrated. Only gases whose column exists in the loaded CSV are offered. O3 and H2O come from their own instruments rather than an Aeris detector, so they have no cal bottles and no masking controls — each has a validity floor instead (see [Validity floors](#validity-floors)).
 - **Trace Above** — optionally add a smaller panel above the main plot: Detector Pressure, T_gas, or "Other". Detector Pressure/T_gas pull from whichever detector the active gas comes from (`d1` for CO2/N2O, `d2` for CH4). "Other" opens a combo box listing every remaining column in the loaded CSV (`oz_o3`, `oz_p`, `oz_t`, `j_sol_cals`, …), so anything in the file can be plotted without a dedicated control. A second combo box overlays any of those columns on a right-hand axis. "No Figure" returns to the single full-size plot.
 - **Data Masking** — warm-up exclusion (minutes from the start of the record) and detector pressure tolerance (±mbar around 140 mbar). Both are applied to the raw data *before* cal means are computed, not just drawn as bands — a cal point can disappear entirely if its averaging window has no valid data left. **Flag Air** (0–90 s, default 0 = off) additionally drops the air data immediately following each cal injection, while the detector cells are still clearing cal gas; unlike the other two it affects only the calibrated product, never the cal means or the raw trace. See [Post-cal flush](#post-cal-flush-flag-air). **Copy settings to all gases** applies these three values *and both cal mean windows* to every calibrated gas (CO2/N2O/CH4 — Ozone has no masking at all), since they describe the instrument on this flight rather than the species. Only the drift model and its smoothing window are left alone, being a judgement about how noisy that gas's own cal record is. Settings remain per-gas; the button is a shortcut, not a mode.
 - **Cal Mean Windows** — one box per cal bottle, titled dynamically from `cals.yaml`: e.g. "50% Cal (CB09960) 206.51 ppm", or just "Cal (CC470901) 402.037 ppm" for a tank with no `info` label. The mole fraction shown is that tank's assigned value for whichever gas is currently active. Each box has a start/end offset in seconds relative to the last point in that calibration period (`Cal_p`), e.g. `-10 s` to `2 s` = `[Cal_p-10s, Cal_p+2s]` (positive values are allowed, reaching past `Cal_p`). Settings are saved per-gas to the flight's own `<dataset>_conf.yaml` (see [Per-flight settings](#per-flight-settings-dataset_confyaml)) and reloaded whenever that dataset is opened again.
@@ -57,20 +58,12 @@ brings its own panel instead (see [Correlations](#correlations)).
 
 Zooming/panning (via the matplotlib toolbar) is preserved across masking, averaging, and upper-trace changes — only the Home button, a gas change, and a cal-tank change reset to full scale.
 
-### Per-flight settings (`<dataset>_conf.yaml`)
+### Per-flight settings (configs)
 
 Settings belong to the flight, not to the app: the right warm-up, pressure
 tolerance, cal windows and — above all — cal tanks are properties of the
-dataset. So when a CSV is loaded, the viewer writes a settings file **next to
-that CSV**, named after it:
-
-```
-/path/to/ucatsb-2025021816.csv
-/path/to/ucatsb-2025021816_conf.yaml    <- created on load
-```
-
-It holds a block for every gas plus the flight's cal-tank pairing, and is
-rewritten on every control change:
+dataset. They are kept in a YAML file beside the CSV, holding a block per gas
+plus that flight's cal-tank pairing:
 
 ```yaml
 cals:
@@ -88,22 +81,31 @@ N2O:
   ...
 ```
 
-Reopening that CSV — in any session, from any directory — restores exactly
-those choices. `ucatsb_gui.py`'s own `ucatsb_gui_config.yaml` keeps working as
-before, but its job is now to be the **template** a flight opened for the
-first time starts from, so the settings you have converged on carry over to
-the next flight instead of reverting to shipped defaults. Two things follow:
+**Nothing is written unless you press Save.** Opening a saved analysis,
+changing things, and quitting leaves the file exactly as you found it. In
+particular, loading a dataset creates no file at all.
 
-- Editing a control writes both files (the flight's, and the template).
-- The **tank pairing is never templated** — a flight with no conf file always
-  starts from `cals.yaml`, never from the last flight you had open. Tanks get
-  swapped between flights, and inheriting the previous flight's pair silently
-  is the one error that would corrupt every calibrated number without
-  announcing itself.
+- **Save…** (button beside Load Data, or `File > Save Configuration…`, ⌘S)
+  opens a dialog with `<dataset>_conf.yaml` offered as the name. Changing that
+  name saves a **second configuration of the same dataset** — as many as you
+  like (`..._tight_conf.yaml`, `..._v2.yaml`).
+- A `•` on the Save button marks unsaved changes. It is a comparison, not a
+  flag: change a spin box and put it back, and the mark clears.
+- **Quitting or loading another dataset with unsaved changes** asks
+  Save / Don't Save / Cancel. Don't Save leaves the starting state untouched;
+  Cancel aborts the quit or load.
 
-If the dataset's directory is not writable (a read-only archive or a mounted
-share), the viewer says so on stderr and falls back to the app-level config
-rather than refusing to open the file.
+**Opening a dataset that has configs:** with just one, it is applied silently.
+With several, a chooser lists them — the conventional `<dataset>_conf.yaml`
+first and preselected — plus *Start from defaults (open nothing)*. Any
+`<dataset stem>*.yaml` beside the CSV counts as that dataset's config, so
+whatever you named it is found; `File > Load Configuration…` opens one by name
+from anywhere, or switches configuration without reloading the CSV.
+
+A dataset with no config starts from the **shipped defaults**. There is no
+app-level template: `ucatsb_gui_config.yaml` now holds only the recent-files
+list, and inheriting one flight's tuning into another silently is exactly what
+per-dataset configs exist to prevent.
 
 ### Cal Tanks tab
 
@@ -469,7 +471,7 @@ Timeseries tab overlays, so they are already good-air-only.
 **Ozone is the exception it has to be.** It has no cal bottles, so there is
 nothing to calibrate it against; it goes on the axis as the ozone
 instrument's own product, `oz_o3best`, with its below-floor readings removed
-(see [Ozone validity floor](#ozone-validity-floor)). The axis label and a line
+(see [Validity floors](#validity-floors)). The axis label and a line
 in the figure's note block both say so, and that axis gets no error bars — there is
 no calibration to propagate, and a zero-width bar would claim a precision
 nobody established. It needs no time alignment: ozone shares the CSV's
@@ -526,18 +528,25 @@ these uncertainties are mostly **systematic** — they shift a whole flight
 together rather than scattering point to point — which is why the fit is plain
 OLS rather than weighted by them.
 
-### Ozone validity floor
+### Validity floors
 
-`oz_o3best` occasionally reports a fault rather than a measurement — the Feb
-2025 flight has 7 readings between −22 and −2292 ppb. Anything below
-**−15 ppb** (`O3_VALID_MIN_PPB`) is dropped as a sensor fault.
+The two instruments with no cal bottles — ozone and water vapour — each
+declare a floor below which a reading is a fault rather than a measurement:
 
-The floor sits well below zero on purpose. A real near-zero ozone measurement
+| Gas | Column | Floor | Effect on the reference flights |
+|---|---|---|---|
+| O3 | `oz_o3best` | **−15 ppb** (`O3_VALID_MIN_PPB`) | removes 7 readings on Feb 2025 (−22 to −2292 ppb) |
+| H2O | `w_H2Obest` | **−5 ppm** (`H2O_VALID_MIN_PPM`) | removes nothing on Jul 2026 (its minimum is +14 ppm) — precautionary |
+
+The H2O floor is there for the fault mode when it appears; it changes no
+current data.
+
+A floor sits well below zero on purpose. A real near-zero ozone measurement
 scatters negative, and that flight has 168 readings between −15 and 0 ppb that
 are the sensor's noise about a small true value. Clipping at zero would bias
 the low end upward and hide how noisy the instrument actually is.
 
-The O3 timeseries therefore shows **two traces, in the same colors the Aeris
+The timeseries of a gas with a floor therefore shows **two traces, in the same colors the Aeris
 gases use**: raw in blue underneath (faded), filtered in red on top — the same
 "blue is everything recorded, red is the series you should read" convention as
 the calibrated overlay. The red line *breaks* over each removed reading rather
@@ -548,10 +557,10 @@ would otherwise set the scale and squash the entire real ozone record into the
 top fifth of the axes; the raw trace is still drawn and simply runs off-scale,
 where zooming out reaches it.
 
-This is a per-gas property (`valid_min` in `GASES`), not one of the maskable
+These are per-gas properties (`valid_min` in `GASES`), not maskable
 settings — it is a physical floor, not a judgement call, so it is not
-adjustable from the control panel. No other gas declares one, and gases
-without one are drawn exactly as before, single trace at full opacity.
+adjustable from the control panel. The cal-bottle gases declare none, and a
+gas without a floor is drawn as a single trace at full opacity.
 
 ## Data assumptions
 
