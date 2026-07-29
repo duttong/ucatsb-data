@@ -1,13 +1,22 @@
-#!/usr/bin/env python3
-"""Plot the d1_CO2_ppm (uncalibrated CO2) timeseries from a UCATS-B CSV file.
+"""Shared analysis logic for UCATS-B flight records: masking, cal-event
+detection, calibration and its uncertainty, and the two export writers.
 
-Usage: python3 plot_co2_timeseries.py <csv_file>
+Imported by `ucatsb_gui.py`, which is the only user interface. This module is
+deliberately **Qt-free** -- it needs pandas and (for the calibration figure)
+matplotlib, nothing more -- so a batch script or notebook can reuse
+`calibrate_series`, `calibration_uncertainty` or `export_icartt` without
+pulling in a GUI toolkit.
+
+It was once `plot_co2_timeseries.py`, named for a standalone CO2-only figure
+CLI that lived at the bottom. That CLI was removed when the GUI superseded it:
+it hardcoded CO2 and one set of masking settings, and it read the cal pairing
+from `cals.yaml`'s `cals:` block, which describes the tanks plumbed in *now*
+and so mislabels the tanks on any earlier flight -- with no way to correct it.
+Everything here is gas-agnostic.
 """
-import sys
 from pathlib import Path
 
 import pandas as pd
-import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 
 LINE_COLOR = "#2a78d6"
@@ -24,10 +33,11 @@ AXIS_COLOR = "#c3c2b7"
 TEXT_COLOR = "#0b0b0b"
 MUTED_COLOR = "#52514e"
 
+# The detector's spec pressure. The *tolerance* around it is not here: it is
+# a per-gas setting the user tunes, and lives in the GUI's
+# DEFAULT_GAS_SETTINGS. So are the warm-up length and the cal-mean windows,
+# which had fixed values here only to serve the removed CO2 CLI.
 D1_P_TARGET_MBARS = 140.0
-D1_P_TOLERANCE_MBARS = 10.0
-WARMUP_MINUTES = 30
-CAL_MEAN_WINDOW_S = 15
 CAL_MERGE_GAP_S = 2   # bridge cal periods split by a single dropped-flag sample
 CALS_YAML_PATH = Path(__file__).parent / "cals.yaml"
 
@@ -1578,115 +1588,3 @@ def plot_calibration_panels(fig, result, gas_key, ylabel, datetimes, unit=""):
         label.set_rotation(45)
         label.set_horizontalalignment("right")
     return [ax_resp, ax_coef, ax_res, ax_icept]
-
-
-def plot_co2_timeseries(csv_path: Path, out_path: Path):
-    df = pd.read_csv(
-        csv_path,
-        usecols=["datetime", "d1_CO2_ppm", "d1_P_mbars", "j_sol_cals", "j_sol_aircal"],
-    )
-    df["datetime"] = pd.to_datetime(df["datetime"])
-    df = drop_presync_rows(df)
-
-    cal_bottles = load_cal_bottles(CALS_YAML_PATH)
-
-    fig, ax = plt.subplots(figsize=(10, 5), facecolor="#fcfcfb")
-    ax.set_facecolor("#fcfcfb")
-
-    # Shade calibration/cal-gas periods (j_sol_cals or j_sol_aircal == 1) so
-    # they aren't mistaken for ambient air measurements.
-    cal = (df["j_sol_cals"].fillna(0).astype(bool)
-           | df["j_sol_aircal"].fillna(0).astype(bool))
-    shade_intervals(ax, df["datetime"], cal, CAL_SHADE_COLOR, alpha=0.3)
-
-    cal_intervals = merge_close_intervals(
-        find_intervals(df["datetime"], cal), pd.Timedelta(seconds=CAL_MERGE_GAP_S)
-    )
-
-    # Flag periods where cell pressure (d1_P_mbars) is out of spec.
-    bad_pressure = (df["d1_P_mbars"] - D1_P_TARGET_MBARS).abs() > D1_P_TOLERANCE_MBARS
-    bad_pressure = bad_pressure.fillna(False)
-
-    # Flag the instrument warm-up period at the start of the record.
-    warmup_end = df["datetime"].iloc[0] + pd.Timedelta(minutes=WARMUP_MINUTES)
-    warmup = df["datetime"] < warmup_end
-
-    # Cal means are estimated from the raw data with these masks applied --
-    # a cal point can be dropped entirely if its window has no valid data.
-    exclude_mask = bad_pressure | warmup
-    cal_points = cal_mean_points(
-        df, cal_intervals, "d1_CO2_ppm",
-        cal0_window=(-CAL_MEAN_WINDOW_S, -1), cal1_window=(-CAL_MEAN_WINDOW_S, -1),
-        cal_bottles=cal_bottles, gas_key="CO2", exclude_mask=exclude_mask,
-    )
-
-    shade_intervals(ax, df["datetime"], warmup, WARMUP_EXCLUDE_COLOR, alpha=0.15)
-    shade_intervals(ax, df["datetime"], bad_pressure, PRESSURE_EXCLUDE_COLOR, alpha=0.15)
-
-    plot_data = df[["datetime", "d1_CO2_ppm"]].dropna()
-    line, = ax.plot(plot_data["datetime"], plot_data["d1_CO2_ppm"], color=LINE_COLOR, linewidth=1.2)
-
-    cal0_pts = [(t, v) for t, v, state, serial in cal_points if state == 0]
-    cal1_pts = [(t, v) for t, v, state, serial in cal_points if state == 1]
-    cal0_label = most_common_serial(cal_points, 0) or "Cal 0"
-    cal1_label = most_common_serial(cal_points, 1) or "Cal 1"
-
-    handles = [line]
-    labels = ["CO2 (ambient)"]
-    if cal0_pts:
-        xs, ys = zip(*cal0_pts)
-        cal0_scatter = ax.scatter(xs, ys, color=CAL0_COLOR, s=40, zorder=5, edgecolors="none")
-        handles.append(cal0_scatter)
-        labels.append(f"{cal0_label}: {mean_std_label(ys)}")
-    if cal1_pts:
-        xs, ys = zip(*cal1_pts)
-        cal1_scatter = ax.scatter(xs, ys, color=CAL1_COLOR, s=40, zorder=5, edgecolors="none")
-        handles.append(cal1_scatter)
-        labels.append(f"{cal1_label}: {mean_std_label(ys)}")
-
-    ax.set_ylabel("CO2 (ppm)", color=TEXT_COLOR)
-    ax.set_title("UCATS-B CO2 (uncalibrated) timeseries", color=TEXT_COLOR, loc="left")
-
-    date_str = plot_data["datetime"].iloc[0].strftime("%Y-%m-%d") if not plot_data.empty else ""
-    ax.set_xlabel(f"Time (UTC-ish, {date_str})", color=MUTED_COLOR)
-
-    ax.xaxis.set_major_locator(mdates.AutoDateLocator())
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
-    fig.autofmt_xdate(rotation=45)
-
-    ax.grid(True, color=GRID_COLOR, linewidth=0.8)
-    for spine in ax.spines.values():
-        spine.set_color(AXIS_COLOR)
-    ax.tick_params(colors=MUTED_COLOR)
-
-    ax.legend(handles, labels, loc="lower right", fontsize=9, framealpha=0.9)
-
-    # Note shaded/flagged periods, if any occurred
-    notes = []
-    if cal.any():
-        notes.append("gray = calibration/cal-air (j_sol_cals, j_sol_aircal)")
-    if warmup.any():
-        notes.append(f"orange = excluded (first {WARMUP_MINUTES} min warm-up)")
-    if bad_pressure.any():
-        notes.append(
-            f"light red = excluded (d1_P_mbars outside {D1_P_TARGET_MBARS:.0f}±{D1_P_TOLERANCE_MBARS:.0f} mbar)"
-        )
-    if notes:
-        ax.text(
-            0.01, 0.98, "\n".join(notes),
-            transform=ax.transAxes, ha="left", va="top",
-            color=MUTED_COLOR, fontsize=9,
-        )
-
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=150)
-    print(f"Saved figure to {out_path}")
-
-
-if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: python3 plot_co2_timeseries.py <csv_file>", file=sys.stderr)
-        sys.exit(1)
-    csv_path = Path(sys.argv[1])
-    out_path = csv_path.with_name(csv_path.stem + "_CO2_ppm.png")
-    plot_co2_timeseries(csv_path, out_path)

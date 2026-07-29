@@ -22,27 +22,44 @@ See `requirements.txt`.
   argument is optional; a file can also be (re)picked at any time from
   within the GUI via the "Load Data" button, so the app can start with no
   argument at all.
-- `python3 plot_co2_timeseries.py <csv_file>` — static PNG, no GUI
 
-No test suite or CI. Both scripts are read-verified by importing the module
-under `QT_QPA_PLATFORM=offscreen` and grabbing a screenshot rather than by
-unit tests — there isn't a headless-safe way to assert on plot pixels, so
-manual visual review (via `Read` on the saved PNG) is how changes here get
-checked.
+There is **no second entry point**. `ucatsb_analysis.py` is a library and is
+never run directly; the CO2-only `plot_co2_timeseries.py <csv>` CLI it used to
+carry was removed (2026-07-29) because the GUI supersedes it and it read the
+cal pairing from `cals.yaml`'s `cals:` block, mislabelling tanks on any flight
+that did not fly the currently-plumbed pair, with no way to override.
+
+No test suite or CI. Changes are read-verified by importing the module under
+`QT_QPA_PLATFORM=offscreen` and grabbing a screenshot rather than by unit
+tests — there isn't a headless-safe way to assert on plot pixels, so manual
+visual review (via `Read` on the saved PNG) is how changes here get checked.
 
 ## Architecture
 
-`plot_co2_timeseries.py` is the shared logic module (despite the CO2-specific
-name/CLI, its functions are gas-agnostic) and also a standalone CLI producing
-one fixed CO2 figure. `ucatsb_gui.py` imports from it rather than
-duplicating: `drop_presync_rows`, `find_intervals`, `merge_close_intervals`,
-`shade_intervals`, `cal_mean_points`, `load_cal_roster`,
-`load_cal_assignment`, `select_cal_bottles`, `most_common_serial`,
-`mean_std_label`, `CALS_YAML_PATH`, plus the calibration functions below and
-the two export writers (`export_companion_csv`, `export_icartt`, with
+`ucatsb_analysis.py` is the shared logic module — masking, cal detection,
+calibration and its uncertainty, and both export writers — and is **Qt-free
+on purpose**, so a batch script or notebook can reuse `calibrate_series` or
+`export_icartt` without a GUI toolkit. Don't import PyQt5 into it, and don't
+move data logic into `ucatsb_gui.py`, which is the GUI and nothing else.
+(It was `plot_co2_timeseries.py` until 2026-07-29; the name came from a
+standalone CO2 figure CLI that was removed in the same change.)
+
+`ucatsb_gui.py` imports from it rather than duplicating: `drop_presync_rows`,
+`find_intervals`, `merge_close_intervals`, `shade_intervals`,
+`cal_mean_points`, `load_cal_roster`, `load_cal_assignment`,
+`select_cal_bottles`, `most_common_serial`, `mean_std_label`,
+`CALS_YAML_PATH`, plus the calibration functions below and the two export
+writers (`export_companion_csv`, `export_icartt`, with
 `icartt_time_base`/`icartt_filename`/`DEFAULT_ICARTT_META`). Any change to
-masking/cal-detection/calibration behavior belongs in that shared module so
-both stay in sync.
+masking/cal-detection/calibration behavior belongs in that shared module.
+
+**The shared palette lives in `ucatsb_analysis.py` and is imported, not
+redeclared.** Thirteen constants (`LINE_COLOR`, `CAL0_COLOR`, `MUTED_COLOR`,
+`D1_P_TARGET_MBARS`, …) were once defined in *both* files with identical
+values — agreeing by discipline alone, so an edit to one silently made the
+calibration panels and the timeseries disagree about what a color meant.
+Only `CALIBRATED_COLOR` and `STATS_BOX_COLOR`, which nothing in the analysis
+module draws, are declared in the GUI.
 
 ### Data pipeline (per redraw)
 

@@ -31,7 +31,7 @@ from matplotlib.figure import Figure
 from matplotlib.widgets import RectangleSelector
 import matplotlib.dates as mdates
 
-from plot_co2_timeseries import (
+from ucatsb_analysis import (
     drop_presync_rows, find_intervals, merge_close_intervals,
     shade_intervals, cal_mean_points, load_cal_roster, load_cal_assignment,
     select_cal_bottles,
@@ -42,30 +42,24 @@ from plot_co2_timeseries import (
     export_companion_csv, export_icartt, icartt_filename, icartt_time_base,
     DEFAULT_ICARTT_META,
     CALS_YAML_PATH, CAL_DRIFT_MODELS, CAL_DEFAULT_SMOOTH_EVENTS,
-    POST_CAL_FLUSH_COLOR,
+    CAL_MERGE_GAP_S, D1_P_TARGET_MBARS,
+    # The shared palette. These used to be declared a second time here, with
+    # identical values -- two homes for one decision, agreeing only by
+    # discipline, so editing one silently made the calibration panels and the
+    # timeseries disagree about what a color means. ucatsb_analysis is the
+    # single home; only the two GUI-only colors below are declared here.
+    LINE_COLOR, RIGHT_AXIS_COLOR, CAL_SHADE_COLOR, PRESSURE_EXCLUDE_COLOR,
+    WARMUP_EXCLUDE_COLOR, PUMPS_EXCLUDE_COLOR, POST_CAL_FLUSH_COLOR,
+    CAL0_COLOR, CAL1_COLOR,
+    GRID_COLOR, AXIS_COLOR, TEXT_COLOR, MUTED_COLOR,
 )
 
-LINE_COLOR = "#2a78d6"
 # The calibrated overlay gets its own color rather than reusing LINE_COLOR:
 # the raw trace stays blue when the overlay is on, so the two are told apart
 # by hue, not by which one happens to be faded. Darker/more saturated than the
 # 15%-alpha PRESSURE_EXCLUDE_COLOR band so it doesn't read as shading.
 CALIBRATED_COLOR = "#c0392b"
-RIGHT_AXIS_COLOR = "#8e44ad"   # purple, distinct from the red/orange masking shades
-CAL_SHADE_COLOR = "#898781"
-PRESSURE_EXCLUDE_COLOR = "#d03b3b"
-WARMUP_EXCLUDE_COLOR = "#ffa64d"   # light orange
-PUMPS_EXCLUDE_COLOR = "#8e7cc3"    # violet, distinct from the other bands
 STATS_BOX_COLOR = "#111111"
-CAL0_COLOR = "#eda100"   # golden
-CAL1_COLOR = "#0d366b"   # dark blue
-GRID_COLOR = "#e1e0d9"
-AXIS_COLOR = "#c3c2b7"
-TEXT_COLOR = "#0b0b0b"
-MUTED_COLOR = "#52514e"
-
-D1_P_TARGET_MBARS = 140.0
-CAL_MERGE_GAP_S = 2   # bridge cal periods split by a single dropped-flag sample
 
 # `short`, `standard_name` and `long_name` exist for the exports: the ICARTT
 # variable name is `<short>_<suffix>` (so Ozone is delivered as O3, the name

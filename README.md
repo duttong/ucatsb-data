@@ -180,14 +180,6 @@ Turning Stats on releases pan or zoom if either is active, since they compete
 for the same drag. The Calibration tab has no Stats button: its three panels
 each mean something different, so a single readout there would be ambiguous.
 
-### Static figure
-
-```
-python3 plot_co2_timeseries.py /path/to/ucatsb-YYYYMMDDHH.csv
-```
-
-Produces `<csv_stem>_CO2_ppm.png` next to the input file: a fixed CO2 timeseries with calibration shading, mean cal points, and warm-up/pressure exclusion bands, using the same logic the GUI uses (no interactive controls).
-
 ## Calibration
 
 The **Calibration** tab turns the in-flight cal-bottle injections into a
@@ -732,7 +724,7 @@ roster changes.
 | File | Purpose |
 |---|---|
 | `ucatsb_gui.py` | PyQt5 interactive viewer |
-| `plot_co2_timeseries.py` | Shared masking/cal-detection logic + standalone static-figure CLI |
+| `ucatsb_analysis.py` | Shared masking, cal-detection, calibration and export logic. A library, never run directly, and deliberately free of any GUI dependency so a script or notebook can reuse it |
 | `ucatsb_gui_config.yaml` | App-level and **shared through the repository**: the [ICARTT header metadata](#header-metadata), which describes the campaign rather than one machine. No analysis settings — those live per dataset (see [Per-flight settings](#per-flight-settings-configs)). Written only by **Save defaults** |
 | `.ucatsb_gui_state.yaml` | App-level and **local, gitignored, hidden**: the recent-files list, which is absolute paths from whichever machine ran it. Rewritten on every dataset load — which is why it is not in the file above — and recreated when absent |
 | `<dataset>_conf.yaml` | Written beside each loaded CSV: that flight's own per-gas settings **and** its cal-tank pairing |
