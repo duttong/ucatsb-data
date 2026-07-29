@@ -152,6 +152,7 @@ CORR_COLORMAP = "turbo"
 
 DEFAULT_GAS_SETTINGS = {
     "warmup_min": 30,
+    "end_flight_min": 0,
     "require_pumps": False,
     "pressure_tol_mbar": 10.0,
     "flag_air_s": 0,
@@ -1095,6 +1096,21 @@ class UcatsbGui(QMainWindow):
         self.warmup_spin.valueChanged.connect(self.on_control_changed)
         mask_form.addRow("Warm-up exclude:", self.warmup_spin)
 
+        # The descent is the busiest part of a flight and the least like the
+        # rest of it, so trimming the tail is as routine as trimming the
+        # warm-up -- same treatment, same orange band, one shared note line.
+        self.end_flight_spin = QSpinBox()
+        self.end_flight_spin.setRange(0, 120)
+        self.end_flight_spin.setSuffix(" min")
+        self.end_flight_spin.setToolTip(
+            "Exclude this many minutes at the END of the record, the mirror\n"
+            "of the warm-up exclusion at the start -- descent, landing and\n"
+            "whatever happens on the ground afterwards. Like the warm-up it\n"
+            "reaches the cal means, not just the plot. 0 disables it."
+        )
+        self.end_flight_spin.valueChanged.connect(self.on_control_changed)
+        mask_form.addRow("End-flight exclude:", self.end_flight_spin)
+
         self.pressure_tol_spin = QDoubleSpinBox()
         self.pressure_tol_spin.setRange(0.0, 10.0)
         self.pressure_tol_spin.setSingleStep(0.05)
@@ -1473,6 +1489,7 @@ class UcatsbGui(QMainWindow):
         triggering on_control_changed (and re-saving/redrawing) per field."""
         self._loading = True
         self.warmup_spin.setValue(settings["warmup_min"])
+        self.end_flight_spin.setValue(settings.get("end_flight_min", 0))
         self.pumps_check.setChecked(bool(settings.get("require_pumps", False)))
         self.pressure_tol_spin.setValue(settings["pressure_tol_mbar"])
         self.flag_air_spin.setValue(settings["flag_air_s"])
@@ -1493,6 +1510,7 @@ class UcatsbGui(QMainWindow):
         from the config on the next control change."""
         return {
             "warmup_min": self.warmup_spin.value(),
+            "end_flight_min": self.end_flight_spin.value(),
             "require_pumps": self.pumps_check.isChecked(),
             "pressure_tol_mbar": self.pressure_tol_spin.value(),
             "flag_air_s": self.flag_air_spin.value(),
@@ -1653,8 +1671,9 @@ class UcatsbGui(QMainWindow):
     # The drift model and its smoothing window are the only per-gas settings
     # left out -- they are a judgement about that gas's cal record (how noisy
     # its injections are), not a description of the flight.
-    COPIED_SETTING_KEYS = ("warmup_min", "require_pumps", "pressure_tol_mbar",
-                           "flag_air_s", "cal1_window_s", "cal2_window_s")
+    COPIED_SETTING_KEYS = ("warmup_min", "end_flight_min", "require_pumps",
+                           "pressure_tol_mbar", "flag_air_s",
+                           "cal1_window_s", "cal2_window_s")
     COPY_SETTINGS_LABEL = "Copy settings to all gases"
 
     def on_copy_masking_to_all(self):
@@ -2015,6 +2034,18 @@ class UcatsbGui(QMainWindow):
         warmup_end = df["datetime"].iloc[0] + pd.Timedelta(minutes=warmup_minutes)
         warmup = df["datetime"] < warmup_end
 
+        # Measured back from the last timestamp in the record, not from a
+        # clock time: "the last 10 minutes" means the last 10 minutes of data
+        # there are, whenever the file happens to stop.
+        end_flight_minutes = settings.get("end_flight_min", 0)
+        end_flight_start = df["datetime"].iloc[-1] - pd.Timedelta(minutes=end_flight_minutes)
+        end_flight = ((df["datetime"] > end_flight_start) if end_flight_minutes
+                      else pd.Series(False, index=df.index))
+        # One band, one note line: both are "the instrument was not doing what
+        # the rest of the flight was doing", and the user asked for them to
+        # read as a single exclusion at the two ends.
+        trimmed = warmup | end_flight
+
         # Pumps off: not ambient air at all, so this joins exclude_mask -- it
         # drops cal points as well as blanking the output, exactly like the
         # warm-up and pressure masks. A missing j_pumps reading counts as off:
@@ -2044,18 +2075,21 @@ class UcatsbGui(QMainWindow):
                 tuple(settings["cal1_window_s"]),
                 tuple(settings["cal2_window_s"]),
                 cal_bottles=self.cal_bottles, gas_key=gas_key,
-                exclude_mask=bad_pressure | warmup | pumps_off,
+                exclude_mask=bad_pressure | trimmed | pumps_off,
             )
 
         self._analysis[gas_key] = {
             "cal": cal, "cal_switch": cal_switch, "not_air": not_air,
-            "warmup": warmup, "bad_pressure": bad_pressure,
+            "warmup": warmup, "end_flight": end_flight, "trimmed": trimmed,
+            "bad_pressure": bad_pressure,
             "pumps_off": pumps_off, "require_pumps": require_pumps,
-            "exclude_mask": bad_pressure | warmup | pumps_off,
+            "exclude_mask": bad_pressure | trimmed | pumps_off,
             "cal_intervals": cal_intervals, "cal_points": cal_points,
             "post_cal_flush": post_cal_flush,
             "has_masking": has_masking,
-            "warmup_minutes": warmup_minutes, "pressure_tol": pressure_tol,
+            "warmup_minutes": warmup_minutes,
+            "end_flight_minutes": end_flight_minutes,
+            "pressure_tol": pressure_tol,
             "flag_air_s": flag_air_s,
         }
         return self._analysis[gas_key]
@@ -2116,13 +2150,17 @@ class UcatsbGui(QMainWindow):
         # included, so the shading and the blanked calibrated trace agree.
         not_air = analysis["not_air"]
         warmup = analysis["warmup"]
+        # Warm-up and end-of-flight share the band and the note: one orange
+        # exclusion at each end of the record.
+        trimmed = analysis["trimmed"]
+        end_flight_minutes = analysis["end_flight_minutes"]
         bad_pressure = analysis["bad_pressure"]
         cal_points = analysis["cal_points"]
         post_cal_flush = analysis["post_cal_flush"]
 
         if has_masking:
             shade_intervals(ax, df["datetime"], not_air, CAL_SHADE_COLOR, alpha=0.3)
-            shade_intervals(ax, df["datetime"], warmup, WARMUP_EXCLUDE_COLOR, alpha=0.15)
+            shade_intervals(ax, df["datetime"], trimmed, WARMUP_EXCLUDE_COLOR, alpha=0.15)
             shade_intervals(ax, df["datetime"], bad_pressure, PRESSURE_EXCLUDE_COLOR, alpha=0.15)
             shade_intervals(ax, df["datetime"], analysis["pumps_off"],
                             PUMPS_EXCLUDE_COLOR, alpha=0.16)
@@ -2252,8 +2290,13 @@ class UcatsbGui(QMainWindow):
                 notes.append("gray = calibration/cal-air (j_sol_cals, j_sol_aircal"
                              + (", + switch-over sample)"
                                 if analysis["cal_switch"].any() else ")"))
-            if warmup.any():
-                notes.append(f"orange = excluded (first {warmup_minutes} min warm-up)")
+            if trimmed.any():
+                ends = []
+                if warmup.any():
+                    ends.append(f"first {warmup_minutes} min warm-up")
+                if analysis["end_flight"].any():
+                    ends.append(f"last {end_flight_minutes} min of flight")
+                notes.append("orange = excluded (" + ", ".join(ends) + ")")
             if bad_pressure.any():
                 notes.append(
                     f"light red = excluded (d1_P_mbars outside {D1_P_TARGET_MBARS:.0f}±{pressure_tol:.2f} mbar)"
@@ -2328,7 +2371,8 @@ class UcatsbGui(QMainWindow):
         if ax_aux is not None:
             aux_col, aux_ylabel = aux_info
             ax_aux.set_facecolor("#fcfcfb")
-            shade_intervals(ax_aux, df["datetime"], warmup, WARMUP_EXCLUDE_COLOR, alpha=0.15)
+            shade_intervals(ax_aux, df["datetime"], analysis["trimmed"],
+                            WARMUP_EXCLUDE_COLOR, alpha=0.15)
             shade_intervals(ax_aux, df["datetime"], bad_pressure, PRESSURE_EXCLUDE_COLOR, alpha=0.15)
             shade_intervals(ax_aux, df["datetime"], analysis["pumps_off"],
                             PUMPS_EXCLUDE_COLOR, alpha=0.16)

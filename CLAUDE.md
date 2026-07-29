@@ -54,7 +54,9 @@ module so both stay in sync.
    `find_intervals` + `merge_close_intervals` turn that boolean mask into
    discrete cal-event windows, bridging events split by a single dropped
    sample (gap ≤ `CAL_MERGE_GAP_S`).
-3. Warm-up (first N minutes), out-of-spec detector pressure
+3. Warm-up (first N minutes), end-of-flight (last M minutes, measured back
+   from the record's last timestamp rather than a clock time), out-of-spec
+   detector pressure
    (`|d1_P_mbars - 140| > tol`) and — when **Pumps on** is set —
    pumps-off (`j_pumps != 1`) masks are computed and **applied to the raw
    data before cal means are estimated** (`exclude_mask` param on
@@ -492,8 +494,14 @@ enabled state when `mask_box` is re-enabled; and it **must** default off,
 because a lab/bench run is pumps-off end to end (the 2026-07-26 file is 100%)
 and enabling it there excludes every row and every cal point.
 
+Warm-up and end-of-flight are OR-ed into `trimmed`, which is what gets shaded
+and what the note describes — deliberately one orange band and one line
+naming whichever ends are active, since both say "the instrument was not doing
+what the rest of the flight was doing". `analysis` still exposes `warmup` and
+`end_flight` separately for anything that needs to tell them apart.
+
 New masking settings default to a **no-op value** (`flag_air_s: 0`,
-`require_pumps: False`) rather than a physically plausible one. `load_config` fills missing keys from
+`require_pumps: False`, `end_flight_min: 0`) rather than a physically plausible one. `load_config` fills missing keys from
 `DEFAULT_GAS_SETTINGS`, so a non-zero default would silently change the
 output of every already-saved config on first launch after the upgrade.
 
