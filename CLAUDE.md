@@ -565,6 +565,13 @@ which is not a plottable column and needs `mdates.date2num` going in and a
   always drawn with it; a continuous color encoding with no scale is
   unreadable.
 
+**The OLS fit is opt-in** (`corr_fit`, default False). A straight line through
+a tracer-tracer plot with real structure in it describes almost none of that
+structure, so leaving it on by default put an authoritative-looking slope on
+every plot that mostly measured how the flight was flown. When off, neither
+the line, the figure note nor the slope/intercept/r block in the side panel is
+produced — `linear_fit` is not even called.
+
 Because these uncertainties are near-entirely *systematic* (they shift a whole
 flight together), `linear_fit` is plain OLS and must stay that way: weighting
 by them would not do what weighting is for, and would make the reported slope

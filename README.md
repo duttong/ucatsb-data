@@ -461,6 +461,13 @@ tabs, and each gas is analysed with *its own* saved settings.
   says so. Only encodings the loaded CSV can supply are offered — a flight
   whose schema lacks `oz_p` gets Time alone.
 - **Error bars (1σ)** — see below.
+- **Linear fit (OLS)** — off by default. These plots usually have real
+  structure (branches, mixing lines, profiles) that a single straight line
+  describes poorly, and its slope then says more about how the flight was
+  sampled than about the tracers. When on, the fit is drawn in red and its
+  slope ± standard error, intercept and *r* appear both on the figure and in
+  the panel; when off, the panel still reports `n` and each tracer's
+  mean ± standard deviation.
 
 **Each axis is calibrated wherever a calibration exists**, deliberately: a
 tracer-tracer slope taken from uncalibrated counts carries that detector's
@@ -489,9 +496,10 @@ composition toward the atmosphere's, which looks exactly like a tracer-tracer
 correlation and drags the fit. On the Feb 2025 file, raising Flag Air to 45 s
 drops that trail (n 11519 → 10088) and moves the slope 0.906 → 0.883.
 
-An ordinary least-squares fit is drawn in red, with slope ± standard error,
-intercept and *r* both on the figure and in the panel on the left (which
-survives zooming and can be read while the plot is somewhere else).
+An ordinary least-squares fit is available via **Linear fit (OLS)** (off by
+default), drawn in red with slope ± standard error, intercept and *r* both on
+the figure and in the panel on the left — which survives zooming and can be
+read while the plot is somewhere else.
 
 ### Where the error bars come from
 

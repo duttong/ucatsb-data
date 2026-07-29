@@ -506,6 +506,9 @@ class UcatsbGui(QMainWindow):
         self.corr_error_bars = False
         # None = single-color points; otherwise a key into CORR_COLOR_BY.
         self.corr_color_by = None
+        # Off by default: a straight line through a tracer-tracer plot with
+        # real structure in it describes almost none of that structure.
+        self.corr_fit = False
         self._corr_ax = None
         self._last_corr_key = None
 
@@ -767,6 +770,18 @@ class UcatsbGui(QMainWindow):
         )
         self.corr_error_check.toggled.connect(self.on_corr_style_changed)
         style_form.addRow(self.corr_error_check)
+
+        self.corr_fit_check = QCheckBox("Linear fit (OLS)")
+        self.corr_fit_check.setChecked(self.corr_fit)
+        self.corr_fit_check.setToolTip(
+            "Least-squares line through the plotted points, with its slope,\n"
+            "intercept and r. Off by default: these plots usually have real\n"
+            "structure (branches, mixing lines, profiles) that a single\n"
+            "straight line describes poorly, and its slope then says more\n"
+            "about how the flight was sampled than about the tracers."
+        )
+        self.corr_fit_check.toggled.connect(self.on_corr_style_changed)
+        style_form.addRow(self.corr_fit_check)
 
         # Checkbox + combo on one spanning row (see the drift-model row: in
         # the two-column form the label gets squeezed to nothing by a
@@ -1676,6 +1691,7 @@ class UcatsbGui(QMainWindow):
             return
         self.corr_marker_size = self.corr_size_spin.value()
         self.corr_error_bars = self.corr_error_check.isChecked()
+        self.corr_fit = self.corr_fit_check.isChecked()
         self._refresh_corr(preserve_view=True)
 
     def _refresh_corr(self, preserve_view=True):
@@ -2561,7 +2577,7 @@ class UcatsbGui(QMainWindow):
             if CORR_COLOR_BY[self.corr_color_by][1] is None:
                 bar.ax.yaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
 
-        fit = linear_fit(x, y)
+        fit = linear_fit(x, y) if self.corr_fit else None
         if fit:
             xs = [x.min(), x.max()]
             ax.plot(xs, [fit["slope"] * v + fit["intercept"] for v in xs],
@@ -2673,10 +2689,27 @@ class UcatsbGui(QMainWindow):
     def _update_corr_stats(self, fit, x, y, x_gas, y_gas, x_unit, y_unit):
         """Numbers panel under the correlation controls. Outside the Figure,
         for the same reason the box-stats readout is: it survives a redraw and
-        can be read while the plot is zoomed somewhere else."""
-        if not fit:
-            self.corr_stats_label.setText("Not enough overlapping points to fit.")
+        can be read while the plot is zoomed somewhere else.
+
+        The fit block is included only when the fit is switched on. A single
+        straight line through a tracer-tracer plot with real structure in it
+        describes almost none of that structure, so its slope and r are more
+        likely to mislead than inform -- hence off by default, and hidden
+        here rather than left sitting there looking authoritative.
+        """
+        if not len(x):
+            self.corr_stats_label.setText("No overlapping points.")
             return
+        head = [f"n      {len(x)}"]
+        if self.corr_fit and fit:
+            head += [
+                f"slope  {fit['slope']:.5g} ± {fit['slope_err']:.3g}",
+                f"       {y_unit} per {x_unit}",
+                f"icept  {fit['intercept']:.6g} {y_unit}",
+                f"r      {fit['r']:.5f}",
+            ]
+        elif self.corr_fit:
+            head.append("(too few points to fit)")
         sigma_note = ""
         if self.corr_error_bars:
             # Only for axes that have a calibration to propagate from; an
@@ -2690,11 +2723,7 @@ class UcatsbGui(QMainWindow):
             if lines:
                 sigma_note = "\nmedian 1σ  " + "\n           ".join(lines)
         self.corr_stats_label.setText(
-            f"n      {fit['n']}\n"
-            f"slope  {fit['slope']:.5g} ± {fit['slope_err']:.3g}\n"
-            f"       {y_unit} per {x_unit}\n"
-            f"icept  {fit['intercept']:.6g} {y_unit}\n"
-            f"r      {fit['r']:.5f}\n"
+            "\n".join(head) + "\n"
             f"{x_gas:6s} {x.mean():.4g} ± {x.std():.3g} {x_unit}\n"
             f"{y_gas:6s} {y.mean():.4g} ± {y.std():.3g} {y_unit}"
             + sigma_note
