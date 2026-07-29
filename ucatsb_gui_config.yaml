@@ -1,7 +1,7 @@
 icartt:
   data_id: SABRE-UCATSB
   location_id: WB57
-  pi_name: MOORE, FRED; HINTSA, ERIC; DUTTON, GEOFF; NANCE, DAVID
+  pi_name: MOORE, FRED; DUTTON, GEOFF; HINTSA, ERIC; NANCE, DAVID
   pi_affiliation: NOAA/GML and University of Colorado, CIRES
   data_source: UCATS-B Laser Spectrometers
   mission: SABRE
@@ -21,24 +21,16 @@ icartt:
   other_comments: N/A
   revision: RA
   revision_history: 'RA: Preliminary data'
-  special_comments: 'Error estimates are based on the assigned values of the onboard calibration
-
+  special_comments: |-
+    Error estimates are based on the assigned values of the onboard calibration
     cylinders, the scatter of the in-flight calibration record, and the drift
-
     model used to interpolate between calibrations. The UNCERTAINTY line above
-
     gives the median 1-sigma for each species on this flight.
-
     CO2, N2O and CH4 are reported as dry air mole fractions. O3 and H2O are
-
     reported as measured and are not calibrated against onboard standards.
 
-
     If you use these data in a publication or report, we would appreciate that
-
     you contact the principal investigators (PIs) first and discuss your
-
     interests. The PIs can discuss the quality of the data and any potential
-
-    problems with its analysis. Please contact the PIs for more information.'
+    problems with its analysis. Please contact the PIs for more information.
   var_suffix: UCATSB
