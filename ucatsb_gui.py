@@ -3216,6 +3216,33 @@ class UcatsbGui(QMainWindow):
         sigma = self._uncertainty_for(gas_key)[0] if self.corr_error_bars else None
         return result["calibrated"], sigma, unit, "calibrated", None
 
+    def _median_sigmas(self, *gas_units):
+        """[(gas, median 1σ, unit)] for those of `gas_units` that have a
+        calibration to propagate one from, in the order given.
+
+        A gas with has_masking=False (Ozone, H2O) contributes no entry rather
+        than a zero -- no cal bottles means there is no uncertainty to report,
+        the same rule _corr_axis applies to the error bars themselves. Shared
+        by the figure note and the numbers panel so the two cannot disagree,
+        and de-duplicated because both axes may be the same gas.
+
+        Cheap despite looking expensive: both calibrations are already built
+        by the time either caller runs, and _uncertainty_for is cached per gas.
+        """
+        out, seen = [], set()
+        for gas, unit in gas_units:
+            if gas in seen or not GASES[gas].get("has_masking", True):
+                continue
+            seen.add(gas)
+            sigma, _ = self._uncertainty_for(gas)
+            if sigma is None:
+                continue
+            median = sigma.median()
+            if pd.isna(median):
+                continue
+            out.append((gas, median, unit))
+        return out
+
     def redraw_corr(self, preserve_view=False):
         """Draw the Correlations tab: one tracer against another.
 
@@ -3382,6 +3409,17 @@ class UcatsbGui(QMainWindow):
             if raw_axes:
                 note += f"; none on {', '.join(raw_axes)}"
             notes.append(note)
+        # The size of that uncertainty, in the gas's own units, on the figure
+        # rather than only in the numbers panel: at flight scale the bars
+        # overlap into a band whose width cannot be read off the axes, and
+        # this is the figure that gets saved and shown to someone else.
+        # Independent of the error-bar toggle -- it is a property of the
+        # calibration, not of whether the bars are drawn.
+        sigmas = self._median_sigmas((x_gas, x_unit), (y_gas, y_unit))
+        if sigmas:
+            notes.append("median 1σ from the calibration: "
+                         + ",  ".join(f"{gas} ±{value:.3g} {unit}"
+                                      for gas, value, unit in sigmas))
         ax.text(0.01, 0.99, "\n".join(notes), transform=ax.transAxes,
                 ha="left", va="top", color=MUTED_COLOR, fontsize=9)
 
@@ -3446,18 +3484,14 @@ class UcatsbGui(QMainWindow):
             ]
         elif self.corr_fit:
             head.append("(too few points to fit)")
-        sigma_note = ""
-        if self.corr_error_bars:
-            # Only for axes that have a calibration to propagate from; an
-            # uncalibrated axis gets no line rather than a zero.
-            lines = []
-            for gas, unit in ((x_gas, x_unit), (y_gas, y_unit)):
-                if not GASES[gas].get("has_masking", True):
-                    continue
-                sigma, _ = self._uncertainty_for(gas)
-                lines.append(f"{gas} {sigma.median():.3g} {unit}")
-            if lines:
-                sigma_note = "\nmedian 1σ  " + "\n           ".join(lines)
+        # Not gated on the error-bar toggle, and stated as ± so it cannot be
+        # read as the mean ± std line above it: that one is the spread of the
+        # atmosphere across the flight, this one is how well the number is
+        # known, and they differ by more than an order of magnitude.
+        lines = [f"{gas} ±{value:.3g} {unit}"
+                 for gas, value, unit in self._median_sigmas((x_gas, x_unit),
+                                                             (y_gas, y_unit))]
+        sigma_note = ("\nmedian 1σ  " + "\n           ".join(lines)) if lines else ""
         self.corr_stats_label.setText(
             "\n".join(head) + "\n"
             f"{x_gas:6s} {x.mean():.4g} ± {x.std():.3g} {x_unit}\n"

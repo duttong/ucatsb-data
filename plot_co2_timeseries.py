@@ -1497,7 +1497,7 @@ def plot_calibration_panels(fig, result, gas_key, ylabel, datetimes, unit=""):
                        color=TEXT_COLOR, fontsize=9)
     ax_resp.set_title("Cal bottle response, as deviation from assigned value",
                       color=TEXT_COLOR, loc="left", fontsize=10)
-    ax_resp.legend(loc="lower right", fontsize=7, framealpha=0.9)
+    ax_resp.legend(loc="upper left", fontsize=7, framealpha=0.9)
 
     # --- Panel 2: derived coefficients -----------------------------------
     _shade_flagged(ax_coef, datetimes, extrap)
@@ -1536,7 +1536,7 @@ def plot_calibration_panels(fig, result, gas_key, ylabel, datetimes, unit=""):
                       color=TEXT_COLOR, fontsize=9)
     ax_res.set_title("Residuals: closure (filled) vs leave-one-out (hollow)",
                      color=TEXT_COLOR, loc="left", fontsize=10)
-    ax_res.legend(loc="upper right", fontsize=7, framealpha=0.9, ncol=2)
+    ax_res.legend(loc="upper left", fontsize=7, framealpha=0.9, ncol=2)
 
     # --- Header block ------------------------------------------------------
     # Drawn as a figure suptitle rather than inside an Axes: these lines are

@@ -549,6 +549,17 @@ them; the title falls back to "see axis labels" when they differ. Anything
 new that assumes both axes are calibrated — the extrapolated-fraction note,
 the Flag Air note, the median-1σ readout — has to check `has_masking` first.
 
+**The median 1σ is reported in two places from one source**, `_median_sigmas`:
+the figure's note block and the numbers panel. It is deliberately **not** gated
+on the "Error bars (1σ)" toggle — it describes the calibration, not the
+drawing — and it is written with a `±` because the `mean ± std` line directly
+above it in the panel is the *spread of the atmosphere across the flight*, an
+entirely different quantity that on this instrument is an order of magnitude
+larger (N2O on 2026-07-28: sd 12 ppb, 1σ 0.815 ppb). The number belongs on the
+figure as well as the panel because at flight scale the bars overlap into a
+band whose width cannot be read off the axes, and the figure is what gets
+saved and handed to someone else.
+
 `calibration_uncertainty(result)` (shared module) returns the 1σ on each
 calibrated value, propagated by writing the two-point calibration as a blend
 of the assigned values, `c = (1-f)A_lo + f A_hi` with
