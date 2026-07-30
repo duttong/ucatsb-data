@@ -685,7 +685,8 @@ def cal_mismatch_notes(bottles, gas_key, roster, rel_threshold=0.01):
 def calibrate_series(df, value_col, cal_points, cal_bottles, gas_key,
                      model="linear", smooth_window=CAL_DEFAULT_SMOOTH_EVENTS,
                      roster=None, flush_mask=None, cal_mask=None,
-                     exclude_mask=None):
+                     exclude_mask=None, pressure=None,
+                     pressure_target=D1_P_TARGET_MBARS):
     """Build a time-varying two-point calibration from the per-injection cal
     means and apply it to every row of df[value_col].
 
@@ -701,6 +702,8 @@ def calibrate_series(df, value_col, cal_points, cal_bottles, gas_key,
                                            and "loo" residuals
       low_state/high_state  int|None
       slope, intercept, calibrated      -- Series on df.index, NaN where undefined
+      pressure_factor  Series|None      -- the applied pressure correction,
+                                           None when it was not asked for
       extrapolated  Series[bool]        -- outside the INTERSECTION of the two
                                            bottles' node spans, or in a long gap
       flushed       Series[bool]        -- post-cal flush rows
@@ -729,6 +732,21 @@ def calibrate_series(df, value_col, cal_points, cal_bottles, gas_key,
     here does not and must not change `cal_points`, `loo_rms` or `span_gain`.
     Removing these rows here rather than in each caller keeps the plotted
     trace and the exported CSV from ever disagreeing about which rows are good.
+
+    `pressure` (a Series of the gas's own detector pressure, in mbar) turns on
+    the pressure correction: the calibrated value is scaled by
+    `pressure_target / P`, normalising each reading to the cell's spec
+    pressure. It is applied to the *calibrated* series only, deliberately --
+    the cal-bottle responses, the drift nodes, the slope/intercept and every
+    residual are the uncorrected measurement, so turning the correction on or
+    off cannot move the calibration itself, only its product. (Correcting the
+    raw signal first would also be defensible, but the two-point calibration
+    would then absorb most of it through the bottle responses, which is a
+    different and much less legible operation.)
+
+    Rows with no usable pressure (missing, or <= 0) get no corrected value:
+    they go NaN in `calibrated` and join `blanked`, so the trace breaks over
+    them rather than mixing corrected and uncorrected values in one series.
     """
     import statistics
 
@@ -740,6 +758,7 @@ def calibrate_series(df, value_col, cal_points, cal_bottles, gas_key,
             "ok": False, "reason": reason, "mode": None, "bottles": {},
             "low_state": None, "high_state": None,
             "slope": nan_series, "intercept": nan_series, "calibrated": nan_series,
+            "pressure_factor": None,
             "extrapolated": false_series, "flushed": false_series,
             "in_cal": false_series, "excluded": false_series,
             "non_ambient": false_series, "blanked": false_series,
@@ -806,6 +825,17 @@ def calibrate_series(df, value_col, cal_points, cal_bottles, gas_key,
 
     calibrated = slope * df[value_col] + intercept
 
+    # Pressure correction, applied to the calibrated product and nothing else:
+    # everything above -- the bottle responses, the nodes, slope/intercept --
+    # is left on the uncorrected measurement, so this cannot move the
+    # calibration. A pressure of 0 or NaN yields no factor and therefore no
+    # value, which is why the resulting NaNs join `blanked` below.
+    pressure_factor = None
+    if pressure is not None:
+        p = pd.to_numeric(pressure.reindex(df.index), errors="coerce")
+        pressure_factor = pressure_target / p.where(p > 0)
+        calibrated = calibrated * pressure_factor
+
     # The trustworthy region is the INTERSECTION of the bottles' node spans,
     # not "first to last cal event": one bottle can lose its points to masking
     # while the other keeps going, and the calibration is only bracketed where
@@ -866,6 +896,11 @@ def calibrate_series(df, value_col, cal_points, cal_bottles, gas_key,
     excluded = _align(exclude_mask)
     non_ambient = flushed | in_cal
     blanked = non_ambient | excluded
+    if pressure_factor is not None:
+        # A row the correction could not be computed for is already NaN in
+        # `calibrated`; joining `blanked` is what makes the trace break over
+        # it instead of the row being dropped and drawn across.
+        blanked = blanked | pressure_factor.isna()
     if blanked.any():
         calibrated = calibrated.mask(blanked)
 
@@ -873,6 +908,7 @@ def calibrate_series(df, value_col, cal_points, cal_bottles, gas_key,
         "ok": True, "reason": None, "mode": mode, "bottles": bottles,
         "low_state": low_state, "high_state": high_state,
         "slope": slope, "intercept": intercept, "calibrated": calibrated,
+        "pressure_factor": pressure_factor,
         "extrapolated": extrapolated, "flushed": flushed,
         "in_cal": in_cal, "excluded": excluded,
         "non_ambient": non_ambient, "blanked": blanked,
@@ -966,6 +1002,19 @@ def calibration_uncertainty(result):
 
     bottles, slope = result["bottles"], result["slope"]
 
+    # The pressure correction is a pure scaling of the calibrated value, so it
+    # is divided back out before f is recovered (the blend of the two assigned
+    # values only holds on the uncorrected scale) and multiplied back into the
+    # answer at the end. The factor itself is treated as exact: the detector
+    # pressure carries its own measurement error, but nothing in the
+    # calibration constrains it, and inventing a number for it here would be
+    # the same mistake as inventing a missing <GAS>_unc.
+    factor = result.get("pressure_factor")
+    uncorrected = calibrated if factor is None else calibrated / factor
+
+    def rescale(sigma):
+        return sigma if factor is None else sigma * factor
+
     closure_rms = {}
     for _, state, closure, _ in result.get("residuals", []):
         closure_rms.setdefault(state, []).append(closure)
@@ -990,18 +1039,18 @@ def calibration_uncertainty(result):
         s_a = bottles[low].get("assigned_unc") or 0.0
         s_r = response_sigma(low)
         sigma = pd.Series((s_a * s_a + s_r * s_r) ** 0.5, index=calibrated.index)
-        return sigma.mask(calibrated.isna()), components
+        return rescale(sigma).mask(calibrated.isna()), components
 
     a_lo, a_hi = bottles[low]["assigned"], bottles[high]["assigned"]
     s_a_lo = bottles[low].get("assigned_unc") or 0.0
     s_a_hi = bottles[high].get("assigned_unc") or 0.0
     s_r_lo, s_r_hi = response_sigma(low), response_sigma(high)
 
-    f = (calibrated - a_lo) / (a_hi - a_lo)
+    f = (uncorrected - a_lo) / (a_hi - a_lo)
     g = 1.0 - f
     var = ((g * s_a_lo) ** 2 + (f * s_a_hi) ** 2
            + (slope * g * s_r_lo) ** 2 + (slope * f * s_r_hi) ** 2)
-    return var.pow(0.5).mask(calibrated.isna()), components
+    return rescale(var.pow(0.5)).mask(calibrated.isna()), components
 
 
 # --------------------------------------------------------------------------
@@ -1219,6 +1268,17 @@ def companion_notes(gas_blocks, source_path=None, presync_rows=0):
                 f"settings exclude. The raw {block['value_col']} is untouched "
                 f"on every row, and {gas}_cal_slope/{gas}_cal_intercept are "
                 f"given everywhere, so a blank row can be recomputed.")
+            if block.get("pressure_corrected"):
+                # Stated as its own sentence, not folded into the one above:
+                # it changes what the number IS, and the slope/intercept
+                # recipe just given does not reproduce it without this step.
+                notes.append(
+                    f"{gas}: {_column_for(block)} is pressure-corrected -- "
+                    f"scaled by {D1_P_TARGET_MBARS:.0f}/"
+                    f"{block.get('pressure_col', 'P')} to normalise every "
+                    f"value to the detector's {D1_P_TARGET_MBARS:.0f} mbar "
+                    f"spec pressure. Applied after the calibration, so "
+                    f"slope*raw+intercept gives the UNcorrected value.")
         elif block.get("final_kind") == "filtered":
             notes.append(
                 f"{gas}: {_column_for(block)} is {block['value_col']} "

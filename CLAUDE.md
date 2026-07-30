@@ -205,6 +205,47 @@ A two-point (slope + intercept) form is required rather than a simple offset:
 the measured span error is several percent (span gain 0.96 on the Jul 2026
 flight, 1.06 on Feb 2025), so gain must be corrected too.
 
+**The pressure correction is a post-multiplier on the calibrated series, and
+only that.** `calibrate_series(pressure=…)` (the **140/P** checkbox beside the
+pressure tolerance, `pressure_correct` in the per-gas settings) scales the
+calibrated value by `D1_P_TARGET_MBARS / P`, normalising each reading to the
+cell's spec pressure. Four properties, all deliberate:
+
+- **It is applied after the calibration and cannot move it.** The cal-bottle
+  responses, the drift nodes, `slope`/`intercept`, every residual and
+  `span_gain` are all computed on the uncorrected measurement, so the
+  Calibration tab reads identically with the box on and off — verify that
+  after touching this, the same way the flush and `exclude_mask` invariants
+  are verified. Correcting the raw signal *before* the calibration would be
+  defensible physics, but the two-point fit would then absorb most of it
+  through the bottle responses, which is a different and far less legible
+  operation. It also means `slope*raw + intercept` (both still exported on
+  every row) gives the **un**corrected value — the companion CSV's notes say
+  so, because otherwise that recipe silently disagrees with the column beside
+  it.
+- **P is the gas's OWN detector pressure** — `d1_P_mbars` for CO2/N2O,
+  `d2_P_mbars` for CH4, from `GASES[gas]["detector"]`, unlike the pressure
+  *mask*, which reads `d1_P_mbars` for everything. Correcting a d2 measurement
+  by the d1 cell's pressure would be meaningless arithmetic. A gas with no
+  detector (Ozone, H2O) has no correction, and the checkbox disables itself in
+  `_select_gas` for a gas whose column the loaded file lacks — per gas, not
+  once at load like `Pumps on`, because which detector a gas comes off varies
+  by gas *and* by flight.
+- **A row with no usable pressure (missing, or ≤ 0) gets no value.** It goes
+  NaN in `calibrated` and joins `blanked` — the join is what makes the trace
+  break over it rather than the row being dropped and drawn across. Mixing
+  corrected and uncorrected values in one series is the outcome being avoided.
+- **The 1σ is scaled by the same factor**, in `calibration_uncertainty`, which
+  divides the factor back out before recovering `f` (the blend of the two
+  assigned values only holds on the uncorrected scale) and multiplies it into
+  the answer. The factor itself is treated as exact: the pressure reading has
+  its own error, but nothing in the calibration constrains it, and inventing a
+  number would be the same mistake as inventing a missing `<GAS>_unc`.
+
+Nothing about it is written into the ICARTT file, following the rule that the
+delivered file describes the data and not the analysis. The companion CSV's
+notes and the Export tab's summary both name it.
+
 Non-obvious properties, each of which has bitten a plausible implementation:
 
 - **QC scatter is leave-one-out, not residual-about-the-model.** The default
@@ -471,9 +512,16 @@ Two failure modes to know, because neither announces itself:
   A panel taller than the viewport now scrolls. A panel *wider* than
   `CONTROLS_WIDTH` neither scrolls (the horizontal bar is off by policy) nor
   wraps — it clips its own right-hand edge, and buttons quietly lose their
-  right halves. `CONTROLS_WIDTH` is 312 against a widest group box of 292 for
-  exactly that headroom. If you add a wide control, measure
-  `box.minimumSizeHint().width()`, don't eyeball it.
+  right halves. `CONTROLS_WIDTH` is 312 against a widest group box of 300
+  (Data Masking, since the 140/P checkbox joined the pressure row) for exactly
+  that headroom. If you add a wide control, measure
+  `box.minimumSizeHint().width()`, don't eyeball it — and measure the
+  *rendered* widget too. The pressure row's " mbar" suffix had to leave the
+  spin box and become a muted tag beside it, because a spin box narrow enough
+  to keep the row inside the panel silently ate the last digit of "10.00"
+  instead. Label text is the expensive part: the form's label column is shared,
+  so widening one row's label ("Pressure (mbar):") moved every row and cost
+  44 px, where the same words as a tag beside the field cost 8.
 - **A `QSpinBox` asks for ~85 px whatever it holds.** Rows carrying two of
   them (the trim pair, each cal window) overflow on that alone. They are
   capped with `setMaximumWidth`, which works because Qt's `qSmartMinSize`
@@ -623,8 +671,8 @@ only the first three apply; adding a new group box is what requires the
 fourth.)
 
 **"Copy settings to all gases"** (`on_copy_masking_to_all`) writes
-`COPIED_SETTING_KEYS` — `warmup_min`, `pressure_tol_mbar`, `flag_air_s`,
-`cal1_window_s`, `cal2_window_s` — from the live controls into every *other*
+`COPIED_SETTING_KEYS` — `warmup_min`, `pressure_tol_mbar`, `pressure_correct`,
+`flag_air_s`, `cal1_window_s`, `cal2_window_s` — from the live controls into every *other*
 gas block. A new persisted control has to be added to that tuple too (or
 consciously left out), or the button will silently leave it behind on the
 other gases. Only `drift_model`/`drift_smooth_events` are excluded: those are
@@ -655,7 +703,8 @@ what the rest of the flight was doing". `analysis` still exposes `warmup` and
 `end_flight` separately for anything that needs to tell them apart.
 
 New masking settings default to a **no-op value** (`flag_air_s: 0`,
-`require_pumps: False`, `end_flight_min: 0`) rather than a physically plausible one. `load_config` fills missing keys from
+`require_pumps: False`, `end_flight_min: 0`, `pressure_correct: False`)
+rather than a physically plausible one. `load_config` fills missing keys from
 `DEFAULT_GAS_SETTINGS`, so a non-zero default would silently change the
 output of every already-saved config on first launch after the upgrade.
 

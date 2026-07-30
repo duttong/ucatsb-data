@@ -229,6 +229,7 @@ DEFAULT_GAS_SETTINGS = {
     "end_flight_min": 0,
     "require_pumps": False,
     "pressure_tol_mbar": 10.0,
+    "pressure_correct": False,
     "flag_air_s": 0,
     "cal1_window_s": [-15, -1],
     "cal2_window_s": [-15, -1],
@@ -1763,8 +1764,40 @@ class UcatsbGui(QMainWindow):
         self.pressure_tol_spin.setRange(0.0, 10.0)
         self.pressure_tol_spin.setSingleStep(0.05)
         self.pressure_tol_spin.setDecimals(2)
-        self.pressure_tol_spin.setSuffix(" mbar")
+        # The " mbar" suffix became a separate tag when the correction arrived
+        # beside it: suffix + spin + checkbox asks 325 px against a 312 px
+        # panel, and a row too wide for the panel neither scrolls nor wraps --
+        # it clips its own right-hand edge in silence. Capped for the same
+        # reason as the trim pair (a spin box asks ~85 px whatever it holds);
+        # 70 is what its widest value, "10.00", needs -- measured, not
+        # guessed, and 66 visibly ate the last digit.
+        self.pressure_tol_spin.setMaximumWidth(70)
         self.pressure_tol_spin.valueChanged.connect(self.on_control_changed)
+
+        # The correction shares the tolerance's row because it shares its
+        # input -- both are about the detector pressure, and the reading that
+        # decides whether a row is masked is the one this scales by.
+        # Labelled with the arithmetic rather than "Correct": it says exactly
+        # what the box does to the number, and it fits. Every candidate label
+        # was measured against the panel -- "Correct" and "×140/P" both push
+        # this group box past the 312 px the panel has.
+        self.pressure_correct_check = QCheckBox(f"{D1_P_TARGET_MBARS:.0f}/P")
+        self.pressure_correct_check.setToolTip(
+            f"Scale the CALIBRATED mole fraction by "
+            f"{D1_P_TARGET_MBARS:.0f}/P, normalising every reading to the\n"
+            f"detector's {D1_P_TARGET_MBARS:.0f} mbar spec pressure. P is that "
+            f"gas's own detector pressure\n(d1 for CO2/N2O, d2 for CH4), so "
+            f"this only exists for the Aeris gases.\n\n"
+            f"Applied to the calibrated product only: the cal-bottle "
+            f"responses, the drift model\nand the slope/intercept are all left "
+            f"on the uncorrected measurement, so turning\nthis on cannot move "
+            f"the calibration itself. It reaches the calibrated trace, the\n"
+            f"Correlations tab and both exports.\n\n"
+            f"Off by default, so an existing config's numbers do not change "
+            f"until it is asked for."
+        )
+        self.pressure_correct_check.toggled.connect(self.on_control_changed)
+
         # One line, not two: the second line only restated the target, which
         # the tooltip now carries. A wrapped label costs a full 20 px row.
         pressure_label = QLabel("Pressure:")
@@ -1772,7 +1805,19 @@ class UcatsbGui(QMainWindow):
             f"Exclude data whose detector pressure is further than this from\n"
             f"the {D1_P_TARGET_MBARS:.0f} mbar target."
         )
-        mask_form.addRow(pressure_label, self.pressure_tol_spin)
+        # The unit as a muted inline tag, like the trim row's start/end: it
+        # cannot go in the row label (widening the label column moves every
+        # row and costs more than it saves) and it cannot stay in the spin box
+        # (the suffix is what pushed this row over the panel's width).
+        pressure_unit = QLabel("mbar")
+        pressure_unit.setStyleSheet(f"color: {MUTED_COLOR};")
+        pressure_row = QHBoxLayout()
+        pressure_row.setSpacing(4)
+        pressure_row.addWidget(self.pressure_tol_spin)
+        pressure_row.addWidget(pressure_unit)
+        pressure_row.addStretch(1)
+        pressure_row.addWidget(self.pressure_correct_check)
+        mask_form.addRow(pressure_label, pressure_row)
 
         # Unlike the two masks above, this one does not touch the cal means
         # (the flush window is ambient by definition, never inside a cal
@@ -1825,10 +1870,10 @@ class UcatsbGui(QMainWindow):
         # window boxes below too, which the label and tooltip have to say.
         self.copy_mask_button = QPushButton(self.COPY_SETTINGS_LABEL)
         self.copy_mask_button.setToolTip(
-            "Copy warm-up, pressure tolerance, Flag Air and both cal mean\n"
-            "windows from the current gas to every other calibrated gas\n"
-            "(CO2/N2O/CH4). The drift model and smoothing window are left\n"
-            "alone."
+            "Copy warm-up, pressure tolerance and correction, Flag Air and\n"
+            "both cal mean windows from the current gas to every other\n"
+            "calibrated gas (CO2/N2O/CH4). The drift model and smoothing\n"
+            "window are left alone."
         )
         self.copy_mask_button.clicked.connect(self.on_copy_masking_to_all)
         mask_form.addRow(self.copy_mask_button)
@@ -2530,6 +2575,8 @@ class UcatsbGui(QMainWindow):
         self.end_flight_spin.setValue(settings.get("end_flight_min", 0))
         self.pumps_check.setChecked(bool(settings.get("require_pumps", False)))
         self.pressure_tol_spin.setValue(settings["pressure_tol_mbar"])
+        self.pressure_correct_check.setChecked(
+            bool(settings.get("pressure_correct", False)))
         self.flag_air_spin.setValue(settings["flag_air_s"])
         self.cal1_start_spin.setValue(settings["cal1_window_s"][0])
         self.cal1_end_spin.setValue(settings["cal1_window_s"][1])
@@ -2551,6 +2598,7 @@ class UcatsbGui(QMainWindow):
             "end_flight_min": self.end_flight_spin.value(),
             "require_pumps": self.pumps_check.isChecked(),
             "pressure_tol_mbar": self.pressure_tol_spin.value(),
+            "pressure_correct": self.pressure_correct_check.isChecked(),
             "flag_air_s": self.flag_air_spin.value(),
             "cal1_window_s": [self.cal1_start_spin.value(), self.cal1_end_spin.value()],
             "cal2_window_s": [self.cal2_start_spin.value(), self.cal2_end_spin.value()],
@@ -2575,6 +2623,13 @@ class UcatsbGui(QMainWindow):
         self.main_pane.calibrated_action.setEnabled(has_masking)
         # flag_box is deliberately absent from that list -- see where it is
         # built. Its readout is per gas, so it does have to follow along.
+        # The pressure correction needs THIS gas's detector pressure column,
+        # and which detector that is varies by gas (and by flight -- the Jul
+        # 2026 file's d2 is a different instrument from the Feb 2025 one), so
+        # it is checked per gas rather than once at load like `Pumps on`.
+        # Set after mask_box's setEnabled, which Qt would otherwise override.
+        self.pressure_correct_check.setEnabled(
+            has_masking and self._pressure_column(gas) is not None)
         if has_masking:
             self._apply_settings_to_controls(self.config[gas])
         self._update_flag_readout()
@@ -2899,7 +2954,7 @@ class UcatsbGui(QMainWindow):
     # left out -- they are a judgement about that gas's cal record (how noisy
     # its injections are), not a description of the flight.
     COPIED_SETTING_KEYS = ("warmup_min", "end_flight_min", "require_pumps",
-                           "pressure_tol_mbar", "flag_air_s",
+                           "pressure_tol_mbar", "pressure_correct", "flag_air_s",
                            "cal1_window_s", "cal2_window_s")
     COPY_SETTINGS_LABEL = "Copy settings to all gases"
 
@@ -3469,6 +3524,12 @@ class UcatsbGui(QMainWindow):
                 sigma, _ = self._uncertainty_for(gas_key)
                 block["final"] = self._to_raw_rows(result["calibrated"])
                 block["final_kind"] = "calibrated"
+                # A property of the delivered numbers, so both writers can say
+                # so -- a column of mole fractions normalised to 140 mbar is
+                # not the same quantity as one that is not.
+                block["pressure_corrected"] = (
+                    result.get("pressure_factor") is not None)
+                block["pressure_col"] = analysis["pressure_col"]
                 block["sigma"] = self._to_raw_rows(sigma)
                 block["slope"] = self._to_raw_rows(result["slope"])
                 block["intercept"] = self._to_raw_rows(result["intercept"])
@@ -3516,7 +3577,9 @@ class UcatsbGui(QMainWindow):
             gas = block["gas"]
             if block.get("final_kind") == "calibrated":
                 n = int(block["final"].notna().sum())
-                lines.append(f"{gas:<6} calibrated      {n:>7,} good ambient rows")
+                lines.append(f"{gas:<6} calibrated      {n:>7,} good ambient rows"
+                             + (f"   (P-corrected to {D1_P_TARGET_MBARS:.0f} mbar)"
+                                if block.get("pressure_corrected") else ""))
             elif block.get("final_kind") == "filtered":
                 n = int(block["final"].notna().sum())
                 removed = int(block["masks"]["below_floor"].sum())
@@ -3830,6 +3893,12 @@ class UcatsbGui(QMainWindow):
         bad_pressure = (df["d1_P_mbars"] - D1_P_TARGET_MBARS).abs() > pressure_tol
         bad_pressure = bad_pressure.fillna(False)
 
+        # The column the pressure correction will divide by, or None when it
+        # is switched off (or the gas has no detector of its own). Resolved
+        # here so every view can name it without re-deriving the rule.
+        pressure_col = (self._pressure_column(gas_key)
+                        if settings.get("pressure_correct", False) else None)
+
         warmup_end = df["datetime"].iloc[0] + pd.Timedelta(minutes=warmup_minutes)
         warmup = df["datetime"] < warmup_end
 
@@ -3903,6 +3972,14 @@ class UcatsbGui(QMainWindow):
             "warmup_minutes": warmup_minutes,
             "end_flight_minutes": end_flight_minutes,
             "pressure_tol": pressure_tol,
+            # Not a mask, but it belongs to the same reading and every view
+            # that describes the calibrated record has to be able to say so
+            # without reaching for the calibration itself (which the
+            # timeseries only computes when the overlay is on).
+            # True when it is actually being applied, not merely asked for:
+            # the column has to exist for this gas on this flight.
+            "pressure_corrected": pressure_col is not None,
+            "pressure_col": pressure_col,
             "flag_air_s": flag_air_s,
         }
         return self._analysis[gas_key]
@@ -4145,6 +4222,16 @@ class UcatsbGui(QMainWindow):
                 notes.append("red = calibrated, blue = raw; calibrated shows "
                              "good air only (cal periods, flush and masked "
                              "spans blanked)")
+            # Said whether or not the overlay is on: it changes the calibrated
+            # record itself, which is what both exports ship, so the figure
+            # would otherwise show a raw trace with no hint that the product
+            # behind it has been rescaled.
+            if analysis["pressure_corrected"]:
+                notes.append(
+                    f"calibrated values scaled to {D1_P_TARGET_MBARS:.0f} mbar "
+                    f"(×{D1_P_TARGET_MBARS:.0f}/{analysis['pressure_col']}); "
+                    f"raw trace unchanged"
+                )
         # Outside the has_masking gate on purpose: Ozone has no masking
         # settings at all, and this is the one thing removing data from its
         # figure, so it is the only line that would explain the red trace.
@@ -4341,8 +4428,29 @@ class UcatsbGui(QMainWindow):
             # same mask separately fed cal_mean_points above, which is what
             # affects the calibration; this use cannot.
             exclude_mask=analysis["exclude_mask"],
+            # Likewise output-only: scaling the calibrated value by 140/P.
+            # None when the box is unchecked, which is also what makes the
+            # setting invisible in every number the Calibration tab shows.
+            pressure=(None if analysis["pressure_col"] is None
+                      else self.df[analysis["pressure_col"]]),
         )
         return self._calibration[gas_key]
+
+    def _pressure_column(self, gas_key):
+        """The detector pressure column this gas's correction divides by, or
+        None when the gas has no detector (Ozone) or the file has no such
+        column.
+
+        Per gas rather than the fixed `d1_P_mbars` the masking uses, because
+        the correction is arithmetic on the measurement itself: CH4 comes off
+        the second Aeris head, and correcting it by the first head's cell
+        pressure would be meaningless.
+        """
+        detector = GASES[gas_key].get("detector")
+        if detector is None or self.df is None:
+            return None
+        col = f"{detector}_P_mbars"
+        return col if col in self.df.columns else None
 
     def _uncertainty_for(self, gas_key):
         """(sigma Series, components dict) for one gas, cached per gas."""
@@ -4650,6 +4758,15 @@ class UcatsbGui(QMainWindow):
             if n_flagged:
                 note += f"; {n_flagged} flagged by hand"
             notes.append(note)
+        # One line for both axes when they agree, since the usual case is the
+        # correction being on everywhere. `has_masking` first, like every
+        # other note here that assumes a calibration exists.
+        corrected = [gas for gas in dict.fromkeys((x_gas, y_gas))
+                     if GASES[gas].get("has_masking", True)
+                     and self._analysis_for(gas)["pressure_corrected"]]
+        if corrected:
+            notes.append(f"{', '.join(corrected)} scaled to "
+                         f"{D1_P_TARGET_MBARS:.0f} mbar (pressure correction)")
         # The fit summary rides in this block rather than in a legend: a
         # legend has to sit somewhere, and on a scatter that fills one corner
         # it lands either on the data or on this text.
