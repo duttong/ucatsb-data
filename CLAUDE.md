@@ -789,6 +789,16 @@ Non-obvious behaviours, each deliberate:
   toolbar actions are mutually exclusive (both want left-drag), and flag mode
   is built `interactive=False` with `button=[1, 3]` — a flag is an action that
   fires and clears, not a standing selection.
+- **`attach_stats_selectors` snapshots and restores `ax.dataLim`, then calls
+  `autoscale_view()`.** A RectangleSelector adds its rectangle — and, when
+  interactive, three handle Line2Ds — to the Axes *at the origin*, and those
+  enlarge `dataLim` to include (0, 0). The timeseries survived it only because
+  its view limits are settled by other means, but its `dataLim.x0` was 0.0
+  (year 1970) rather than the record's start, which any later autoscale would
+  have inherited. Restoring `dataLim` alone is not enough — adding the artists
+  has already triggered an autoscale off the polluted limits and nothing
+  recomputes the view — hence the explicit `autoscale_view()`, safe because it
+  only touches an axis whose autoscale is still on.
 - **Undo is session-only.** A config that could undo its own contents would be
   a strange object.
 

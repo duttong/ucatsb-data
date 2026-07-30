@@ -649,6 +649,15 @@ class PlotPane(QWidget):
         flagging = self.selector_mode == "flag"
         active = self.selector_mode is not None
         for i, ax in enumerate(live):
+            # A RectangleSelector adds its rectangle (and, when interactive,
+            # its corner handles) to the Axes at the ORIGIN, and those artists
+            # enlarge ax.dataLim to include (0, 0). Restoring dataLim is not
+            # enough on its own: adding them has already triggered an autoscale
+            # off the polluted limits and nothing recomputes the view, hence
+            # the explicit autoscale_view() below -- which is safe because it
+            # only touches an axis whose autoscale is still on, leaving a
+            # preserved view or an explicitly framed y-range exactly as it was.
+            saved_limits = ax.dataLim.frozen()
             sel = RectangleSelector(
                 ax, functools.partial(self._on_select, ax), useblit=True,
                 # Flag mode is non-interactive and takes the right button too:
@@ -670,6 +679,8 @@ class PlotPane(QWidget):
                     pass
             sel.set_visible(active and not flagging
                             and i == box_index and self._box is not None)
+            ax.dataLim.set(saved_limits)
+            ax.autoscale_view()
             self.selectors.append(sel)
 
     def _on_select(self, ax, eclick, erelease):
