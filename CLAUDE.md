@@ -506,9 +506,67 @@ file is exactly as it was. So:
 - `config_path` is the name Save offers; `config_loaded_from` is the file
   actually opened, or None when the dataset started from defaults. They differ
   exactly in that case, which is what the Cal Tanks readout reports.
+- **The file label under Load Data names both**, as two fixed lines —
+  `Filename: <dataset>.csv` / `Config: <config>`, the latter `defaults` when
+  `config_loaded_from` is None. A flight can have several configs, so which one
+  is in force must be answerable without opening the Cal Tanks tab.
+  `_update_file_labels` writes **both** control pages (the per-gas panel and
+  Correlations) from one place, like `_rebuild_recent_menus`, and is called
+  from `load_csv`, `_apply_config_file` and `on_save_clicked` — the three
+  points where either name can change. It shows the config *filename* rather
+  than the variant recovered from it: the variant is a name for a thing on
+  disk, and where the two can disagree (a config predating the scheme, or one
+  opened from another directory) the filename is what tells you where to look.
+  Rich text, so the field names are bold and the values ordinary weight;
+  `html.escape` on both, since a file name is not our markup.
+
+  **Two lines and no word wrap means the values must be elided** — this is the
+  panel-width failure mode landing on the one label whose job is to name a
+  file. `Config: <default name>` measures 305 px and a short variant 349,
+  against ~300 px of panel, so unwrapped they lose their right-hand ends in
+  silence. `_elide_field` fits the value to `CONTROLS_WIDTH - 2 *
+  CONTROLS_MARGIN` minus the bold field name, and the tooltip keeps both full
+  paths. It elides from the **left**, against the usual convention: the config
+  name opens with the dataset stem, which the Filename line right above already
+  gives, so the front is the redundant part while the tail — the variant, and
+  `_conf.yaml` — is what distinguishes one config from another.
+
+  It measures against `CONTROLS_WIDTH`, not the label's own `width()`, because
+  it runs during `load_csv` before the panel is laid out (`width()` is still
+  the default 100 there). The panel is fixed-width, so the static budget is the
+  true one at every moment — but that also means `CONTROLS_MARGIN` is now load
+  bearing in two places, the layouts' `setContentsMargins` and here.
 - Save is **save-as every time**: several configs per dataset was the point,
-  so the filename is always offered for editing rather than overwriting what
+  so the name is always offered for editing rather than overwriting what
   was opened.
+
+**Save asks for a *variant name*, not a filename** (`_choose_config_name`,
+2026-07-30). `flight_config_path(csv, variant)` composes
+`<dataset stem>[_<variant>]_conf.yaml` beside the CSV;
+`config_variant_name` is its inverse, recovering the variant to pre-fill the
+field (and returning `""` for a name that predates the scheme).
+
+The dataset stem is **structural, not decoration** — `_config_candidates`
+finds a flight's configs by globbing it — and the old `QFileDialog` had no way
+to say so, so a config saved as `test.yaml` was silently invisible from the
+next open onward. Composing the name on this side is what makes "saved" and
+"findable" the same thing. Three consequences:
+
+- **`_config_candidates` stays looser than what Save now writes.** It matches
+  any `<stem>*.yaml`, not just `*_conf.yaml`, because configs named freely
+  under the old dialog exist on disk and tightening it would strand them.
+- **The overwrite prompt is ours now.** `QFileDialog` gave it for free; the
+  dialog therefore `exec_()`s in a **loop**, so declining to replace returns to
+  the name field instead of cancelling the save.
+- **Saving to another directory is gone, deliberately.** Such a config was
+  already unreachable by the stem search; `on_load_config_clicked` remains the
+  way to open one from anywhere.
+
+`sanitize_config_variant` strips path separators and `..` rather than escaping
+them — the variant is free text that lands straight in a path — and drops a
+trailing `conf` component so copying an existing name's shape doesn't yield
+`..._test_conf_conf.yaml`. It is anchored (`(?:^|_)conf$`) so a variant like
+`reconf` survives.
 
 **Dirty state is a comparison, not a flag.** `_is_dirty()` deep-compares
 `_current_state()` (config + cal_selection) against `_saved_state`, snapshotted
@@ -591,8 +649,15 @@ file. Settings themselves are no longer written
 without Save, but a test that exercises Save writes a config beside the CSV —
 so copy the CSV into the scratchpad rather than pointing the test at
 `~/Data/UCATSb/...`. Drive Save by monkeypatching
-`QFileDialog.getSaveFileName`, and the config chooser by patching
-`UcatsbGui._choose_config_file`; both are what `check_save.py` does.
+`UcatsbGui._choose_config_name` (return a path, or None for cancel), and the
+config chooser by patching `UcatsbGui._choose_config_file`.
+
+**Patch `_choose_config_file` *before* constructing `UcatsbGui`, not after.**
+It `exec_()`s a modal dialog, which under `QT_QPA_PLATFORM=offscreen` blocks
+forever with no output — and it fires from `load_csv` during `__init__`
+whenever the scratchpad already holds more than one config for that CSV, which
+a previous run of the same script will have left there. The symptom is a script
+that simply hangs.
 
 ### Correlations tab and `calibration_uncertainty`
 
@@ -711,6 +776,17 @@ use-after-free on the sender. Both therefore defer via
 `QTimer.singleShot(0, ...)` and let the signal finish first. Any future action
 inside these menus that ends in a rebuild needs the same treatment; a
 verification script must `processEvents()` after triggering one.
+
+**Picking the dataset that is already open re-runs the config choice**
+(`_reopen_config`), rather than returning silently as it used to. A flight with
+several saved configs is the case where the chooser matters most, and the
+silent no-op left it reachable only by loading another file and coming back.
+The CSV is **not** re-read — nothing about the data has changed, and re-parsing
+would discard `raw_df` (and the row count `load_flagged` validates against) to
+rebuild it identically. Everything after the read is redone: the same
+`_load_flight_config` → `_select_gas` → `_update_tank_readout` → `refresh()`
+sequence `on_load_config_clicked` uses. `_confirm_discard` still guards it, so
+a reopen cannot silently drop unsaved settings.
 
 Missing files stay listed but disabled and marked `(missing)` rather than
 being pruned on sight — an unmounted volume comes back. They are dropped only

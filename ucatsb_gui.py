@@ -13,18 +13,22 @@ to start empty and load a file from the file browser.
 """
 import copy
 import functools
+import html
+import re
 import sys
 from pathlib import Path
 
 import pandas as pd
 import yaml
 from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtGui import QFont, QFontMetrics
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
     QGroupBox, QComboBox, QDoubleSpinBox, QSpinBox, QLabel, QGridLayout,
     QButtonGroup, QRadioButton, QPushButton, QFileDialog, QMessageBox,
     QTabWidget, QCheckBox, QAction, QStackedWidget, QMenu, QFrame, QStyle,
     QDialog, QDialogButtonBox, QLineEdit, QPlainTextEdit, QScrollArea,
+    QListWidget, QListWidgetItem,
 )
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg, NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
@@ -152,6 +156,12 @@ AUX_OPTIONS = ["No Figure", "Detector Pressure", "T_gas", "Other"]
 # ~1% of the figure's width. Anything widened here should be checked against it.
 CONTROLS_WIDTH = 312
 
+# The panel layouts' contents margin, 6 rather than Qt's 9 for the reasons
+# above. Named because _elide_field has to subtract it to know how much width a
+# label actually gets; every setContentsMargins in the two control panels uses
+# it, so a change here must be a change there.
+CONTROLS_MARGIN = 6
+
 
 def aux_trace_info(selection: str, gas: str, other_column: str = None):
     """Return (column, ylabel) for the chosen auxiliary trace, given which
@@ -227,12 +237,52 @@ DEFAULT_GAS_SETTINGS = {
 }
 
 
-def flight_config_path(csv_path: Path) -> Path:
+def sanitize_config_variant(text: str) -> str:
+    """Reduce free text to the part of a filename it is allowed to be.
+
+    The variant is typed by the user but lands straight in a path, so anything
+    that could steer it out of the CSV's directory -- separators, `..`, a
+    leading dot -- is removed rather than escaped, and everything else
+    collapses to underscores so the result is one word. A trailing `conf` is
+    dropped too: the suffix is already added below, and a user copying the
+    shape of an existing name would otherwise get `..._test_conf_conf.yaml`.
+    """
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", str(text)).strip("._-")
+    cleaned = re.sub(r"(?:^|_)conf$", "", cleaned)
+    return cleaned.strip("._-")
+
+
+def flight_config_path(csv_path: Path, variant: str = "") -> Path:
     """Where a dataset's own settings live: <dataset>_conf.yaml, beside the
-    CSV. Per-flight rather than global because the right warm-up, pressure
-    tolerance, cal windows and -- above all -- cal tanks are properties of the
-    flight, and re-deriving them every time a file is reopened loses work."""
-    return Path(csv_path).with_name(f"{Path(csv_path).stem}_conf.yaml")
+    CSV, or <dataset>_<variant>_conf.yaml for a second configuration of the
+    same flight. Per-flight rather than global because the right warm-up,
+    pressure tolerance, cal windows and -- above all -- cal tanks are
+    properties of the flight, and re-deriving them every time a file is
+    reopened loses work.
+
+    The dataset stem is not decoration: `_config_candidates` finds a flight's
+    configs by it, so a name without it is a config the next open cannot see.
+    That is why the name is composed here from a variant rather than typed
+    whole into a file dialog.
+    """
+    stem = Path(csv_path).stem
+    variant = sanitize_config_variant(variant)
+    middle = f"_{variant}" if variant else ""
+    return Path(csv_path).with_name(f"{stem}{middle}_conf.yaml")
+
+
+def config_variant_name(csv_path: Path, config_path: Path) -> str:
+    """The variant `flight_config_path` would need to reproduce `config_path`,
+    or "" if the name does not follow the scheme (an older config named freely,
+    or one opened from elsewhere) -- in which case offering the default name is
+    the right fallback."""
+    if config_path is None or csv_path is None:
+        return ""
+    name = Path(config_path).name
+    stem = Path(csv_path).stem
+    if not name.startswith(stem) or not name.endswith("_conf.yaml"):
+        return ""
+    return sanitize_config_variant(name[len(stem):-len("_conf.yaml")])
 
 
 def _read_yaml(path: Path) -> dict:
@@ -1053,8 +1103,7 @@ class UcatsbGui(QMainWindow):
         self._remember_recent(csv_path)
 
         self.setWindowTitle(f"UCATS-B Viewer - {csv_path.name}")
-        self.file_label.setText(csv_path.name)
-        self.file_label.setToolTip(str(csv_path))
+        self._update_file_labels()
         # A flight whose schema predates j_pumps can't offer the filter. The
         # explicit disable survives mask_box's setEnabled(has_masking), since
         # Qt restores a child's own enabled state when its parent comes back.
@@ -1062,8 +1111,6 @@ class UcatsbGui(QMainWindow):
         if "j_pumps" not in df.columns:
             self.pumps_check.setChecked(False)
 
-        self.corr_file_label.setText(csv_path.name)
-        self.corr_file_label.setToolTip(str(csv_path))
         self._populate_corr_combos()
         self._populate_corr_color_combo()
 
@@ -1101,10 +1148,14 @@ class UcatsbGui(QMainWindow):
     def _config_candidates(self, csv_path: Path):
         """Config files that belong to this dataset, default first.
 
-        Any `<dataset stem>*.yaml` beside the CSV: Save lets the name be
-        changed freely, so `..._conf.yaml`, `..._tight_conf.yaml` and
-        `..._v2.yaml` are all the same dataset's configs, while another
-        flight's are excluded by the stem.
+        Any `<dataset stem>*.yaml` beside the CSV: Save names a variant, so
+        `..._conf.yaml` and `..._tight_conf.yaml` are both this dataset's
+        configs, while another flight's are excluded by the stem.
+
+        Deliberately looser than the names Save now composes -- it also matches
+        `..._v2.yaml` and anything else stem-prefixed. Save used to accept a
+        free-typed filename, so configs in those shapes exist on disk; matching
+        only `*_conf.yaml` would strand them.
         """
         default = flight_config_path(csv_path)
         found = sorted(p for p in csv_path.parent.glob(f"{csv_path.stem}*.yaml")
@@ -1148,6 +1199,7 @@ class UcatsbGui(QMainWindow):
         self.config_path = path or fallback_name
         self.config_loaded_from = path
         self._snapshot_state()
+        self._update_file_labels()
         self._apply_cal_selection_to_controls()
         # After the snapshot: a length mismatch is a warning about what was
         # loaded, not an unsaved change to be offered back.
@@ -1558,10 +1610,32 @@ class UcatsbGui(QMainWindow):
     def _open_recent_now(self, path_str):
         path = Path(path_str)
         if path == self.csv_path:
+            self._reopen_config()
             return
         if not self._confirm_discard("loading another dataset"):
             return
         self._try_load(path, forget_on_failure=True)
+
+    def _reopen_config(self):
+        """Picking the already-open dataset: re-choose its configuration.
+
+        This used to return silently, which left the config chooser reachable
+        only by loading some other file first and coming back -- and a flight
+        with several saved configs is exactly the case where switching between
+        them is the point of the menu entry.
+
+        The CSV is deliberately **not** re-read. Nothing about the data has
+        changed, so re-parsing would spend a second arriving at the same frame
+        and throw away `raw_df` and the flag row-count it validates against.
+        Everything after the read is redone, which is what a config switch is:
+        the same sequence `on_load_config_clicked` runs.
+        """
+        if not self._confirm_discard("reopening this dataset"):
+            return
+        self._load_flight_config(self.csv_path)
+        self._select_gas(self.current_gas)
+        self._update_tank_readout()
+        self.refresh()
 
     def _build_controls(self):
         panel = QWidget()
@@ -1588,6 +1662,8 @@ class UcatsbGui(QMainWindow):
 
         # Just the name -- the panel is 300 px wide and a full path would
         # either clip or force the panel wider. The full path is the tooltip.
+        # Two fixed lines (Filename:/Config:), written by _update_file_labels.
+        # Deliberately not word-wrapped -- see there.
         self.file_label = QLabel("No file loaded")
         self.file_label.setStyleSheet(f"color: {MUTED_COLOR};")
         vbox.addWidget(self.file_label)
@@ -2149,7 +2225,7 @@ class UcatsbGui(QMainWindow):
                 f"From {self.config_loaded_from.name} — Save to keep changes")
         else:
             self.tank_conf_label.setText(
-                f"Not saved yet — Save… offers {self.config_path.name}")
+                f"Not saved yet — Save… writes {self.config_path.name}")
 
     # The ICARTT header metadata form: (key, label, height, tooltip), where
     # height 0 is a single-line box and anything else a text area that tall.
@@ -2543,6 +2619,82 @@ class UcatsbGui(QMainWindow):
         """
         return self._saved_state is not None and self._current_state() != self._saved_state
 
+    def _update_file_labels(self):
+        """Name the dataset *and* the configuration it is being viewed through,
+        on both control pages.
+
+        Which config is loaded was otherwise invisible outside the Cal Tanks
+        tab, and since Save names a variant a flight can easily have several —
+        "which one am I looking at" is a question the panel should answer
+        without a tab change. Both pages are written from here for the same
+        reason `_rebuild_recent_menus` builds both menus: two writers of one
+        fact drift.
+
+        The config name is deliberately the **filename**, not the variant
+        recovered from it: the variant is a name for a thing on disk, and when
+        the two could disagree — an older config named freely, one opened from
+        another directory — the filename is the one that tells you what to go
+        and look at.
+
+        **Always two lines, never wrapped.** One row per fact, so the block has
+        a fixed height and the second line means the same thing every time
+        rather than sometimes being the tail of the first.
+
+        Which makes the values **elided, not clipped**: a config name runs 305
+        px for the default and 349 for a short variant, against ~300 px of
+        panel, so without wrapping the end of the name simply vanishes — the
+        panel-width failure mode, on the one label whose whole job is to name
+        a file. `_elide_field` trims it to fit and the tooltip keeps both full
+        paths.
+        """
+        if not hasattr(self, "file_label"):
+            return
+        if self.csv_path is None:
+            name, conf, tip = "No file loaded", "—", ""
+        else:
+            name = self.csv_path.name
+            if self.config_loaded_from is not None:
+                conf = self.config_loaded_from.name
+                conf_tip = f"Configuration: {self.config_loaded_from}"
+            else:
+                # Not the same as "no settings": the dataset is on
+                # DEFAULT_GAS_SETTINGS, and config_path is where the first Save
+                # would put them.
+                conf = "defaults"
+                conf_tip = ("No configuration file — built-in defaults. "
+                            f"Save… writes {self.config_path.name}.")
+            tip = f"{self.csv_path}\n{conf_tip}"
+        # Rich text: the field names are bold, the names themselves ordinary
+        # weight, so the eye lands on the two values rather than on the labels
+        # that never change. escape() because a file name is not our text --
+        # an `&` in one would otherwise be read as markup and vanish.
+        text = (f"<b>Filename:</b> {html.escape(self._elide_field('Filename:', name))}<br>"
+                f"<b>Config:</b> {html.escape(self._elide_field('Config:', conf))}")
+        for label in (self.file_label, self.corr_file_label):
+            label.setText(text)
+            label.setToolTip(tip)
+
+    def _elide_field(self, field, value):
+        """Trim `value` to what is left of the panel beside a bold `field:`.
+
+        Elided from the **left**, unusually: the config name begins with the
+        dataset stem, which the Filename line directly above already shows, so
+        the front is the one part guaranteed to be redundant while the tail
+        (the variant, and `_conf.yaml`) is what distinguishes one config from
+        another. Right-eliding would cut exactly the part worth reading.
+
+        The budget is `CONTROLS_WIDTH` minus the layout margins rather than the
+        label's own width, because the label is measured before it is laid out
+        (`_update_file_labels` runs during load) and the panel is fixed-width,
+        so the static figure is the true one at every moment.
+        """
+        bold = QFont(self.file_label.font())
+        bold.setBold(True)
+        used = QFontMetrics(bold).horizontalAdvance(field + " ")
+        room = max(40, CONTROLS_WIDTH - 2 * CONTROLS_MARGIN - used)
+        return QFontMetrics(self.file_label.font()).elidedText(
+            value, Qt.ElideLeft, room)
+
     def _update_save_state(self):
         """Mark the Save button when there is something to save."""
         if not hasattr(self, "save_button"):
@@ -2552,8 +2704,9 @@ class UcatsbGui(QMainWindow):
         name = self.config_path.name if self.config_path else "a new file"
         self.save_button.setToolTip(
             ("Unsaved changes. " if dirty else "No unsaved changes. ")
-            + f"Save writes a config file — the dialog offers {name}, and any "
-              "other name saves a second configuration of the same dataset."
+            + f"Save writes a config file beside the CSV — {name} unless you "
+              "name a variant, which saves a second configuration of the same "
+              "dataset."
         )
 
     def _mark_dirty(self):
@@ -2562,21 +2715,104 @@ class UcatsbGui(QMainWindow):
         analysis, experimenting and quitting leaves the file untouched."""
         self._update_save_state()
 
+    def _choose_config_name(self):
+        """Ask what to call this configuration, and return the full path.
+
+        A variant name, not a filename: the dataset stem and the `_conf`
+        suffix are added by `flight_config_path`, so every config this writes
+        is one `_config_candidates` will find when the flight is next opened.
+        The old QFileDialog let the name be typed whole, which meant a config
+        saved as `test.yaml` was silently invisible from then on -- a save
+        dialog that cannot express the loader's one requirement.
+
+        The cost is that a config can no longer be written to another
+        directory. Nothing is lost: such a file was already unreachable by the
+        stem search, and "Load configuration…" still opens a config by name
+        from anywhere.
+        """
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Save configuration")
+        dialog.setMinimumWidth(420)
+        layout = QVBoxLayout(dialog)
+
+        label = QLabel(f"Saved beside {self.csv_path.name}. Leave the name "
+                       f"empty for this flight's main configuration, or name a "
+                       f"variant to keep several.")
+        label.setWordWrap(True)
+        layout.addWidget(label)
+
+        form = QFormLayout()
+        edit = QLineEdit(config_variant_name(self.csv_path, self.config_path))
+        edit.setPlaceholderText("(none — the main configuration)")
+        form.addRow("Variant name:", edit)
+        layout.addLayout(form)
+
+        # The composed name, live. The whole point of taking a variant instead
+        # of a filename is that the user no longer types the parts that matter,
+        # so the result has to be visible rather than a surprise on disk.
+        preview = QLabel()
+        preview.setWordWrap(True)
+        preview.setStyleSheet(f"color: {MUTED_COLOR};")
+        layout.addWidget(preview)
+
+        def update_preview():
+            path = flight_config_path(self.csv_path, edit.text())
+            note = "  (replaces the existing file)" if path.exists() else ""
+            preview.setText(f"Saves as {path.name}{note}")
+
+        edit.textChanged.connect(update_preview)
+        update_preview()
+
+        # Existing configs, so re-saving over one is a click rather than
+        # remembering how it was spelled.
+        existing = self._config_candidates(self.csv_path)
+        if existing:
+            layout.addWidget(QLabel("Existing configurations:"))
+            listing = QListWidget()
+            listing.setMaximumHeight(96)
+            for path in existing:
+                item = QListWidgetItem(path.name)
+                item.setData(Qt.UserRole, config_variant_name(self.csv_path, path))
+                listing.addItem(item)
+            listing.itemClicked.connect(
+                lambda item: edit.setText(item.data(Qt.UserRole) or ""))
+            layout.addWidget(listing)
+
+        box = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        box.accepted.connect(dialog.accept)
+        box.rejected.connect(dialog.reject)
+        layout.addWidget(box)
+
+        # Looped, because the overwrite prompt QFileDialog gave for free is now
+        # ours to ask: answering "no" has to come back to the name, not cancel
+        # the save.
+        while True:
+            edit.setFocus()
+            edit.selectAll()
+            if dialog.exec_() != QDialog.Accepted:
+                return None
+            path = flight_config_path(self.csv_path, edit.text())
+            if not path.exists():
+                return path
+            answer = QMessageBox.question(
+                self, "Replace configuration",
+                f"{path.name} already exists.\n\nReplace it?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if answer == QMessageBox.Yes:
+                return path
+
     def on_save_clicked(self):
         """Write the current settings to a config file of the user's choosing.
 
         Save-as every time, deliberately: the request was to keep several
-        configurations per dataset, so the filename is always offered for
-        editing rather than silently overwriting whatever was opened.
+        configurations per dataset, so the name is always offered for editing
+        rather than silently overwriting whatever was opened.
         """
         if self.df is None:
             return
-        default = str(self.config_path or flight_config_path(self.csv_path))
-        path_str, _ = QFileDialog.getSaveFileName(
-            self, "Save configuration", default, "YAML Files (*.yaml);;All Files (*)")
-        if not path_str:
+        path = self._choose_config_name()
+        if path is None:
             return False
-        path = Path(path_str)
         try:
             save_config(path, self.config, cal_selection=self.cal_selection,
                         flagged=flagged_to_yaml(self.flagged, len(self.raw_df)))
@@ -2587,6 +2823,7 @@ class UcatsbGui(QMainWindow):
         self.config_path = path
         self.config_loaded_from = path
         self._snapshot_state()
+        self._update_file_labels()
         self._update_tank_readout()
         return True
 
