@@ -1707,7 +1707,13 @@ def plot_calibration_panels(fig, result, gas_key, ylabel, datetimes, unit=""):
     ax_coef.set_ylabel("slope", color=LINE_COLOR, fontsize=9)
     ax_coef.tick_params(axis="y", colors=LINE_COLOR, labelsize=8)
     ax_icept = ax_coef.twinx()
-    ax_icept.plot(datetimes, result["intercept"], color=RIGHT_AXIS_COLOR, linewidth=1.2)
+    # Dashed, and the only dashed trace on the panel: the two lines share one
+    # frame but not one scale, so the reader has to keep track of which of
+    # them the left axis is talking about. Colour alone did that; a second
+    # cue does it in a greyscale print, and the dashes are the y-axis's
+    # partner (the right spine and its labels carry the same colour).
+    ax_icept.plot(datetimes, result["intercept"], color=RIGHT_AXIS_COLOR,
+                  linewidth=1.2, linestyle="--", dashes=(5, 2))
     ax_icept.set_ylabel(f"intercept ({unit})" if unit else "intercept",
                         color=RIGHT_AXIS_COLOR, fontsize=9)
     ax_icept.tick_params(axis="y", colors=RIGHT_AXIS_COLOR, labelsize=8)
