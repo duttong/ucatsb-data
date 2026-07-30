@@ -902,6 +902,20 @@ Flag does not.
   stock behaviour. `PlotPane.set_home_view` only records that triple: it sets
   no limits and draws nothing.
 
+  **A redraw that was asked to rescale does frame on the visible data**
+  (2026-07-30), which is not a contradiction of the above but its complement:
+  a hidden artist keeps its data limits, so the autoscale still reaches out to
+  markers nobody can see — on Ozone, a 0–3663 ppb axis for a record that tops
+  out at 1140 once four flagged spikes are hidden. `redraw_corr` gates this on
+  `old_view is None`, i.e. on a *full rescale having been requested*, which is
+  what a tracer change is (`on_corr_gas_changed` / `on_corr_swap_axes` pass
+  `preserve_view=False`). Every other route preserves the view, and the Hide
+  toggle still never redraws at all — so zooming in and then toggling flagged
+  points on and off keeps them appearing and disappearing at the zoomed scale,
+  which is the whole point of the toggle. The limits are applied **before**
+  `reset_nav()`, so the visible frame becomes the nav base rather than sitting
+  on top of one that still spans the hidden markers.
+
   **Overriding `home` rather than rewriting the nav stack is the point.** The
   first version cleared the stack (`toolbar.update()`) and pushed the wanted
   range as a new base, then restored the user's view on top. It worked, but

@@ -4457,15 +4457,38 @@ class UcatsbGui(QMainWindow):
                               "x_gas": x_gas, "y_gas": y_gas}
         self.corr_pane.attach_stats_selectors([ax])
 
+        # Frame a rescale on what is actually visible. A hidden artist keeps
+        # its data limits, so the autoscale above still reaches out to flagged
+        # points the user cannot see -- on Ozone that is the difference between
+        # a 0-3663 ppb axis and a 0-900 one, for markers that are not drawn.
+        #
+        # Gated on `old_view is None`, i.e. on a full rescale having been asked
+        # for, which is what a tracer change does (on_corr_gas_changed /
+        # on_corr_swap_axes pass preserve_view=False). Every other route here
+        # preserves the view, so this cannot reframe a plot the user has zoomed
+        # in on -- and the Hide toggle itself never redraws at all, so toggling
+        # flagged points on and off at a zoomed scale keeps working exactly as
+        # before. Applied BEFORE reset_nav so this becomes the view Home
+        # returns to, rather than a range sitting on top of a nav base that
+        # still spans the hidden markers.
+        rescale_to_visible = (old_view is None and self.corr_hide_flagged
+                              and flagged_here.any())
+        if rescale_to_visible:
+            limits = self._corr_home_limits()
+            if limits:
+                ax.set_xlim(limits[0])
+                ax.set_ylim(limits[1])
+
         self.corr_pane.reset_nav()
         if old_view is not None:
             ax.set_xlim(old_view[0])
             ax.set_ylim(old_view[1])
         self._corr_ax = ax
         self._last_corr_key = corr_key
-        # After reset_nav, so Home frames what is actually drawn: with the
-        # markers hidden the autoscale reset_nav captured still includes them,
-        # since a hidden artist keeps its data limits.
+        # After reset_nav, so Home frames what is actually drawn. Still needed
+        # when the rescale above ran -- reset_nav captured the right view, but
+        # the override is also what keeps Home correct once the user zooms and
+        # then toggles the markers back off without a redraw.
         if self.corr_hide_flagged and flagged_here.any():
             self._retarget_corr_home()
         # Last, because the Hide toggle's enabled state keys off the marker
