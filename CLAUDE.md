@@ -255,6 +255,29 @@ Non-obvious properties, each of which has bitten a plausible implementation:
   cancels genuine slow drift (both neighbours share it). The plain closure
   residual is still computed and plotted, but as a self-consistency check
   that should read ~0 under `linear`; a non-zero value there is a bug signal.
+- **The leave-one-out is PAIRED: the companion bottle carries the drift**
+  (`paired_loo_residuals`, 2026-07-30). Hiding one injection also hides
+  whatever the instrument did between its neighbours — but the other tank was
+  measured over that same stretch, saw the same thing, and is still there, so
+  the plain residual charges the calibration for drift no real gap loses. The
+  node is left out of `delta = R_this − R_other` instead, and the companion's
+  own measurement is added back: a common excursion cancels and what remains
+  is what the pair genuinely disagrees about. On 2026-07-30 that is
+  0.539 → 0.215 ppm for CO2's low bottle and 2.27 → 1.57 ppb for CH4's,
+  taking the reported median 1σ from 1.04 → 0.67 ppm and 1.98 → 1.47 ppb.
+  Two things to keep in mind:
+  - **It brings the companion's own noise in**, so where the drift between
+    neighbouring injections is small next to the injection-to-injection
+    scatter it reads *worse* — N2O goes 0.66 → 0.72 ppb. That is the metric
+    being honest, not failing, and a gas moving the "wrong" way is not a bug
+    signal. Both numbers are computed (`loo_rms` and `loo_rms_plain`) and the
+    residuals panel's legend shows the unpaired one in brackets, because the
+    gap between them is the only visible measure of how much of the scatter
+    was shared drift.
+  - **It feeds the QC scatter and the uncertainty only.** The cal means, the
+    drift nodes, `slope`/`intercept`, `span_gain` and `calibrated` never read
+    `loo`, and a change here must leave them bit-identical — verified against
+    the previous implementation over all three gases when this landed.
 - **The trustworthy region is the INTERSECTION of the two bottles' node
   spans**, not "first to last cal event". A bottle can lose points to masking
   while the other keeps going. In the partial-overlap region one bottle
@@ -788,7 +811,8 @@ of the assigned values, `c = (1-f)A_lo + f A_hi` with
 - **`f` is not clamped to [0, 1].** Ambient air usually sits outside the
   bracket the two tanks span, and the uncertainty genuinely grows as the
   calibration extrapolates away from them.
-- **Per-bottle response sigma is `sqrt(loo² + closure²)`, and both halves are
+- **Per-bottle response sigma is `sqrt(loo² + closure²)`** — `loo` being the
+  *paired* leave-one-out above — **and both halves are
   required.** Under `linear` the closure residual is identically 0 (the model
   interpolates through every node), so closure alone would report zero
   uncertainty; under `constant` the LOO scatter understates the error the

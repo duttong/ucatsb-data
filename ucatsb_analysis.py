@@ -634,6 +634,66 @@ def loo_residuals(times, values):
     return out
 
 
+def paired_loo_residuals(times, values, other_times, other_values):
+    """Leave-one-out residual with the OTHER bottle carrying the drift.
+
+    `loo_residuals` throws away information the calibration never actually
+    loses. Hiding one injection of a bottle also hides whatever the
+    instrument did between its neighbours -- but the companion tank was
+    measured over that same stretch and saw the same thing, and it is still
+    there. So the plain residual charges the calibration for drift that a
+    real gap does not lose, and on a flight where the two bottles track each
+    other (r = 0.94 for CO2 on 2026-07-30) most of the reported scatter is
+    that, not irreproducibility.
+
+    The fix is to leave the node out of a series the common drift has already
+    been removed from:
+
+        delta(t)   = R_this(t) - R_other(t)      (at this bottle's node times)
+        prediction = interp(delta without i) + R_other(t_i)
+        residual   = R_this(t_i) - prediction
+
+    A common excursion cancels in `delta` and is added back through the
+    companion's own measurement, so what is left is what the pair genuinely
+    disagrees about. The difference form (rather than a ratio) is what the
+    two-point calibration's own arithmetic uses, and measured slightly better
+    on two of the three gases.
+
+    Two honest caveats, both worth knowing before reading the number:
+
+    - **It brings the companion's noise in.** `R_other(t_i)` is itself an
+      interpolation of measurements with their own scatter, so where the drift
+      between neighbouring injections is small compared with the
+      injection-to-injection noise, this is *worse* than the plain residual --
+      N2O on 2026-07-30 goes 0.66 -> 0.72 ppb while CO2 goes 0.54 -> 0.22 ppm.
+      That is the metric being honest, not failing: it is saying the pair
+      disagrees by about that much and no drift model can fix it.
+    - It describes this bottle's response **relative to the calibration's
+      other leg**, which is the quantity a two-point calibration actually
+      rests on: a shift common to both legs largely cancels in the slope.
+
+    Falls back to the plain residual when there is no companion to pair with
+    (one bottle, or fewer than two nodes on the other side).
+    """
+    if len(times) < 2 or len(other_times) < 2:
+        return loo_residuals(times, values)
+    companion = list(interp_hold(other_times, other_values,
+                                 pd.Series(list(times))))
+    if any(pd.isna(c) for c in companion):
+        return loo_residuals(times, values)
+    delta = [v - c for v, c in zip(values, companion)]
+    out = []
+    for i, t in enumerate(times):
+        others_t = times[:i] + times[i + 1:]
+        others_d = delta[:i] + delta[i + 1:]
+        if not others_t:
+            out.append(float("nan"))
+            continue
+        pred = interp_hold(others_t, others_d, pd.Series([t])).iloc[0]
+        out.append(values[i] - (pred + companion[i]))
+    return out
+
+
 def _gap_spans(times, factor=CAL_GAP_FACTOR):
     """Spans between consecutive nodes that are anomalously long (> factor x
     the median spacing) -- a telemetry dropout or a stretch where cals stopped.
@@ -762,7 +822,7 @@ def calibrate_series(df, value_col, cal_points, cal_bottles, gas_key,
             "extrapolated": false_series, "flushed": false_series,
             "in_cal": false_series, "excluded": false_series,
             "non_ambient": false_series, "blanked": false_series,
-            "residuals": [], "loo_rms": {},
+            "residuals": [], "loo_rms": {}, "loo_rms_plain": {},
             "span_gain": None, "warnings": [],
         }
 
@@ -772,7 +832,19 @@ def calibrate_series(df, value_col, cal_points, cal_bottles, gas_key,
     bottles = cal_bottle_series(cal_points, cal_bottles, gas_key)
     for state, info in bottles.items():
         info["nodes"] = drift_nodes(info["times"], info["values"], model, smooth_window)
-        info["loo"] = loo_residuals(info["times"], info["values"])
+        info["loo_plain"] = loo_residuals(info["times"], info["values"])
+        info["loo"] = info["loo_plain"]
+    # The common-mode pass needs both bottles, so it cannot live in the loop
+    # above. `loo` is what the QC scatter and the uncertainty read; the
+    # unpaired residual is kept beside it, because a reader comparing the two
+    # is the only way to see how much of the scatter was drift the pair
+    # agreed about (see paired_loo_residuals).
+    if len(bottles) == 2:
+        (_, first), (_, second) = sorted(bottles.items())
+        first["loo"] = paired_loo_residuals(
+            first["times"], first["values"], second["times"], second["values"])
+        second["loo"] = paired_loo_residuals(
+            second["times"], second["values"], first["times"], first["values"])
 
     usable = [s for s, i in bottles.items() if i["assigned"] is not None and i["times"]]
     if not usable:
@@ -851,7 +923,7 @@ def calibrate_series(df, value_col, cal_points, cal_bottles, gas_key,
     # Closure residual: what the calibration makes of its own input. Exact
     # zero by construction under "linear" -- a non-zero value there is a bug
     # signal, not a quality metric (that's what loo is for).
-    residuals, loo_rms = [], {}
+    residuals, loo_rms, loo_rms_plain = [], {}, {}
     for state in span_states:
         info = bottles[state]
         node_slope = interp_hold(times, slope, pd.Series(info["times"]))
@@ -859,9 +931,10 @@ def calibrate_series(df, value_col, cal_points, cal_bottles, gas_key,
         for i, (t, value) in enumerate(zip(info["times"], info["values"])):
             closure = node_slope.iloc[i] * value + node_icept.iloc[i] - info["assigned"]
             residuals.append((t, state, closure, info["loo"][i]))
-        finite = [r for r in info["loo"] if pd.notna(r)]
-        if finite:
-            loo_rms[state] = (sum(r * r for r in finite) / len(finite)) ** 0.5
+        for key, target in (("loo", loo_rms), ("loo_plain", loo_rms_plain)):
+            finite = [r for r in info.get(key, []) if pd.notna(r)]
+            if finite:
+                target[state] = (sum(r * r for r in finite) / len(finite)) ** 0.5
 
     if slope.notna().any() and (slope.min() < CAL_SLOPE_SANE_RANGE[0]
                                  or slope.max() > CAL_SLOPE_SANE_RANGE[1]):
@@ -913,6 +986,7 @@ def calibrate_series(df, value_col, cal_points, cal_bottles, gas_key,
         "in_cal": in_cal, "excluded": excluded,
         "non_ambient": non_ambient, "blanked": blanked,
         "residuals": residuals, "loo_rms": loo_rms,
+        "loo_rms_plain": loo_rms_plain,
         "span_gain": span_gain, "warnings": warnings,
     }
 
@@ -981,7 +1055,9 @@ def calibration_uncertainty(result):
       This term is almost entirely *systematic*: it shifts a whole flight
       together rather than scattering point to point.
     - **sR**, how well the drift model reproduces that bottle's response,
-      as sqrt(loo^2 + closure^2). Both halves are needed and neither alone is
+      as sqrt(loo^2 + closure^2), where loo is the PAIRED leave-one-out (see
+      paired_loo_residuals -- drift the other tank also saw is not charged to
+      this one). Both halves are needed and neither alone is
       right. The leave-one-out RMS is the honest scatter under a model that
       interpolates through every node (`linear`, where closure is 0 by
       construction). The closure RMS is the error the model *itself*
@@ -1744,18 +1820,26 @@ def plot_calibration_panels(fig, result, gas_key, ylabel, datetimes, unit=""):
             continue
         times = [p[0] for p in pts]
         rms = result["loo_rms"].get(state)
+        rms_plain = result.get("loo_rms_plain", {}).get(state)
         ax_res.scatter(times, [p[1] for p in pts], color=color, s=18,
                        zorder=5, edgecolors="none", label=f"{info['serial']} closure")
         ax_res.scatter(times, [p[2] for p in pts], facecolors="none",
                        edgecolors=color, s=26, zorder=4, linewidths=1.0,
                        label=f"{info['serial']} leave-one-out"
-                             + (f"  RMS={rms:.3f}" if rms is not None else ""))
+                             + (f"  RMS={rms:.3f}" if rms is not None else "")
+                             # The unpaired number beside it: the gap between
+                             # them is how much of the scatter was drift the
+                             # other bottle also saw, and it is the only place
+                             # that is visible.
+                             + (f" ({rms_plain:.3f} unpaired)"
+                                if rms_plain is not None and rms is not None
+                                and abs(rms_plain - rms) > 5e-4 else ""))
         if info.get("assigned_unc"):
             ax_res.axhspan(-info["assigned_unc"], info["assigned_unc"],
                            color=color, alpha=0.15, linewidth=0)
     ax_res.set_ylabel(f"residual ({unit})" if unit else "residual",
                       color=TEXT_COLOR, fontsize=9)
-    ax_res.set_title("Residuals: closure (filled) vs leave-one-out (hollow)",
+    ax_res.set_title("Residuals: closure (filled) vs leave-one-out (hollow, paired)",
                      color=TEXT_COLOR, loc="left", fontsize=10)
     ax_res.legend(loc="upper left", fontsize=7, framealpha=0.9,
                   ncol=2).set_in_layout(False)
