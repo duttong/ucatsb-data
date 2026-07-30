@@ -1835,7 +1835,10 @@ def plot_calibration_panels(fig, result, gas_key, ylabel, datetimes, unit=""):
         # which is where the median lands whenever ambient is above the tanks
         # -- i.e. on every CO2 flight so far.
         right_half = median_c > (grid[0] + grid[-1]) / 2
-        ax_sig.annotate(f"{median_s:.3g}", (median_c, median_s),
+        label = f"{median_s:.3g}"
+        if a_hi:
+            label += f"  ({100.0 * median_s / a_hi:.2g}%)"
+        ax_sig.annotate(label, (median_c, median_s),
                         textcoords="offset points",
                         xytext=(-5, 4) if right_half else (5, 4),
                         ha="right" if right_half else "left",
@@ -1856,6 +1859,23 @@ def plot_calibration_panels(fig, result, gas_key, ylabel, datetimes, unit=""):
     # Four ticks at most: this panel is a quarter of the figure's width, and
     # a ppm value is five characters wide before it is rotated.
     ax_sig.locator_params(axis="x", nbins=4)
+
+    # The same curve as a percentage, on the right. The denominator is the
+    # HIGHER tank's assigned value, not the gas's own mean or the span: it is
+    # the bottle ambient sits nearest, so a reader comparing this flight's
+    # precision against a spec ("0.25% of ~419 ppm") is comparing against a
+    # number that means something. A secondary axis rather than a second
+    # annotation, so every part of the curve can be read in both units --
+    # including the minimum, which is the point of the panel.
+    if a_hi:
+        serial_hi = result["bottles"][high].get("serial")
+        ax_pct = ax_sig.secondary_yaxis(
+            "right",
+            functions=(lambda s: 100.0 * s / a_hi, lambda p: p * a_hi / 100.0))
+        ax_pct.set_ylabel(f"% of {serial_hi}" if serial_hi else "% of high cal",
+                          color=MUTED_COLOR, fontsize=9)
+        ax_pct.tick_params(colors=MUTED_COLOR, labelsize=8)
+        ax_pct.spines["right"].set_color(AXIS_COLOR)
 
     # --- Header block ------------------------------------------------------
     # Drawn as a figure suptitle rather than inside an Axes: these lines are

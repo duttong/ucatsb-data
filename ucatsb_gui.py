@@ -4606,8 +4606,15 @@ class UcatsbGui(QMainWindow):
         return (result["slope"] * raw + result["intercept"]).mask(~flags)
 
     def _median_sigmas(self, *gas_units):
-        """[(gas, median 1σ, unit)] for those of `gas_units` that have a
-        calibration to propagate one from, in the order given.
+        """[(gas, median 1σ, unit, percent)] for those of `gas_units` that
+        have a calibration to propagate one from, in the order given.
+
+        `percent` is the 1σ as a percentage of the HIGHER cal tank's assigned
+        value, or None when that bottle has none. That denominator rather than
+        the gas's own mean: ambient sits nearest the high bottle, so it is the
+        one a reader is implicitly comparing against when they ask how good
+        the number is (see the 1σ panel on the Calibration tab, which puts the
+        whole curve on the same scale).
 
         A gas with has_masking=False (Ozone, H2O) contributes no entry rather
         than a zero -- no cal bottles means there is no uncertainty to report,
@@ -4629,7 +4636,11 @@ class UcatsbGui(QMainWindow):
             median = sigma.median()
             if pd.isna(median):
                 continue
-            out.append((gas, median, unit))
+            result = self._calibration_for(gas) or {}
+            high = (result.get("bottles") or {}).get(result.get("high_state"), {})
+            assigned = high.get("assigned")
+            out.append((gas, median, unit,
+                        100.0 * median / assigned if assigned else None))
         return out
 
     def redraw_corr(self, preserve_view=False):
@@ -4844,9 +4855,16 @@ class UcatsbGui(QMainWindow):
         # calibration, not of whether the bars are drawn.
         sigmas = self._median_sigmas((x_gas, x_unit), (y_gas, y_unit))
         if sigmas:
-            notes.append("median 1σ from the calibration: "
-                         + ",  ".join(f"{gas} ±{value:.3g} {unit}"
-                                      for gas, value, unit in sigmas))
+            # The "% of" is spelled out once at the end rather than after
+            # each gas: with two tracers the qualifier is longer than the
+            # numbers it qualifies.
+            notes.append(
+                "median 1σ from the calibration: "
+                + ",  ".join(f"{gas} ±{value:.3g} {unit}"
+                             + (f" ({pct:.2g}%)" if pct else "")
+                             for gas, value, unit, pct in sigmas)
+                + ("    (% of that gas's high cal tank)"
+                   if any(pct for *_, pct in sigmas) else ""))
         # in_layout=False, and it has to be: a Text is unclipped by default, so
         # constrained_layout counts it in the Axes' tight bbox and reserves
         # room for the part that hangs off the right-hand edge. But the note is
@@ -4970,9 +4988,9 @@ class UcatsbGui(QMainWindow):
         # read as the mean ± std line above it: that one is the spread of the
         # atmosphere across the flight, this one is how well the number is
         # known, and they differ by more than an order of magnitude.
-        lines = [f"{gas} ±{value:.3g} {unit}"
-                 for gas, value, unit in self._median_sigmas((x_gas, x_unit),
-                                                             (y_gas, y_unit))]
+        lines = [f"{gas} ±{value:.3g} {unit}" + (f"  ({pct:.2g}%)" if pct else "")
+                 for gas, value, unit, pct in self._median_sigmas((x_gas, x_unit),
+                                                                  (y_gas, y_unit))]
         sigma_note = ("\nmedian 1σ  " + "\n           ".join(lines)) if lines else ""
         self.corr_stats_label.setText(
             "\n".join(head) + "\n"

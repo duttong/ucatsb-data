@@ -817,6 +817,16 @@ LOO 0.59 into 0.87 ppm, against a 0.40 ppm minimum at ~406 ppm. The flight's
 1st–99th percentile is shaded and its median marked, so the panel answers
 "what is this flight paying for its bracket" directly.
 
+**The same curve is also given as a percentage**, on a `secondary_yaxis`, and
+the denominator is the **higher tank's assigned value** — not the gas's own
+mean and not the span. Ambient sits nearest that bottle, so it is what a
+reader is implicitly comparing against when they ask how good the number is
+("0.25% of ~419 ppm"). A secondary axis rather than a second annotation, so
+the whole curve reads in both units, including the minimum. The same
+percentage rides on the median-1σ readouts on Correlations, through
+`_median_sigmas`, which returns `(gas, median, unit, percent)` — a 4-tuple
+feeding two call sites, so adding a fifth field means touching both.
+
 It is a *column* of the bottom row, not a fourth stacked panel: its x axis is
 a mixing ratio, so it cannot join the `sharex` group, and a full-width row
 under three time panels would invite it to be read as one. It uses the median
