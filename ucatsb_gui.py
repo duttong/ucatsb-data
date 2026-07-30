@@ -21,9 +21,9 @@ import yaml
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
-    QGroupBox, QComboBox, QDoubleSpinBox, QSpinBox, QLabel,
+    QGroupBox, QComboBox, QDoubleSpinBox, QSpinBox, QLabel, QGridLayout,
     QButtonGroup, QRadioButton, QPushButton, QFileDialog, QMessageBox,
-    QTabWidget, QCheckBox, QAction, QStackedWidget, QMenu,
+    QTabWidget, QCheckBox, QAction, QStackedWidget, QMenu, QFrame, QStyle,
     QDialog, QDialogButtonBox, QLineEdit, QPlainTextEdit, QScrollArea,
 )
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg, NavigationToolbar2QT as NavigationToolbar
@@ -137,6 +137,20 @@ NAMED_TRACE_COLUMNS = {
 } | {g["value_col"] for g in GASES.values()}
 
 AUX_OPTIONS = ["No Figure", "Detector Pressure", "T_gas", "Other"]
+
+# Content width of the left control panel. The scroll area around it reserves
+# the scrollbar's width on top of this, so the controls get the full amount
+# either way -- several comments below explain layout choices ("a stretching
+# field squeezes the label column to nothing") that only make sense against a
+# fixed, and fairly narrow, panel.
+#
+# 312 rather than the 300 it was for a long time: the widest group box now asks
+# for 292 and there is nothing to warn you when one asks for more. A panel too
+# narrow for its contents does not scroll or wrap, it silently clips its own
+# right-hand edge -- the Save button and the Clear button lose their right
+# halves and nothing says why. The dozen px is headroom against that, and costs
+# ~1% of the figure's width. Anything widened here should be checked against it.
+CONTROLS_WIDTH = 312
 
 
 def aux_trace_info(selection: str, gas: str, other_column: str = None):
@@ -515,6 +529,24 @@ class PlotPane(QWidget):
         )
         self.flag_action.toggled.connect(self._on_flag_toggled)
         self.toolbar.addAction(self.flag_action)
+
+        # A view toggle, not a setting: it overlays this repo's calibrated
+        # series on the figure and changes nothing else, so it belongs beside
+        # the other things that decide what the figure shows rather than in the
+        # per-gas settings panel, where it was taking a row and reading like
+        # something that gets saved. Nothing connects it here -- the owner
+        # does, and hides it on the panes that have no raw trace to overlay.
+        self.toolbar.addSeparator()
+        self.calibrated_action = QAction("Calibrated", self.toolbar)
+        self.calibrated_action.setCheckable(True)
+        self.calibrated_action.setToolTip(
+            "Overlay the calibrated series (red) on the raw trace (blue).\n\n"
+            "The raw trace stays exactly as it is -- the two are told apart\n"
+            "by colour, not by which is faded. Session-only and off at\n"
+            "startup, so the app never opens showing calibrated data\n"
+            "without being asked."
+        )
+        self.toolbar.addAction(self.calibrated_action)
 
         readout = QHBoxLayout()
         self.stats_combo = QComboBox()
@@ -909,6 +941,12 @@ class UcatsbGui(QMainWindow):
         central = QWidget()
         self.setCentralWidget(central)
         layout = QHBoxLayout(central)
+        # Qt's default 9 px all round is 18 px of height the controls panel
+        # would rather have -- enough, at the default window size, to be the
+        # difference between the panel fitting and a scrollbar appearing for
+        # the sake of a few pixels. The tabs and the group boxes provide all
+        # the visual separation this edge needs.
+        layout.setContentsMargins(4, 4, 4, 4)
 
         # The control panel is a stack, not one panel: everything in the
         # main panel is per-gas and the Correlations tab is inherently about
@@ -918,8 +956,29 @@ class UcatsbGui(QMainWindow):
         self.controls_stack = QStackedWidget()
         self.controls_stack.addWidget(self._build_controls())
         self.controls_stack.addWidget(self._build_corr_controls())
-        self.controls_stack.setFixedWidth(300)
-        layout.addWidget(self.controls_stack, 0)
+
+        # The stack goes inside a QScrollArea so the WINDOW's minimum height
+        # stops being "however tall the tallest control panel happens to be".
+        # Without it the panel's ~1090 px sizeHint set a hard floor of ~1130 px
+        # on the window, which does not fit a laptop screen at default scaling
+        # -- and every control added since made it worse with no warning. The
+        # panel is compact enough that the scrollbar normally never appears;
+        # this is the backstop that makes that a layout detail rather than a
+        # constraint on the whole app. Same pattern as the Export tab.
+        controls_scroll = QScrollArea()
+        controls_scroll.setWidget(self.controls_stack)
+        controls_scroll.setWidgetResizable(True)
+        controls_scroll.setFrameShape(QFrame.NoFrame)
+        # Never scroll sideways: the panel is built to a fixed width, so a
+        # horizontal bar would only ever mean something has been laid out
+        # wrongly, and stealing height for it would be the wrong response.
+        controls_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        # Reserve the vertical scrollbar's width on top of the content width,
+        # so the controls get their full CONTROLS_WIDTH whether or not the bar
+        # is showing and nothing reflows when it appears.
+        sb_extent = self.style().pixelMetric(QStyle.PM_ScrollBarExtent)
+        controls_scroll.setFixedWidth(CONTROLS_WIDTH + sb_extent)
+        layout.addWidget(controls_scroll, 0)
         layout.addWidget(self._build_tabs(), 1)
 
         self._initializing = False
@@ -1016,8 +1075,10 @@ class UcatsbGui(QMainWindow):
         self.gas_combo.addItems(available_gases.keys())
         self.gas_combo.blockSignals(False)
 
-        for name, rb in self.aux_radios.items():
-            rb.setChecked(name == "No Figure")
+        self.aux_combo.blockSignals(True)
+        self.aux_combo.setCurrentText("No Figure")
+        self.aux_combo.blockSignals(False)
+        self.aux_selection = "No Figure"
         self.other_combo.setEnabled(False)
         self.right_axis_combo.setEnabled(False)
 
@@ -1134,7 +1195,13 @@ class UcatsbGui(QMainWindow):
         """Controls for the Correlations tab only (see the stack comment in
         __init__ for why they are not merged into the main panel)."""
         panel = QWidget()
+        panel.setFixedWidth(CONTROLS_WIDTH)
         vbox = QVBoxLayout(panel)
+        # Same tightening as the per-gas panel, and for the same reason: this
+        # is the TALLER of the two stack pages, so it -- not the other one --
+        # is what the stack asks the window for.
+        vbox.setContentsMargins(6, 6, 6, 6)
+        vbox.setSpacing(4)
 
         self.corr_file_label = QLabel("No file loaded")
         self.corr_file_label.setStyleSheet(f"color: {MUTED_COLOR};")
@@ -1142,6 +1209,8 @@ class UcatsbGui(QMainWindow):
 
         axes_box = QGroupBox("Tracers")
         axes_form = QFormLayout(axes_box)
+        axes_form.setContentsMargins(6, 6, 6, 6)
+        axes_form.setSpacing(4)
         self.corr_x_combo = QComboBox()
         self.corr_x_combo.currentTextChanged.connect(
             functools.partial(self.on_corr_gas_changed, "x"))
@@ -1158,6 +1227,8 @@ class UcatsbGui(QMainWindow):
 
         style_box = QGroupBox("Points")
         style_form = QFormLayout(style_box)
+        style_form.setContentsMargins(6, 6, 6, 6)
+        style_form.setSpacing(4)
         self.corr_size_spin = QSpinBox()
         self.corr_size_spin.setRange(1, 20)
         self.corr_size_spin.setValue(self.corr_marker_size)
@@ -1222,6 +1293,8 @@ class UcatsbGui(QMainWindow):
         # pickers change.
         self.corr_flag_box = QGroupBox("Flagged Points")
         corr_flag_form = QVBoxLayout(self.corr_flag_box)
+        corr_flag_form.setContentsMargins(6, 6, 6, 6)
+        corr_flag_form.setSpacing(4)
         target_row = QHBoxLayout()
         target_row.setSpacing(4)
         target_row.addWidget(QLabel("Flag:"))
@@ -1492,8 +1565,13 @@ class UcatsbGui(QMainWindow):
 
     def _build_controls(self):
         panel = QWidget()
-        panel.setFixedWidth(300)
+        panel.setFixedWidth(CONTROLS_WIDTH)
         vbox = QVBoxLayout(panel)
+        # Tighter than Qt's defaults (9/6). Nine group boxes' worth of gaps and
+        # margins is ~70 px of nothing, which is real estate this panel does
+        # not have; 6/4 still reads as separated.
+        vbox.setContentsMargins(6, 6, 6, 6)
+        vbox.setSpacing(4)
 
         # The menu IS the button's action (no clicked handler): pressing it
         # opens "Open File… / recent files / Clear", and setMenu also gives
@@ -1514,59 +1592,74 @@ class UcatsbGui(QMainWindow):
         self.file_label.setStyleSheet(f"color: {MUTED_COLOR};")
         vbox.addWidget(self.file_label)
 
-        gas_box = QGroupBox("Gas")
-        gas_layout = QVBoxLayout(gas_box)
+        # Gas and the aux-panel pickers share one box: all four rows answer
+        # "what is drawn", and two boxes cost 47 px of title-and-margin chrome
+        # each. The aux selection is a combo rather than the four radio buttons
+        # it used to be -- radios spend a row per option to show three the user
+        # is not choosing, which is 100 px this panel cannot spare. It is a
+        # single-choice control either way.
+        traces_box = QGroupBox("Traces")
+        traces_form = QFormLayout(traces_box)
+        traces_form.setContentsMargins(6, 6, 6, 6)
+        traces_form.setSpacing(4)
+        traces_form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+
         self.gas_combo = QComboBox()
         self.gas_combo.addItems(self.available_gases.keys())
         self.gas_combo.currentTextChanged.connect(self.on_gas_changed)
-        gas_layout.addWidget(self.gas_combo)
-        vbox.addWidget(gas_box)
+        traces_form.addRow("Gas:", self.gas_combo)
 
-        aux_box = QGroupBox("Trace Above")
-        aux_layout = QVBoxLayout(aux_box)
-        self.aux_group = QButtonGroup(aux_box)
-        self.aux_radios = {}
-        for name in AUX_OPTIONS:
-            rb = QRadioButton(name)
-            if name == "No Figure":
-                rb.setChecked(True)
-            rb.toggled.connect(self.on_aux_changed)
-            self.aux_group.addButton(rb)
-            aux_layout.addWidget(rb)
-            self.aux_radios[name] = rb
+        self.aux_combo = QComboBox()
+        self.aux_combo.addItems(AUX_OPTIONS)
+        self.aux_combo.setToolTip(
+            "What to draw in a second panel above the gas trace.\n"
+            '"No Figure" gives the gas the whole plot.'
+        )
+        self.aux_combo.currentTextChanged.connect(self.on_aux_changed)
+        traces_form.addRow("Above:", self.aux_combo)
 
         self.other_combo = QComboBox()
         self.other_combo.addItems(self.other_columns)
         self.other_combo.setEnabled(False)
         self.other_combo.currentTextChanged.connect(self.on_other_changed)
-        aux_layout.addWidget(self.other_combo)
+        traces_form.addRow("Other:", self.other_combo)
 
-        aux_layout.addWidget(QLabel("Right axis:"))
         self.right_axis_combo = QComboBox()
         self.right_axis_combo.addItem("(none)")
         self.right_axis_combo.addItems(self.other_columns)
         self.right_axis_combo.setEnabled(False)
         self.right_axis_combo.currentTextChanged.connect(self.on_right_axis_changed)
-        aux_layout.addWidget(self.right_axis_combo)
+        traces_form.addRow("Right axis:", self.right_axis_combo)
 
-        vbox.addWidget(aux_box)
+        vbox.addWidget(traces_box)
 
         self.mask_box = QGroupBox("Data Masking")
         mask_form = QFormLayout(self.mask_box)
+        mask_form.setContentsMargins(6, 6, 6, 6)
+        mask_form.setSpacing(4)
+        mask_form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
 
+        # Warm-up and end-of-flight share a row: they are the same setting at
+        # the two ends of the record, both in minutes, and they are already
+        # OR-ed into one `trimmed` mask drawn as one orange band. Two form rows
+        # spent 62 px saying that twice. The descent is the busiest part of a
+        # flight and the least like the rest of it, so trimming the tail is as
+        # routine as trimming the warm-up.
+        # No " min" suffix on either spin box: the row label carries the unit
+        # once for both. Two suffixes plus two inline labels plus the row label
+        # do not fit across a 300 px panel -- they pushed the box's minimum
+        # width to 347 and the panel silently clipped its own right-hand edge.
         self.warmup_spin = QSpinBox()
         self.warmup_spin.setRange(0, 120)
         self.warmup_spin.setSingleStep(1)
-        self.warmup_spin.setSuffix(" min")
+        self.warmup_spin.setToolTip(
+            "Exclude this many minutes at the START of the record, while the\n"
+            "instrument warms up. Reaches the cal means, not just the plot."
+        )
         self.warmup_spin.valueChanged.connect(self.on_control_changed)
-        mask_form.addRow("Warm-up exclude:", self.warmup_spin)
 
-        # The descent is the busiest part of a flight and the least like the
-        # rest of it, so trimming the tail is as routine as trimming the
-        # warm-up -- same treatment, same orange band, one shared note line.
         self.end_flight_spin = QSpinBox()
         self.end_flight_spin.setRange(0, 120)
-        self.end_flight_spin.setSuffix(" min")
         self.end_flight_spin.setToolTip(
             "Exclude this many minutes at the END of the record, the mirror\n"
             "of the warm-up exclusion at the start -- descent, landing and\n"
@@ -1574,16 +1667,36 @@ class UcatsbGui(QMainWindow):
             "reaches the cal means, not just the plot. 0 disables it."
         )
         self.end_flight_spin.valueChanged.connect(self.on_control_changed)
-        mask_form.addRow("End-flight exclude:", self.end_flight_spin)
+
+        trim_row = QHBoxLayout()
+        trim_row.setSpacing(4)
+        for text, spin in (("start", self.warmup_spin), ("end", self.end_flight_spin)):
+            tag = QLabel(text)
+            tag.setStyleSheet(f"color: {MUTED_COLOR};")
+            trim_row.addWidget(tag)
+            # Capped: a QSpinBox asks for ~85 px whatever it holds, and two of
+            # them plus their tags plus the row label overflow the panel. These
+            # hold at most "120", so the cap costs no visible digits -- but it
+            # has to be a MAXIMUM, since that is the constraint that wins over
+            # the size hint. Widen only alongside CONTROLS_WIDTH.
+            spin.setMaximumWidth(55)
+            trim_row.addWidget(spin, 1)
+        mask_form.addRow("Trim (min):", trim_row)
 
         self.pressure_tol_spin = QDoubleSpinBox()
         self.pressure_tol_spin.setRange(0.0, 10.0)
         self.pressure_tol_spin.setSingleStep(0.05)
         self.pressure_tol_spin.setDecimals(2)
         self.pressure_tol_spin.setSuffix(" mbar")
-        self.pressure_tol_spin.setMinimumWidth(130)
         self.pressure_tol_spin.valueChanged.connect(self.on_control_changed)
-        mask_form.addRow(f"Pressure tol\n(±{D1_P_TARGET_MBARS:.0f} mbar target):", self.pressure_tol_spin)
+        # One line, not two: the second line only restated the target, which
+        # the tooltip now carries. A wrapped label costs a full 20 px row.
+        pressure_label = QLabel("Pressure:")
+        pressure_label.setToolTip(
+            f"Exclude data whose detector pressure is further than this from\n"
+            f"the {D1_P_TARGET_MBARS:.0f} mbar target."
+        )
+        mask_form.addRow(pressure_label, self.pressure_tol_spin)
 
         # Unlike the two masks above, this one does not touch the cal means
         # (the flush window is ambient by definition, never inside a cal
@@ -1600,6 +1713,7 @@ class UcatsbGui(QMainWindow):
             "cal period end are dropped from the calibrated series and the\n"
             "export; the raw trace keeps them. 0 disables it."
         )
+        self.flag_air_spin.setMaximumWidth(62)
         self.flag_air_spin.valueChanged.connect(self.on_control_changed)
 
         # Pumps toggle and Flag Air share one spanning row, the toggle to the
@@ -1645,16 +1759,34 @@ class UcatsbGui(QMainWindow):
 
         vbox.addWidget(self.mask_box)
 
-        # Visual order swapped: the 100% bottle box appears above the 50% one.
-        self.cal2_box, self.cal2_start_spin, self.cal2_end_spin = self._add_cal_window_box(
-            vbox, "Cal 2 Mean Window"
-        )
-        self.cal1_box, self.cal1_start_spin, self.cal1_end_spin = self._add_cal_window_box(
-            vbox, "Cal 1 Mean Window"
-        )
-
+        # ONE calibration box, holding what used to be three: a mean-window box
+        # per tank plus a box for the drift model. Each cost 41 px of title and
+        # margin to hold a single row, and all three answer the same question
+        # -- how the two-point calibration is built. The grid rows are the two
+        # tanks' windows; the drift model spans beneath them.
         self.cal_box = QGroupBox("Calibration")
-        cal_form = QFormLayout(self.cal_box)
+        cal_grid = QGridLayout(self.cal_box)
+        cal_grid.setContentsMargins(6, 6, 6, 6)
+        cal_grid.setHorizontalSpacing(4)
+        cal_grid.setVerticalSpacing(4)
+
+        # Visual order is unchanged from the two-box version: the 100% bottle's
+        # row is above the 50% one. The tank each row belongs to used to be a
+        # box title, which had room for "100% Cal (CC302489) 418.947 ppm"; a row
+        # label does not, so it carries the short form and the full
+        # identification moved to its tooltip -- see _set_cal_row_label, which
+        # sets both together. Start/End get no labels of their own for the same
+        # reason; the header row above them names the columns once.
+        cal_grid.addWidget(QLabel("Window:"), 0, 0)
+        for col, name in ((1, "start"), (2, "end")):
+            header = QLabel(name)
+            header.setAlignment(Qt.AlignHCenter)
+            header.setStyleSheet(f"color: {MUTED_COLOR};")
+            cal_grid.addWidget(header, 0, col)
+        (self.cal2_label, self.cal2_start_spin,
+         self.cal2_end_spin) = self._add_cal_window_row(cal_grid, 1, "Cal 2")
+        (self.cal1_label, self.cal1_start_spin,
+         self.cal1_end_spin) = self._add_cal_window_row(cal_grid, 2, "Cal 1")
 
         # One row, one label: the smoothing window only means anything for the
         # "smooth" model, so it reads as part of that choice rather than as an
@@ -1685,20 +1817,21 @@ class UcatsbGui(QMainWindow):
         self.smooth_spin.valueChanged.connect(self.on_control_changed)
         self.smooth_spin.setMaximumWidth(72)
         drift_row.addWidget(self.smooth_spin)
-        cal_form.addRow(drift_row)
+        cal_grid.addLayout(drift_row, 3, 0, 1, 3)
 
-        # Session-only, deliberately not persisted and off by default: the
-        # timeseries is documented as showing uncalibrated data, and a
-        # remembered toggle would let the app start up showing calibrated
-        # data with no visible reason why.
-        self.calibrated_check = QCheckBox("Show calibrated on main plot")
-        self.calibrated_check.toggled.connect(self.on_calibrated_toggled)
-        cal_form.addRow(self.calibrated_check)
-
-        # No export button here any more: exporting is now the Export tab's
-        # job, where it can cover every gas at once. This panel is per-gas,
-        # and a per-gas button was quietly the reason the old export could
-        # only ever describe one of them.
+        # "Show calibrated" is NOT here any more -- it is a checkable action on
+        # the Timeseries toolbar (see PlotPane.calibrated_action). It changes
+        # no setting and is not saved; it only decides what the figure draws,
+        # which is what every other control on that toolbar does. It stays
+        # session-only and off by default for the old reason: the timeseries is
+        # documented as showing uncalibrated data, and a remembered toggle
+        # would let the app start up showing calibrated data with no visible
+        # reason why.
+        #
+        # No export button here either: exporting is the Export tab's job,
+        # where it can cover every gas at once. This panel is per-gas, and a
+        # per-gas button was quietly the reason the old export could only ever
+        # describe one of them.
         vbox.addWidget(self.cal_box)
 
         # Deliberately NOT in the setEnabled(has_masking) list in _select_gas:
@@ -1708,6 +1841,8 @@ class UcatsbGui(QMainWindow):
         # points the user struck out by hand.
         self.flag_box = QGroupBox("Flagged Points")
         flag_form = QVBoxLayout(self.flag_box)
+        flag_form.setContentsMargins(6, 6, 6, 6)
+        flag_form.setSpacing(4)
         self.flag_label = QLabel("No points flagged")
         self.flag_label.setWordWrap(True)
         self.flag_label.setStyleSheet(f"color: {MUTED_COLOR};")
@@ -1749,43 +1884,57 @@ class UcatsbGui(QMainWindow):
         "Settings are saved per-gas."
     )
 
-    def _add_cal_window_box(self, vbox, title):
-        """Start/End on one row -- two form rows per box cost more vertical
-        space than the control panel can spare on a laptop screen."""
-        box = QGroupBox(title)
-        box.setToolTip(self.CAL_WINDOW_HELP)
-        row = QHBoxLayout(box)
+    def _add_cal_window_row(self, grid, row, fallback):
+        """One tank's [start, end] window as a labelled row of the shared grid.
+
+        Start and End have no labels of their own -- the box title says
+        "(start, end)" and each spin box carries its own tooltip. Two words per
+        row would push the tank label out of a 300 px panel, and the pair reads
+        as one interval anyway.
+        """
+        label = QLabel(fallback)
+        label.setToolTip(self.CAL_WINDOW_HELP)
+        grid.addWidget(label, row, 0)
 
         spins = []
-        for label in ("Start:", "End:"):
+        for which, tip in (("start", "Window START, relative to Cal_p."),
+                           ("end", "Window END, relative to Cal_p.")):
             spin = QSpinBox()
             spin.setRange(-60, 60)
             spin.setSuffix(" s")
+            # See the trim spins: a maximum, not a hint, so the pair fits the
+            # panel. "-60 s" is the widest text these ever hold.
+            spin.setMaximumWidth(80)
+            spin.setToolTip(f"{tip}\n\n{self.CAL_WINDOW_HELP}")
             spin.valueChanged.connect(self.on_control_changed)
-            row.addWidget(QLabel(label))
-            row.addWidget(spin, 1)
+            grid.addWidget(spin, row, len(spins) + 1)
             spins.append(spin)
+        grid.setColumnStretch(1, 1)
+        grid.setColumnStretch(2, 1)
+        return label, spins[0], spins[1]
 
-        vbox.addWidget(box)
-        return box, spins[0], spins[1]
+    def _set_cal_row_label(self, label_widget, serial, fallback):
+        """Name a cal-window row for the tank it belongs to.
 
-    def _cal_box_title(self, label, fallback):
-        """Title a cal-window box as "<info> Cal (<serial>) <mole fraction>"
-        (e.g. "50% Cal (CB09960) 206.51 ppm") using cals.yaml's info field
-        and its assigned value for the active gas, if the serial was
-        matched; otherwise fall back. `info` (the rough-percentage label) is
-        optional -- not every tank in the roster has one -- so the mole
-        fraction still shows up without it rather than losing the title
-        entirely."""
-        nominal = self.cal_bottles.get(label, {}) if label else {}
+        The visible text is the short form -- cals.yaml's `info` ("100%") when
+        there is one, else the serial -- because a row label has far less room
+        than the group-box title this used to be. The full identification
+        ("100% Cal (CC302489) 418.947 ppm") moves to the tooltip, so nothing is
+        lost, only demoted. `info` stays optional: not every tank in the roster
+        has one, and the next one added may well arrive without it.
+        """
+        nominal = self.cal_bottles.get(serial, {}) if serial else {}
         if not nominal:
-            return fallback
+            label_widget.setText(fallback)
+            label_widget.setToolTip(self.CAL_WINDOW_HELP)
+            return
         info = nominal.get("info")
-        title = f"{info} Cal ({label})" if info else f"Cal ({label})"
+        full = f"{info} Cal ({serial})" if info else f"Cal ({serial})"
         value = nominal.get(self.current_gas)
         if value is not None:
-            title += f" {value:g} {gas_unit(self.current_gas)}"
-        return title
+            full += f" {value:g} {gas_unit(self.current_gas)}"
+        label_widget.setText(info if info else serial)
+        label_widget.setToolTip(f"{full}\n\n{self.CAL_WINDOW_HELP}")
 
     def _build_tabs(self):
         """Timeseries, Calibration and Cal Tanks as tabs over the shared
@@ -1802,6 +1951,7 @@ class UcatsbGui(QMainWindow):
         self.cal_pane = PlotPane()
         self.main_pane.on_box = self.on_stats_box
         self.main_pane.on_flag_box = self.on_flag_box
+        self.main_pane.calibrated_action.toggled.connect(self.on_calibrated_toggled)
         # The Calibration tab's three panels each mean something different
         # (response deviation, coefficients, residuals), so a single box-stats
         # readout there would be ambiguous -- Timeseries only for now. Flagging
@@ -1810,6 +1960,10 @@ class UcatsbGui(QMainWindow):
         # would have to name.
         self.cal_pane.stats_action.setVisible(False)
         self.cal_pane.flag_action.setVisible(False)
+        # The overlay is a Timeseries thing: the other two panes draw derived
+        # quantities that are calibrated already or not calibrated at all, so
+        # there is no raw trace there to lay a calibrated one over.
+        self.cal_pane.calibrated_action.setVisible(False)
         # Keep the historical attribute names bound to the timeseries pane so
         # redraw()'s existing body needs no changes.
         self.figure = self.main_pane.figure
@@ -1825,6 +1979,7 @@ class UcatsbGui(QMainWindow):
         # timeseries. The ambiguity Stats could not resolve (a box names two
         # gases' rows) is settled by the explicit target combo instead.
         self.corr_pane.stats_action.setVisible(False)
+        self.corr_pane.calibrated_action.setVisible(False)
         self.corr_pane.on_flag_box = self.on_corr_flag_box
 
         self.export_pane = self._build_export_pane()
@@ -2335,9 +2490,13 @@ class UcatsbGui(QMainWindow):
         self.current_gas = gas
         has_masking = GASES[gas].get("has_masking", True)
         self.mask_box.setEnabled(has_masking)
-        self.cal1_box.setEnabled(has_masking)
-        self.cal2_box.setEnabled(has_masking)
         self.cal_box.setEnabled(has_masking)
+        # The overlay toggle moved to the toolbar, so it no longer greys out
+        # with the box it used to sit in -- it has to be told. A gas with no
+        # cal bottles has nothing to overlay. Its checked state is left alone,
+        # exactly as a disabled checkbox's would be, so switching away and back
+        # returns it as it was.
+        self.main_pane.calibrated_action.setEnabled(has_masking)
         # flag_box is deliberately absent from that list -- see where it is
         # built. Its readout is per gas, so it does have to follow along.
         if has_masking:
@@ -3242,13 +3401,12 @@ class UcatsbGui(QMainWindow):
                         f"having no value for any variable.")
         QMessageBox.information(self, "Export ICARTT", message)
 
-    def on_aux_changed(self, checked: bool):
-        if not checked:
+    def on_aux_changed(self, selection: str):
+        # Fires with "" while the combo is being repopulated on a file load;
+        # the caller re-selects "No Figure" itself, so there is nothing to do.
+        if not selection:
             return
-        for name, rb in self.aux_radios.items():
-            if rb.isChecked():
-                self.aux_selection = name
-                break
+        self.aux_selection = selection
         self.other_combo.setEnabled(self.aux_selection == "Other")
         # The right-axis trace twins whatever's on the aux panel, so it only
         # makes sense once that panel exists at all.
@@ -3672,8 +3830,8 @@ class UcatsbGui(QMainWindow):
         if has_masking:
             cal0_label = most_common_serial(cal_points, 0) or "Cal 1"
             cal1_label = most_common_serial(cal_points, 1) or "Cal 2"
-            self.cal1_box.setTitle(self._cal_box_title(cal0_label, "Cal 1 Mean Window"))
-            self.cal2_box.setTitle(self._cal_box_title(cal1_label, "Cal 2 Mean Window"))
+            self._set_cal_row_label(self.cal1_label, cal0_label, "Cal 1")
+            self._set_cal_row_label(self.cal2_label, cal1_label, "Cal 2")
 
         handles = [line]
         # Kept short when both traces are shown -- the y-axis already names

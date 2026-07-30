@@ -272,12 +272,15 @@ the GUI's Cal Tanks tab overrides it per flight and stores the choice in
 records a tank swap on the *current* run; it is no longer the only way to
 analyse a flight that flew something else.
 
-`info` is a rough round-number label (`50%`/`100%`) used only to title the
-cal-window boxes. Every tank in the roster carries one as of 2026-07-29, but
-it stays **optional**: `_cal_box_title` in `ucatsb_gui.py` shows the serial +
-mole fraction without it rather than losing the title, so don't reintroduce a
-hard dependency on `info` being present — the next tank added to the roster
-may well arrive without one.
+`info` is a rough round-number label (`50%`/`100%`) used only to name the
+cal-window rows. Every tank in the roster carries one as of 2026-07-29, but
+it stays **optional**: `_set_cal_row_label` in `ucatsb_gui.py` falls back to
+the serial rather than losing the label, so don't reintroduce a hard
+dependency on `info` being present — the next tank added to the roster may
+well arrive without one. `info` is now the *visible* text (a row label has far
+less room than the group-box title this used to be, 2026-07-30); the full
+"100% Cal (CC302489) 418.947 ppm" moved to the label's tooltip, which is built
+in the same place so the two cannot drift.
 
 ### Cal bottle identity is matched by concentration, not trusted from config
 
@@ -327,8 +330,8 @@ missing from a given file's schema.
 
 Data is plotted **uncalibrated** (`d1_CO2_ppm`, `d1_N2O_ppb`, `d2_CH4_ppb`),
 not the `*c_ppm`/`*c_ppb` calibrated columns — this was a deliberate switch;
-don't revert to the calibrated columns without being asked. The "Show
-calibrated on main plot" toggle does **not** change this: it overlays the
+don't revert to the calibrated columns without being asked. The **Calibrated**
+toolbar toggle does **not** change this: it overlays the
 result of *this repo's* `calibrate_series` in red (`CALIBRATED_COLOR`),
 keeping the raw trace in its usual blue `LINE_COLOR` underneath at
 `alpha=0.55`. The two traces are distinguished by **hue, not by which one is
@@ -336,12 +339,22 @@ faded** — recoloring the raw trace when the overlay came on read as the raw
 data having changed. It is session-only and defaults off, precisely so
 the app never starts up showing calibrated data without the user asking.
 
+It lives on the Timeseries **toolbar** (`PlotPane.calibrated_action`), not in
+the controls panel where it used to be a checkbox (moved 2026-07-30): it
+changes what the figure draws and nothing else, which is what everything else
+on that toolbar does, and sitting among the per-gas settings made a
+session-only view toggle look like something that gets saved. Two consequences
+worth keeping: it is hidden on the Calibration and Correlations panes, which
+have no raw trace to overlay; and because it no longer sits inside `cal_box`
+it does not grey out with it, so `_select_gas` disables it explicitly for a
+gas with `has_masking=False`.
+
 ### GUI view-preservation (`ucatsb_gui.py` `redraw()`)
 
 `redraw(preserve_view=False)` rebuilds the whole Figure from scratch every
 call (`self.figure.clear()` + fresh `add_subplot`/`add_gridspec`) rather than
 updating artists in place, because the panel count changes (single axes vs.
-main+aux) depending on the "Trace Above" selection. To avoid the zoom
+main+aux) depending on the "Above:" trace selection. To avoid the zoom
 resetting on every masking/averaging tweak or aux-trace change:
 
 - The **main plot's** x/y limits are captured before clearing and reapplied
@@ -417,6 +430,43 @@ still the default and the reason holds (duplicating the gas selector, or
 making one tab depend on state invisible from another); Correlations is the
 exception because it is inherently about *two* gases, so a per-gas panel
 beside it would be actively misleading about what is plotted.
+
+### The controls panel's size is a constraint on the whole window
+
+Both stack pages are `CONTROLS_WIDTH` wide and as tall as their contents, and
+the stack is as tall as the **taller** page — currently Correlations, not the
+per-gas panel, so a height measurement that only looks at the one you edited
+is measuring the wrong thing.
+
+**The stack sits inside a `QScrollArea`** (added 2026-07-30). Without it the
+panel's ~1090 px sizeHint set a hard floor of ~1130 px on the *window*, which
+does not fit a laptop screen at default scaling — and every control added over
+the years pushed it up with nothing to say so. With it the window minimum is
+~420 px. Compaction in the same change brought the panel itself to ~715, so
+the scrollbar normally never appears; the scroll area is what keeps that a
+layout detail rather than something the user hits.
+
+Two failure modes to know, because neither announces itself:
+
+- **Too little height is invisible; too little width is silent corruption.**
+  A panel taller than the viewport now scrolls. A panel *wider* than
+  `CONTROLS_WIDTH` neither scrolls (the horizontal bar is off by policy) nor
+  wraps — it clips its own right-hand edge, and buttons quietly lose their
+  right halves. `CONTROLS_WIDTH` is 312 against a widest group box of 292 for
+  exactly that headroom. If you add a wide control, measure
+  `box.minimumSizeHint().width()`, don't eyeball it.
+- **A `QSpinBox` asks for ~85 px whatever it holds.** Rows carrying two of
+  them (the trim pair, each cal window) overflow on that alone. They are
+  capped with `setMaximumWidth`, which works because Qt's `qSmartMinSize`
+  bounds the minimum by the maximum — `setMinimumWidth` would not have done
+  it, and the natural size hint ignores that these only ever show three
+  characters.
+
+Group boxes are the expensive thing to add: each costs ~41 px of title and
+margin before it holds anything, which is why Gas and the aux pickers share
+"Traces", and the two cal-window boxes plus the drift model share
+"Calibration". Layouts here run 6 px margins / 4 px spacing rather than Qt's
+9/6 default for the same reason.
 
 `refresh()` redraws only the visible pane and marks the others dirty, so a
 spinbox drag doesn't render a pane nobody is looking at. The `_preserve`
