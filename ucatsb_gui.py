@@ -428,6 +428,45 @@ def save_config(path: Path, config: dict, cal_selection: dict = None,
                               default_flow_style=False, width=100))
 
 
+class _NavToolbar(NavigationToolbar):
+    """The stock toolbar, with a Home that can be pointed somewhere else.
+
+    Home normally returns to the first entry of the nav stack, and the only
+    way to change that entry through the public API is to clear the stack and
+    push a new base -- which throws away every zoom and pan the user has done,
+    so Back and Forward stop working. Overriding `home` instead leaves the
+    stack completely alone: the history is theirs, and only where Home lands
+    is ours to redirect.
+
+    The override is a plain (axes, xlim, ylim) triple rather than a callback,
+    and it is checked against the figure's live axes because the panes rebuild
+    their Figure from scratch on every draw -- an override captured before a
+    redraw refers to a destroyed Axes and must not be applied to the new one.
+    """
+
+    def __init__(self, canvas, parent=None):
+        super().__init__(canvas, parent)
+        self._home_override = None
+
+    def set_home_override(self, ax=None, xlim=None, ylim=None):
+        """Point Home at `xlim`/`ylim` on `ax`; `ax=None` restores the
+        stock behaviour. Nothing is drawn and no limits are touched -- the
+        view on screen is not this method's business."""
+        self._home_override = None if ax is None else (ax, xlim, ylim)
+
+    def home(self, *args):
+        override = self._home_override
+        if override is not None and override[0] in self.canvas.figure.axes:
+            ax, xlim, ylim = override
+            ax.set_xlim(*xlim)
+            ax.set_ylim(*ylim)
+            # Pushed so Back still returns to wherever they were standing.
+            self.push_current()
+            self.canvas.draw_idle()
+            return
+        super().home(*args)
+
+
 class PlotPane(QWidget):
     """One matplotlib Figure with its own toolbar, as a tab page.
 
@@ -441,7 +480,7 @@ class PlotPane(QWidget):
         layout = QVBoxLayout(self)
         self.figure = Figure(constrained_layout=True)
         self.canvas = FigureCanvasQTAgg(self.figure)
-        self.toolbar = NavigationToolbar(self.canvas, self)
+        self.toolbar = _NavToolbar(self.canvas, self)
 
         # Appended to the stock toolbar rather than declared through
         # NavigationToolbar.toolitems: toolitems entries have to name a method
@@ -525,9 +564,35 @@ class PlotPane(QWidget):
 
     def reset_nav(self):
         """Point the toolbar's Home at the newly-built full-scale view; its
-        nav stack otherwise still references the just-destroyed Axes."""
+        nav stack otherwise still references the just-destroyed Axes.
+
+        Also drops any Home override: a fresh draw has just established what
+        full scale means, and an override from before it described a figure
+        that no longer exists.
+        """
+        self.toolbar.set_home_override(None)
         self.toolbar.update()
         self.toolbar.push_current()
+
+    def set_home_view(self, ax, xlim, ylim):
+        """Point Home at `xlim`/`ylim` without touching the current view.
+
+        Needed because hiding the flagged points must not replot -- the user
+        is typically zoomed in on the very points being hidden -- yet Home
+        should then frame what is left rather than a range set by markers that
+        are no longer drawn.
+
+        This sets nothing and draws nothing; it only records where Home goes
+        (see _NavToolbar). An earlier version applied the range, pushed it as
+        a new nav-stack base and put the old view back, which worked but wiped
+        the user's zoom/pan history on every toggle and moved the axis limits
+        twice per click for no visible reason.
+        """
+        self.toolbar.set_home_override(ax, xlim, ylim)
+
+    def clear_home_view(self):
+        """Give Home back to the nav stack's own base."""
+        self.toolbar.set_home_override(None)
 
     def _set_readout_visible(self, visible, stats_widgets=True):
         """Show the readout row. The label is shared by both tools -- the flag
@@ -814,6 +879,10 @@ class UcatsbGui(QMainWindow):
         # Set by redraw_corr; what the flag tool resolves a dragged box
         # against. None until the tab has drawn something flaggable.
         self._corr_plotted = None
+        self._corr_flag_scatter = None
+        # Session-only, like the calibrated overlay: which markers you have
+        # temporarily taken off the plot is not a property of the flight.
+        self.corr_hide_flagged = False
         self.corr_marker_size = 4
         self.corr_error_bars = False
         # None = single-color points; otherwise a key into CORR_COLOR_BY.
@@ -1170,6 +1239,21 @@ class UcatsbGui(QMainWindow):
         self.corr_flag_label.setWordWrap(True)
         self.corr_flag_label.setStyleSheet(f"color: {MUTED_COLOR};")
         corr_flag_form.addWidget(self.corr_flag_label)
+
+        # Hiding is a *view* change, not an edit: it toggles the markers'
+        # visibility in place and never redraws, because the user is usually
+        # zoomed in on the very points being hidden and a replot would throw
+        # that away. Session-only, like the calibrated overlay -- what you are
+        # looking at right now is not a property of the flight.
+        self.corr_hide_check = QCheckBox("Hide flagged points")
+        self.corr_hide_check.setToolTip(
+            "Take the struck-out markers off the plot without redrawing, so\n"
+            "the current zoom is kept exactly. Home then rescales to the\n"
+            "unflagged data. The points stay flagged either way — this only\n"
+            "changes what is drawn."
+        )
+        self.corr_hide_check.toggled.connect(self.on_corr_hide_flagged)
+        corr_flag_form.addWidget(self.corr_hide_check)
 
         corr_flag_buttons = QHBoxLayout()
         self.corr_flag_undo_button = QPushButton("Undo")
@@ -2517,6 +2601,66 @@ class UcatsbGui(QMainWindow):
             "No points flagged" if not parts else "  ·  ".join(parts))
         self.corr_flag_clear_button.setEnabled(bool(total))
         self.corr_flag_undo_button.setEnabled(bool(self._flag_undo))
+        # Keyed off what is DRAWN, not off the combo's scope: the markers show
+        # flags on either axis, so the toggle stays useful while the combo
+        # points at a gas with none of its own.
+        self.corr_hide_check.setEnabled(self._corr_flag_scatter is not None)
+
+    def on_corr_hide_flagged(self, checked):
+        """Show or hide the struck-out markers, without replotting.
+
+        Deliberately not a refresh(): the whole point is that the current zoom
+        survives, and the flags themselves are unchanged -- this is a view
+        toggle, so nothing is dirtied and nothing is recomputed. Only the
+        artist's visibility and the Home target move.
+        """
+        if self._initializing:
+            return
+        self.corr_hide_flagged = checked
+        if self._corr_flag_scatter is not None:
+            self._corr_flag_scatter.set_visible(not checked)
+        self._retarget_corr_home()
+        self.corr_pane.canvas.draw_idle()
+
+    def _corr_home_limits(self):
+        """(xlim, ylim) Home should return to, given what is currently drawn.
+
+        Built from the recorded plotted data rather than from `ax.dataLim`,
+        which still carries the hidden markers -- and which the selectors have
+        their own history of polluting. 5% margins, matching what matplotlib's
+        own autoscale would have produced. None when there is nothing to frame.
+        """
+        plotted = self._corr_plotted
+        if not plotted:
+            return None
+        keep = plotted["keep"]
+        if self.corr_hide_flagged:
+            # Only the paired, unflagged record: `keep` already excludes every
+            # flagged row, which is exactly what stays on screen.
+            shown = keep
+        else:
+            shown = keep | plotted["flagged"]
+        fx, fy = plotted["x"][shown], plotted["y"][shown]
+        if not len(fx.dropna()) or not len(fy.dropna()):
+            return None
+
+        def span(values):
+            lo, hi = float(values.min()), float(values.max())
+            pad = 0.05 * (hi - lo) if hi > lo else (abs(hi) * 0.05 or 0.5)
+            return lo - pad, hi + pad
+
+        return span(fx), span(fy)
+
+    def _retarget_corr_home(self):
+        """Point Home at what is currently drawn -- or hand it back to the nav
+        stack when the markers are showing, since then the stock full-scale
+        view is already right."""
+        if not self.corr_hide_flagged:
+            self.corr_pane.clear_home_view()
+            return
+        limits = self._corr_home_limits()
+        if limits and self._corr_ax is not None:
+            self.corr_pane.set_home_view(self._corr_ax, *limits)
 
     def on_corr_flag_clear(self):
         """Clear the flags on whichever tracer the combo names -- the same
@@ -3971,6 +4115,7 @@ class UcatsbGui(QMainWindow):
             self.corr_stats_label.setText("")
             self._corr_ax = None
             self._corr_plotted = None
+            self._corr_flag_scatter = None
             self._last_corr_key = corr_key
             self.corr_pane.reset_nav()
             self.corr_pane.canvas.draw()
@@ -4046,10 +4191,13 @@ class UcatsbGui(QMainWindow):
                         & fx.notna() & fy.notna())
         if z_vals is not None:
             flagged_here &= z_vals.notna()
+        self._corr_flag_scatter = None
         if flagged_here.any():
-            ax.scatter(fx[flagged_here], fy[flagged_here], marker="x",
-                       s=max(28, self.corr_marker_size ** 2), linewidths=1.1,
-                       color=FLAGGED_COLOR, zorder=4)
+            self._corr_flag_scatter = ax.scatter(
+                fx[flagged_here], fy[flagged_here], marker="x",
+                s=max(28, self.corr_marker_size ** 2), linewidths=1.1,
+                color=FLAGGED_COLOR, zorder=4,
+                visible=not self.corr_hide_flagged)
 
         fit = linear_fit(x, y) if self.corr_fit else None
         if fit:
@@ -4145,6 +4293,7 @@ class UcatsbGui(QMainWindow):
         # z-variable's own pairing rule, and rebuilding that from the outside
         # would be a second implementation free to drift from this one.
         self._corr_plotted = {"keep": keep, "x": fx, "y": fy,
+                              "flagged": flagged_here,
                               "x_gas": x_gas, "y_gas": y_gas}
         self.corr_pane.attach_stats_selectors([ax])
 
@@ -4154,6 +4303,14 @@ class UcatsbGui(QMainWindow):
             ax.set_ylim(old_view[1])
         self._corr_ax = ax
         self._last_corr_key = corr_key
+        # After reset_nav, so Home frames what is actually drawn: with the
+        # markers hidden the autoscale reset_nav captured still includes them,
+        # since a hidden artist keeps its data limits.
+        if self.corr_hide_flagged and flagged_here.any():
+            self._retarget_corr_home()
+        # Last, because the Hide toggle's enabled state keys off the marker
+        # artist this draw just created (or didn't).
+        self._update_corr_flag_readout()
         self.corr_pane.canvas.draw()
 
     def _text_height_frac(self, ax, text, cap=0.5):

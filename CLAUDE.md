@@ -840,6 +840,37 @@ Flag does not.
   Flagged points are deliberately drawn *outside* the plotted record, so
   unflag has to reach them, while flag must only ever take points that are
   actually part of it.
+- **"Hide flagged points" never replots.** It sets the marker artist's
+  visibility and calls `draw_idle()`, nothing more: the user is typically
+  zoomed in on the very points being hidden, and a redraw would throw that
+  away. It is a *view* toggle, so it is session-only (like the calibrated
+  overlay), does not dirty the config, and does not touch the flags —
+  `refresh()` here would be wrong on every count.
+
+  **Home is retargeted instead**, by `_NavToolbar.home` — a subclass whose
+  Home consults an `(axes, xlim, ylim)` override before falling back to the
+  stock behaviour. `PlotPane.set_home_view` only records that triple: it sets
+  no limits and draws nothing.
+
+  **Overriding `home` rather than rewriting the nav stack is the point.** The
+  first version cleared the stack (`toolbar.update()`) and pushed the wanted
+  range as a new base, then restored the user's view on top. It worked, but
+  it threw away every zoom and pan they had done — Back and Forward stopped
+  working — and moved the axis limits twice per click for no visible reason.
+  The history is the user's; only where Home lands is ours to redirect. The
+  override is checked against `canvas.figure.axes` before use, because the
+  panes rebuild their Figure from scratch and a stale override would name a
+  destroyed Axes; `reset_nav()` clears it for the same reason.
+
+  `_corr_home_limits` builds that range from `_corr_plotted` rather than from
+  `ax.dataLim`, for two reasons: a hidden artist keeps its data limits, so
+  `dataLim` still spans the markers; and the selectors have their own history
+  of polluting it (see above). 5% margins, matching matplotlib's own autoscale
+  — verified against it (N2O data 303.8–341.5 → 301.9–343.4).
+
+  `redraw_corr` re-applies the retarget at the end, after `reset_nav()`, since
+  the autoscale that captured is the one that still includes the hidden
+  markers.
 
 `save_config` now carries **two** flight-config blocks, so its
 omitted-block-is-a-deletion trap is live again on that path: a save passing

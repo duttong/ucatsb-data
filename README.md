@@ -237,6 +237,14 @@ over them to unflag. Here the box is matched against the plotted (calibrated)
 values, since on that figure those *are* the axes, and unflagging uses the same
 box as flagging.
 
+**Hide flagged points** takes those markers off the plot once you are done with
+them, so the correlation itself fills the figure — on the 2026-07-28 flight
+that is the difference between an O3 axis running to 3500 ppb and one running
+to 850. It is a view toggle, not an edit: the points stay flagged, nothing is
+saved, and **the plot is not redrawn**, so whatever you had zoomed to is kept
+exactly. **Home** afterwards rescales to the unflagged data rather than back to
+a range set by markers that are no longer drawn.
+
 The view is held still while you flag, since you are usually zoomed in on the
 points you are removing — press **Home** afterwards to reframe the y-axis on
 what is left.
