@@ -582,7 +582,7 @@ files** rather than generic ICARTT practice, so a campaign's UCATS and UCATS-B
 files can be processed the same way: missing data is `-99999`, units carry the
 trailing `v` (`ppmv`/`ppbv`), variable lines are
 `name, unit, standard_name, description`, and the 1σ variable for a species is
-`<species>e_<suffix>` — `CO2e_UCATSB` beside `CO2_UCATSB`.
+`<species>e_<suffix>` — `CO2e_RASTA` beside `CO2_RASTA`.
 
 The `standard_name` field is not free text: it comes from the NASA ESDS
 Atmospheric Composition Variable Standard Names Convention that ICARTT V2.0
@@ -624,7 +624,7 @@ because they are whole sections rather than single keyword values:
   line here each time you bump `Revision`.
 
 `Data ID`, `Location ID` and `Revision` also build the suggested file name,
-`dataID_locationID_YYYYMMDD_R#.ict` (hyphens are kept, so `SABRE-UCATSB`
+`dataID_locationID_YYYYMMDD_R#.ict` (hyphens are kept, so `SABRE-RASTA`
 works; underscores are stripped, since `_` separates the name's own fields). Leaving the PI, mission, platform or
 location ID blank is allowed but prompts first, since an archive will normally
 reject a file like that.

@@ -1,16 +1,16 @@
 icartt:
-  data_id: SABRE-UCATSB
+  data_id: SABRE-RASTA
   location_id: WB57
   pi_name: MOORE, FRED; DUTTON, GEOFF; HINTSA, ERIC; NANCE, DAVID
   pi_affiliation: NOAA/GML and University of Colorado, CIRES
-  data_source: UCATS-B Laser Spectrometers
+  data_source: RASTA Laser Spectrometers
   mission: SABRE
   pi_contact_info: 'NOAA/GML, 325 Broadway, Boulder, CO; email: Fred.Moore@noaa.gov'
   platform: WB57
   location: Aircraft location in separate file
   associated_data: MMS-1HZ
-  instrument_info: 'UCATS-B: Aeris laser spectrometers (CO2, N2O, CH4), a 2B Technologies ozone monitor,
-    a Maycomm H2O sensor'
+  instrument_info: 'RASTA (formerly UCATS-B): Aeris laser spectrometers (CO2, N2O, CH4), a 2B Technologies
+    ozone monitor, a Maycomm H2O sensor'
   data_info: Units for CO2 and H2O are ppm; units for N2O, CH4 and O3 are ppb
   uncertainty: ''
   ulod_value: N/A
@@ -22,6 +22,12 @@ icartt:
   revision: RA
   revision_history: 'RA: Preliminary data'
   special_comments: |-
+    RASTA was previously identified as UCATS-B. It was renamed to avoid
+    confusion with the UCATS gas chromatograph flying on the same platform.
+    The instrument, its inlet and its calibration are unchanged; only the name
+    has changed. Files delivered before this revision, and the variable names
+    within them, carry the UCATSB identifier.
+
     Error estimates are based on the assigned values of the onboard calibration
     cylinders, the scatter of the in-flight calibration record, and the drift
     model used to interpolate between calibrations. The UNCERTAINTY line above
@@ -33,4 +39,4 @@ icartt:
     you contact the principal investigators (PIs) first and discuss your
     interests. The PIs can discuss the quality of the data and any potential
     problems with its analysis. Please contact the PIs for more information.
-  var_suffix: UCATSB
+  var_suffix: RASTA

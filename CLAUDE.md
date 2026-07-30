@@ -1011,7 +1011,7 @@ campaign meets one convention across both instruments:
   than either alone.
 - **Units gain the trailing `v`** (`ppmv`/`ppbv`) via `ICARTT_UNITS`, for the
   ICARTT header only. Plot labels keep `ppm`/`ppb`.
-- **The 1σ variable is `<species>e_<suffix>`** (`CO2e_UCATSB`), not
+- **The 1σ variable is `<species>e_<suffix>`** (`CO2e_RASTA`), not
   `_unc`, and reuses its parent's standard name exactly as those files do —
   which the ACVSNC also requires: "when uncertainty is reported as a separate
   variable, the uncertainty variable should share the same standard name as

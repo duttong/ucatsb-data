@@ -1051,11 +1051,11 @@ ICARTT_FFI = 1001
 # is visible to whoever reads the file. The two exceptions describe this
 # repo's instrument rather than any flight, so they can be stated safely.
 DEFAULT_ICARTT_META = {
-    "data_id": "UCATSB",
+    "data_id": "RASTA",
     "location_id": "",
     "pi_name": "",
     "pi_affiliation": "",
-    "data_source": "UCATS-B airborne in-situ trace gas measurements",
+    "data_source": "RASTA airborne in-situ trace gas measurements",
     "mission": "",
     "pi_contact_info": "",
     "platform": "",
@@ -1082,7 +1082,7 @@ DEFAULT_ICARTT_META = {
     # PIs" request live. Blank lines inside it are meaningful and preserved.
     # Nothing is appended to it -- see export_icartt.
     "special_comments": "",
-    "var_suffix": "UCATSB",
+    "var_suffix": "RASTA",
 }
 
 # Order matters: the ICARTT standard requires these keywords, one per line, in
@@ -1323,7 +1323,7 @@ def icartt_filename(meta, start_date):
         cleaned = "".join(c for c in str(value or "") if c.isalnum() or c == "-")
         return cleaned.strip("-") or fallback
 
-    data_id = slug(meta["data_id"], "UCATSB")
+    data_id = slug(meta["data_id"], "RASTA")
     location_id = slug(meta["location_id"], "Aircraft")
     revision = slug(meta["revision"], "R0")
     return f"{data_id}_{location_id}_{start_date:%Y%m%d}_{revision}.ict"
@@ -1345,7 +1345,7 @@ def _icartt_variables(gas_blocks, meta, include_sigma):
     dropping the field outright would shift the description into field 2 and
     make position mean different things on different lines of the same file.
 
-    An uncertainty variable is named `<species>e_<suffix>` (`CO2e_UCATSB`),
+    An uncertainty variable is named `<species>e_<suffix>` (`CO2e_RASTA`),
     the sister instrument's convention, and reuses its parent's standard name
     exactly as those files do.
     """

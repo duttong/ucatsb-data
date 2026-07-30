@@ -2013,8 +2013,10 @@ class UcatsbGui(QMainWindow):
     ICARTT_FIELDS = (
         ("data_id", "Data ID", 0,
          "First part of the file name — the mission/instrument data product. "
-         "UCATS-B is registered with the archive as SABRE-UCATSB, which is "
-         "what this should stay for SABRE. The ICARTT standard requires the "
+         "The instrument is registered with the archive as SABRE-RASTA "
+         "(renamed from SABRE-UCATSB in 2026 to end the confusion with the "
+         "UCATS gas chromatograph), which is what this should stay for "
+         "SABRE. The ICARTT standard requires the "
          "ID to match whatever the archiving data center has registered, so "
          "a new campaign means asking them, not inventing one. Hyphens are "
          "kept; underscores separate the file name's own fields and are "
@@ -2069,8 +2071,8 @@ class UcatsbGui(QMainWindow):
          "their error estimates and ask users to contact the PIs.\n"
          "This box is the whole section — nothing is added to it."),
         ("var_suffix", "Variable name suffix", 0,
-         "Appended to each species name, e.g. CO2_UCATSB; the 1-sigma "
-         "variable becomes CO2e_UCATSB. Convention is the instrument or PI."),
+         "Appended to each species name, e.g. CO2_RASTA; the 1-sigma "
+         "variable becomes CO2e_RASTA. Convention is the instrument or PI."),
     )
 
     def _build_export_pane(self):
