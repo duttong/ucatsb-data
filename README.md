@@ -64,12 +64,18 @@ Zooming/panning (via the matplotlib toolbar) is preserved across masking, averag
 Settings belong to the flight, not to the app: the right warm-up, pressure
 tolerance, cal windows and — above all — cal tanks are properties of the
 dataset. They are kept in a YAML file beside the CSV, holding a block per gas
-plus that flight's cal-tank pairing:
+plus that flight's cal-tank pairing and any [flagged points](#flagging-errant-points-flag):
 
 ```yaml
 cals:
   cal0: CC302489
   cal1: CB09960
+flagged:                 # points struck out by hand, as raw-file row ranges
+  Ozone:
+    rows: 16199          # the CSV length they were drawn against
+    ranges:
+      - [4271, 4272]
+      - [6358, 6358]
 CO2:
   warmup_min: 12
   pressure_tol_mbar: 0.3
@@ -179,6 +185,49 @@ resizes it — to start a fresh selection, drag somewhere clear of it.
 Turning Stats on releases pan or zoom if either is active, since they compete
 for the same drag. The Calibration tab has no Stats button: its three panels
 each mean something different, so a single readout there would be ambiguous.
+
+### Flagging errant points ("Flag")
+
+Some readings are visibly wrong and no automatic rule catches them — ozone on
+the 2026-07-28 flight spikes to 3500 ppb against a 0–900 ppb record, and no
+threshold separates those from real data. The **Flag** toolbar toggle, beside
+Stats, is the manual override:
+
+- **Left-drag a box** over the bad points to flag them.
+- **Right-drag** to unflag.
+
+Flagged rows are struck out with a black `x` at their raw value and removed
+from the calibrated (or, for Ozone and H2O, the filtered) record, from the
+Correlations tab and from both export products. The raw blue trace still shows
+everything, so nothing is hidden — only excluded.
+
+Two asymmetries are worth knowing, both deliberate:
+
+- **Flagging matches the box against the raw (blue) trace**, so a flag means
+  the same points after you change the drift model or swap cal tanks. Drawing
+  a tight box around the red calibrated overlay can therefore catch nothing —
+  it sits an intercept away, about 10 ppm on CO2 — and the readout will say so.
+- **Unflagging ignores the box height** and clears the whole time span you drag
+  over. A flagged spike is usually off the top of the axes, because the default
+  y-range is framed on the filtered data; requiring you to reach its value
+  would make it unremovable.
+
+Flagging works on any gas, and the **Flagged Points** panel on the left shows
+the count, with **Undo** (this session only) and **Clear** (current gas only).
+Tick **Apply to all gases** to spread each new flag across every species at
+once, for an inlet or pump problem that ruins them all together.
+
+Flags on a cal-bottle gas behave like every other mask: a flagged row inside a
+cal window is dropped before that injection's mean is computed, so flagging a
+visibly bad injection genuinely changes the calibration.
+
+The view is held still while you flag, since you are usually zoomed in on the
+points you are removing — press **Home** afterwards to reframe the y-axis on
+what is left.
+
+**Flags are saved with the flight, but only when you press Save**, like every
+other setting. They live in the flight's config as row ranges, so a few
+thousand flagged points cost a handful of lines.
 
 ## Calibration
 
@@ -462,7 +511,8 @@ Columns, per gas:
 | `<gas>_cal_unc` | 1σ on that value |
 | `<gas>_cal_slope`, `<gas>_cal_intercept` | the coefficients, on **every** row, so a blank row can be recomputed |
 | `<gas>_is_cal_period`, `<gas>_is_post_cal_flush`, `<gas>_is_masked`, `<gas>_is_extrapolated` | why a row is blank |
-| `<gas>_filtered`, `<gas>_below_floor` | for O3 and H2O, which have no cal bottles — the raw value with below-floor faults removed |
+| `<gas>_is_flagged` | struck out by hand (see [Flagging errant points](#flagging-errant-points-flag)). A subset of `is_masked` for a calibrated gas, written separately because it is the one removal that cannot be reconstructed from the settings |
+| `<gas>_filtered`, `<gas>_below_floor` | for O3 and H2O, which have no cal bottles — the raw value with below-floor faults and flagged points removed |
 
 plus `datetime`, `time_s` (seconds from midnight UTC, which Igor and Excel
 both plot far more readily than a parsed date), and the raw value columns

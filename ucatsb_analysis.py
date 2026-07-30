@@ -26,6 +26,11 @@ PRESSURE_EXCLUDE_COLOR = "#d03b3b"
 WARMUP_EXCLUDE_COLOR = "#ffa64d"   # light orange
 PUMPS_EXCLUDE_COLOR = "#8e7cc3"    # violet, distinct from the other bands
 POST_CAL_FLUSH_COLOR = "#2fa88a"   # teal, distinct from the warm-up/pressure shades
+# Manually flagged points. Near-black and drawn as an x, so a struck-out
+# reading reads as struck out rather than as one more colored band: it is the
+# only removal the user made by hand, and the only one not explained by a
+# setting somewhere in the panel.
+FLAGGED_COLOR = "#111111"
 CAL0_COLOR = "#eda100"   # golden
 CAL1_COLOR = "#0d366b"   # dark blue
 GRID_COLOR = "#e1e0d9"
@@ -111,6 +116,105 @@ def below_floor_mask(values, floor):
     if floor is None:
         return pd.Series(False, index=values.index)
     return values.notna() & (values < floor)
+
+
+# --------------------------------------------------------------------------
+# Manually flagged rows, as run-length-encoded row ranges
+#
+# The user can strike out points no automatic rule catches (an ozone spike
+# well above the record, a stretch of nonsense after a valve glitch) and those
+# removals persist in the flight's config. Ranges rather than a list of row
+# numbers: one dragged gesture is one entry whatever its width, so a config
+# stays readable at thousands of flagged points.
+#
+# Ranges are INCLUSIVE at both ends, and every function here returns them
+# sorted, non-overlapping and adjacency-merged. That canonical form is what
+# makes the on-disk representation stable, which matters because _is_dirty()
+# deep-compares it: two different gesture orders reaching the same set of rows
+# must produce the same YAML, or the app would offer to save nothing.
+#
+# Set arithmetic is the whole reason ranges beat storing the drawn rectangles:
+# unflagging is a difference, with no ordering or paint/erase semantics to get
+# wrong, and the flagged set cannot shift underneath the user when an unrelated
+# setting changes.
+# --------------------------------------------------------------------------
+
+def merge_ranges(ranges):
+    """Canonical form: sorted, non-overlapping, adjacent runs joined.
+
+    Adjacent (`hi + 1 == lo`) merges as well as overlapping, so flagging rows
+    10-20 and then 21-30 stores one range and not two -- otherwise the same
+    set of rows would have more than one representation and the dirty-state
+    comparison would report a change where there is none.
+    """
+    cleaned = []
+    for lo, hi in ranges:
+        lo, hi = int(lo), int(hi)
+        if hi < lo:
+            lo, hi = hi, lo
+        if hi < 0:
+            continue
+        cleaned.append((max(lo, 0), hi))
+    if not cleaned:
+        return []
+    cleaned.sort()
+    merged = [cleaned[0]]
+    for lo, hi in cleaned[1:]:
+        last_lo, last_hi = merged[-1]
+        if lo <= last_hi + 1:
+            merged[-1] = (last_lo, max(last_hi, hi))
+        else:
+            merged.append((lo, hi))
+    return merged
+
+
+def add_ranges(ranges, lo, hi):
+    """Union: flag rows lo..hi in addition to whatever is already flagged."""
+    return merge_ranges(list(ranges) + [(lo, hi)])
+
+
+def subtract_ranges(ranges, lo, hi):
+    """Difference: unflag rows lo..hi. A cut inside an existing range splits
+    it in two, which is what makes unflagging exact rather than approximate --
+    it never has to discard the whole gesture that produced the range."""
+    lo, hi = int(lo), int(hi)
+    if hi < lo:
+        lo, hi = hi, lo
+    out = []
+    for r_lo, r_hi in merge_ranges(ranges):
+        if r_hi < lo or r_lo > hi:      # untouched
+            out.append((r_lo, r_hi))
+            continue
+        if r_lo < lo:                   # keep the head
+            out.append((r_lo, lo - 1))
+        if r_hi > hi:                   # keep the tail
+            out.append((hi + 1, r_hi))
+    return merge_ranges(out)
+
+
+def ranges_to_mask(ranges, index, offset=0):
+    """Boolean Series over `index`, True on the flagged rows.
+
+    `offset` is subtracted from the stored row numbers: ranges are recorded
+    against the RAW file's row numbering (so they mean the same thing as the
+    companion CSV's rows, and survive a change in how many pre-sync rows get
+    trimmed), while the analysis frame starts at raw row `presync_dropped`.
+    Rows outside the frame are simply not marked rather than raising -- a
+    range can legitimately reach into the trimmed head.
+    """
+    mask = pd.Series(False, index=index)
+    n = len(mask)
+    for lo, hi in merge_ranges(ranges):
+        lo, hi = lo - offset, hi - offset
+        if hi < 0 or lo >= n:
+            continue
+        mask.iloc[max(lo, 0):min(hi, n - 1) + 1] = True
+    return mask
+
+
+def ranges_row_count(ranges):
+    """How many rows the ranges cover, for the readouts."""
+    return sum(hi - lo + 1 for lo, hi in merge_ranges(ranges))
 
 
 def cal_switch_mask(datetimes, cal_mask):

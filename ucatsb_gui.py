@@ -43,6 +43,7 @@ from ucatsb_analysis import (
     DEFAULT_ICARTT_META,
     CALS_YAML_PATH, CAL_DRIFT_MODELS, CAL_DEFAULT_SMOOTH_EVENTS,
     CAL_MERGE_GAP_S, D1_P_TARGET_MBARS,
+    merge_ranges, add_ranges, subtract_ranges, ranges_to_mask, ranges_row_count,
     # The shared palette. These used to be declared a second time here, with
     # identical values -- two homes for one decision, agreeing only by
     # discipline, so editing one silently made the calibration panels and the
@@ -50,7 +51,7 @@ from ucatsb_analysis import (
     # single home; only the two GUI-only colors below are declared here.
     LINE_COLOR, RIGHT_AXIS_COLOR, CAL_SHADE_COLOR, PRESSURE_EXCLUDE_COLOR,
     WARMUP_EXCLUDE_COLOR, PUMPS_EXCLUDE_COLOR, POST_CAL_FLUSH_COLOR,
-    CAL0_COLOR, CAL1_COLOR,
+    CAL0_COLOR, CAL1_COLOR, FLAGGED_COLOR,
     GRID_COLOR, AXIS_COLOR, TEXT_COLOR, MUTED_COLOR,
 )
 
@@ -324,6 +325,60 @@ def load_cal_selection(path: Path, default: dict) -> dict:
     return selection
 
 
+def load_flagged(path: Path, raw_rows: int = None):
+    """The flight's manually flagged row ranges, as {gas: [(lo, hi), ...]}.
+
+    Returns ({}, None) when the file has no `flagged:` block, and
+    (ranges, complaint) otherwise -- `complaint` being a displayable sentence
+    when a gas's stored `rows:` disagrees with the CSV actually loaded.
+
+    Row numbers are the RAW file's, which is the one thing about this format
+    worth being careful with. They are exact and permanent -- unlike a stored
+    rectangle, a flagged row cannot quietly become a different row when the
+    drift model or the cal tanks change -- but they are only meaningful for the
+    file they were drawn on. `rows:` is the tripwire for that: a regenerated
+    CSV with a different length would otherwise shift every flag silently, and
+    silently wrong is the one outcome this feature cannot have. The flags are
+    still applied when it trips, because the user is better placed to judge
+    than we are; they are just told.
+    """
+    loaded = _read_yaml(path).get("flagged")
+    if not isinstance(loaded, dict):
+        return {}, None
+    flagged, mismatches = {}, []
+    for gas, block in loaded.items():
+        if gas not in GASES or not isinstance(block, dict):
+            continue
+        raw = block.get("ranges")
+        if not isinstance(raw, list):
+            continue
+        pairs = [(r[0], r[1]) for r in raw
+                 if isinstance(r, (list, tuple)) and len(r) == 2
+                 and all(isinstance(v, int) for v in r)]
+        if not pairs:
+            continue
+        flagged[gas] = merge_ranges(pairs)
+        stored_rows = block.get("rows")
+        if raw_rows is not None and isinstance(stored_rows, int) and stored_rows != raw_rows:
+            mismatches.append(f"{gas} (saved against {stored_rows} rows)")
+    complaint = None
+    if mismatches:
+        complaint = (f"Flagged rows were saved against a different CSV length "
+                     f"than the {raw_rows} rows now loaded: "
+                     f"{', '.join(mismatches)}. They have been applied as "
+                     f"stored — check they still land on the right points.")
+    return flagged, complaint
+
+
+def flagged_to_yaml(flagged: dict, raw_rows: int):
+    """The `flagged:` block as plain data, dropping gases with nothing flagged
+    so an untouched flight writes no block at all."""
+    return {
+        gas: {"rows": raw_rows, "ranges": [[lo, hi] for lo, hi in ranges]}
+        for gas, ranges in sorted(flagged.items()) if ranges
+    }
+
+
 class _BlockStyleDumper(yaml.SafeDumper):
     """A SafeDumper that writes multi-line strings as YAML block scalars.
 
@@ -345,21 +400,24 @@ _BlockStyleDumper.add_representer(str, _represent_str)
 
 
 def save_config(path: Path, config: dict, cal_selection: dict = None,
+                flagged: dict = None,
                 recent_files: list = None, icartt_meta: dict = None):
     """Write the per-gas blocks, plus whichever of the non-gas blocks belongs
-    in this file: the tank selection for a flight's own conf, the ICARTT
-    header metadata for the shared app config, the recent-file list for the
-    app state file. **One block per file** -- see load_cal_selection,
-    load_icartt_meta and load_recent_files for why each lives where it does.
+    in this file: the tank selection and the manually flagged rows for a
+    flight's own conf, the ICARTT header metadata for the shared app config,
+    the recent-file list for the app state file. **One file's blocks per
+    call** -- see load_cal_selection, load_flagged, load_icartt_meta and
+    load_recent_files for why each lives where it does.
 
     This writes a *fresh* document, so an omitted block is a deletion, the
-    same trap the per-gas settings have with _controls_to_settings(). That
-    used to be a live hazard here, when the shared config carried both the
-    recent list and the metadata and every write had to remember both; the
-    split into two files retired it, and passing one block per call is now
-    the only correct use.
+    same trap the per-gas settings have with _controls_to_settings(). The
+    flight config now carries *two* non-gas blocks, so that trap is live again
+    on this path: a save that passes `cal_selection=` but forgets `flagged=`
+    silently discards every flagged point. on_save_clicked passes both.
     """
     doc = dict(config)
+    if flagged:
+        doc = {"flagged": dict(flagged), **doc}
     if cal_selection:
         doc = {"cals": dict(cal_selection), **doc}
     if icartt_meta:
@@ -400,6 +458,25 @@ class PlotPane(QWidget):
         self.stats_action.toggled.connect(self._on_stats_toggled)
         self.toolbar.addAction(self.stats_action)
 
+        # A second mode on the SAME selector rather than a second selector.
+        # attach_stats_selectors() rebuilds self.selectors wholesale on every
+        # draw and disconnects the old event handlers; a parallel list would
+        # have to duplicate all of that and would leak canvas connections if
+        # it ever got out of step. One selector, one mode flag.
+        self.flag_action = QAction("Flag", self.toolbar)
+        self.flag_action.setCheckable(True)
+        self.flag_action.setToolTip(
+            "Drag a box to flag errant points, removing them from the\n"
+            "calibrated or filtered record. Right-drag to unflag.\n\n"
+            "Flagging matches the box against the RAW (blue) trace, so a\n"
+            "flag means the same points after a drift-model or cal-tank\n"
+            "change. Unflagging ignores the box height and clears the whole\n"
+            "time span — a flagged spike is often off the top of the axes.\n\n"
+            "Flags are saved with the flight when you press Save."
+        )
+        self.flag_action.toggled.connect(self._on_flag_toggled)
+        self.toolbar.addAction(self.flag_action)
+
         readout = QHBoxLayout()
         self.stats_combo = QComboBox()
         self.stats_combo.setMinimumWidth(190)
@@ -421,14 +498,28 @@ class PlotPane(QWidget):
 
         layout.addWidget(self.toolbar)
         layout.addLayout(readout)
-        layout.addWidget(self.canvas)
+        # Stretch 1 on the canvas and 0 on everything else: the readout row
+        # gets its sizeHint and the plot takes all the rest. Without it the
+        # row and the canvas are both Preferred with no stretch, so QVBoxLayout
+        # splits the spare space EQUALLY and the figure loses half its height
+        # the moment the readout appears. That stayed hidden while the row
+        # always contained the trace combo -- a QComboBox is Fixed vertically,
+        # which caps the whole QHBoxLayout -- and only showed up once the flag
+        # tool started showing the label on its own.
+        layout.addWidget(self.canvas, 1)
 
-        # on_box is set by the owner; the selectors themselves are rebuilt on
-        # every draw (see attach_stats_selectors).
+        # on_box/on_flag_box are set by the owner; the selectors themselves
+        # are rebuilt on every draw (see attach_stats_selectors).
         self.on_box = None
+        self.on_flag_box = None
         self.selectors = []
-        # (axes, extents) of the live box -- only one exists at a time, in
-        # whichever panel it was drawn in.
+        # Which tool the shared selector is currently acting as: None, "stats"
+        # or "flag". The two toolbar actions are mutually exclusive because
+        # both want the same left-drag.
+        self.selector_mode = None
+        # (axes index, extents) of the live stats box -- only one exists at a
+        # time, in whichever panel it was drawn in. Never set in flag mode: a
+        # flag is an action, not a standing selection.
         self._box = None
         self._loading_traces = False
 
@@ -438,34 +529,73 @@ class PlotPane(QWidget):
         self.toolbar.update()
         self.toolbar.push_current()
 
-    def _set_readout_visible(self, visible):
-        self.stats_combo.setVisible(visible)
+    def _set_readout_visible(self, visible, stats_widgets=True):
+        """Show the readout row. The label is shared by both tools -- the flag
+        tool reports what it just did there -- but the trace combo and Copy
+        button are meaningless to it, so they only appear for Stats."""
+        self.stats_combo.setVisible(visible and stats_widgets)
         self.stats_label.setVisible(visible)
-        self.stats_copy_button.setVisible(visible)
+        self.stats_copy_button.setVisible(visible and stats_widgets)
 
     def _copy_stats(self):
         QApplication.clipboard().setText(self.stats_label.text())
 
+    def _release_widgetlock(self):
+        """Free the canvas widgetlock that pan/zoom hold.
+
+        `_SelectorWidget.ignore()` drops every event while it is held, so a
+        selector switched on under an active pan or zoom would look dead
+        rather than merely inactive. Re-invoking the toolbar's own toggle is
+        what actually releases it. (The reverse needs no handling: clicking
+        pan afterwards just makes the selector inert until pan goes off.)
+        """
+        mode = str(self.toolbar.mode)
+        if "pan" in mode:
+            self.toolbar.pan()
+        elif "zoom" in mode:
+            self.toolbar.zoom()
+
     def _on_stats_toggled(self, checked):
         if checked:
-            # Pan/zoom hold the canvas widgetlock, and _SelectorWidget.ignore()
-            # drops every event while it is held -- the tool would look dead.
-            # (The reverse needs no handling: clicking pan later just makes the
-            # selector inert until pan is switched off again.)
-            mode = str(self.toolbar.mode)
-            if "pan" in mode:
-                self.toolbar.pan()
-            elif "zoom" in mode:
-                self.toolbar.zoom()
-        for i, sel in enumerate(self.selectors):
-            sel.set_active(checked)
-            sel.set_visible(checked and self._box is not None and i == self._box[0])
-        self.canvas.draw_idle()
+            self._release_widgetlock()
+            if self.flag_action.isChecked():
+                self.flag_action.setChecked(False)   # re-enters here via flag
+        self._set_selector_mode("stats" if checked else None)
         self._set_readout_visible(checked and bool(self.stats_label.text()))
+        self.canvas.draw_idle()
+
+    def _on_flag_toggled(self, checked):
+        if checked:
+            self._release_widgetlock()
+            if self.stats_action.isChecked():
+                self.stats_action.setChecked(False)
+        self._set_selector_mode("flag" if checked else None)
+
+    def _set_selector_mode(self, mode):
+        """Switch the shared selector between tools.
+
+        Rebuilt rather than reconfigured: the two modes differ in `props` and
+        in `interactive`, neither of which RectangleSelector exposes reliably
+        after construction across matplotlib versions, and the rebuild path
+        already exists and costs nothing. The stats box's extents survive
+        because attach_stats_selectors carries them across.
+        """
+        if mode == self.selector_mode:
+            return
+        # A stats readout left standing under the flag tool would describe a
+        # box that is no longer on screen, and vice versa.
+        self.stats_label.setText("")
+        self._set_readout_visible(False)
+        self.selector_mode = mode
+        axes = [sel.ax for sel in self.selectors]
+        if axes:
+            self.attach_stats_selectors(axes)
+        self.canvas.draw_idle()
 
     def set_stats_text(self, text):
         self.stats_label.setText(text)
-        self._set_readout_visible(bool(text) and self.stats_action.isChecked())
+        self._set_readout_visible(bool(text) and self.selector_mode is not None,
+                                  stats_widgets=self.selector_mode == "stats")
 
     def current_trace_key(self):
         return self.stats_combo.currentData()
@@ -516,26 +646,48 @@ class PlotPane(QWidget):
         self._box = None
 
         live = [ax for ax in axes if ax is not None]
-        active = self.stats_action.isChecked()
+        flagging = self.selector_mode == "flag"
+        active = self.selector_mode is not None
         for i, ax in enumerate(live):
             sel = RectangleSelector(
                 ax, functools.partial(self._on_select, ax), useblit=True,
-                interactive=True, button=[1], minspanx=3, minspany=3,
-                spancoords="pixels",
-                props=dict(facecolor="none", edgecolor=STATS_BOX_COLOR,
-                           linewidth=1.4, linestyle="--"),
+                # Flag mode is non-interactive and takes the right button too:
+                # a flag is an action that fires and clears, not a standing
+                # selection with drag handles, and right-drag is the unflag.
+                interactive=not flagging,
+                button=[1, 3] if flagging else [1],
+                minspanx=3, minspany=3, spancoords="pixels",
+                props=dict(facecolor="none",
+                           edgecolor=FLAGGED_COLOR if flagging else STATS_BOX_COLOR,
+                           linewidth=1.4, linestyle="-" if flagging else "--"),
             )
             sel.set_active(active)
-            if i == box_index and box_extents is not None:
+            if not flagging and i == box_index and box_extents is not None:
                 try:
                     sel.extents = box_extents
                     self._box = (i, box_extents)
                 except Exception:
                     pass
-            sel.set_visible(active and i == box_index and self._box is not None)
+            sel.set_visible(active and not flagging
+                            and i == box_index and self._box is not None)
             self.selectors.append(sel)
 
     def _on_select(self, ax, eclick, erelease):
+        if self.selector_mode == "flag":
+            # Button 3 is the unflag. Read off the press rather than the
+            # release so a drag that starts with the right button and wanders
+            # still means "unflag".
+            if self.on_flag_box is not None:
+                x0, x1 = sorted((eclick.xdata, erelease.xdata))
+                y0, y1 = sorted((eclick.ydata, erelease.ydata))
+                if None not in (x0, x1, y0, y1):
+                    self.on_flag_box(ax, x0, x1, y0, y1, eclick.button == 3)
+            # Clear the rectangle: the flag is applied, and leaving the box up
+            # would suggest a selection that no longer means anything.
+            for sel in self.selectors:
+                sel.set_visible(False)
+            self.canvas.draw_idle()
+            return
         for sel in self.selectors:
             if sel.ax is ax:
                 self._box = (self.selectors.index(sel), sel.extents)
@@ -619,6 +771,14 @@ class UcatsbGui(QMainWindow):
         self.cal_selection = dict(self.default_cal_selection)
         self.cal_bottles = select_cal_bottles(self.cal_roster,
                                               self.cal_selection.values())
+        # Manually flagged rows, {gas: [(lo, hi), ...]} in RAW file row
+        # numbers. Per flight and per gas; empty is the no-op, so a flight
+        # nobody has flagged behaves exactly as it did before the feature.
+        self.flagged = {}
+        # Session-only undo stack of previous `flagged` dicts. Deliberately
+        # not persisted: it is a property of this editing session, and a
+        # config that could undo its own contents would be a strange object.
+        self._flag_undo = []
         self.ax = None
         self.ax_aux = None
         self.ax_aux2 = None
@@ -825,6 +985,10 @@ class UcatsbGui(QMainWindow):
         self.config = load_config(path) if path else load_config(None)
         self.cal_selection = (load_cal_selection(path, self.default_cal_selection)
                               if path else dict(self.default_cal_selection))
+        raw_rows = len(self.raw_df) if self.raw_df is not None else None
+        self.flagged, flag_complaint = (load_flagged(path, raw_rows) if path
+                                        else ({}, None))
+        self._flag_undo = []
         self._rebuild_cal_bottles()
         # config_path is what Save offers as the default filename. With no
         # config loaded that is the conventional name for this dataset, so
@@ -833,6 +997,11 @@ class UcatsbGui(QMainWindow):
         self.config_loaded_from = path
         self._snapshot_state()
         self._apply_cal_selection_to_controls()
+        # After the snapshot: a length mismatch is a warning about what was
+        # loaded, not an unsaved change to be offered back.
+        self._update_flag_readout()
+        if flag_complaint:
+            QMessageBox.warning(self, "Flagged points", flag_complaint)
 
     def _choose_config_file(self, csv_path: Path, candidates):
         """Ask which of several configs to open. Returns a path, or None for
@@ -1385,6 +1554,42 @@ class UcatsbGui(QMainWindow):
         # only ever describe one of them.
         vbox.addWidget(self.cal_box)
 
+        # Deliberately NOT in the setEnabled(has_masking) list in _select_gas:
+        # Ozone is the gas this feature exists for, and it is precisely the
+        # one with no masking settings to enable. Its own group box for the
+        # same reason -- it is not a masking *setting*, it is a record of
+        # points the user struck out by hand.
+        self.flag_box = QGroupBox("Flagged Points")
+        flag_form = QVBoxLayout(self.flag_box)
+        self.flag_label = QLabel("No points flagged")
+        self.flag_label.setWordWrap(True)
+        self.flag_label.setStyleSheet(f"color: {MUTED_COLOR};")
+        flag_form.addWidget(self.flag_label)
+
+        self.flag_all_check = QCheckBox("Apply to all gases")
+        self.flag_all_check.setToolTip(
+            "Spread each new flag across every gas — for an inlet or pump\n"
+            "problem that ruins them all at once. Unticked, a flag belongs\n"
+            "to the gas on display. Does not affect Clear, which is always\n"
+            "the current gas only."
+        )
+        flag_form.addWidget(self.flag_all_check)
+
+        flag_row = QHBoxLayout()
+        self.flag_undo_button = QPushButton("Undo")
+        self.flag_undo_button.setToolTip(
+            "Step back through this session's flagging. Not saved with the\n"
+            "flight — reopening starts a fresh history."
+        )
+        self.flag_undo_button.clicked.connect(self.on_flag_undo)
+        self.flag_clear_button = QPushButton("Clear")
+        self.flag_clear_button.setToolTip("Remove every flag on the current gas.")
+        self.flag_clear_button.clicked.connect(self.on_flag_clear)
+        flag_row.addWidget(self.flag_undo_button)
+        flag_row.addWidget(self.flag_clear_button)
+        flag_form.addLayout(flag_row)
+        vbox.addWidget(self.flag_box)
+
         vbox.addStretch(1)
         return panel
 
@@ -1449,10 +1654,15 @@ class UcatsbGui(QMainWindow):
         self.main_pane = PlotPane()
         self.cal_pane = PlotPane()
         self.main_pane.on_box = self.on_stats_box
+        self.main_pane.on_flag_box = self.on_flag_box
         # The Calibration tab's three panels each mean something different
         # (response deviation, coefficients, residuals), so a single box-stats
-        # readout there would be ambiguous -- Timeseries only for now.
+        # readout there would be ambiguous -- Timeseries only for now. Flagging
+        # is Timeseries-only for a stronger reason: the cal panels plot derived
+        # quantities (deviations, coefficients, residuals), not the rows a flag
+        # would have to name.
         self.cal_pane.stats_action.setVisible(False)
+        self.cal_pane.flag_action.setVisible(False)
         # Keep the historical attribute names bound to the timeseries pane so
         # redraw()'s existing body needs no changes.
         self.figure = self.main_pane.figure
@@ -1462,8 +1672,10 @@ class UcatsbGui(QMainWindow):
         self.tanks_pane = self._build_cal_tanks_pane()
         self.corr_pane = PlotPane()
         # Same reason as the Calibration tab: the box-stats readout describes
-        # one trace over a time span, which a tracer-tracer scatter is not.
+        # one trace over a time span, which a tracer-tracer scatter is not --
+        # and a box on a scatter names two gases' rows at once, not one gas's.
         self.corr_pane.stats_action.setVisible(False)
+        self.corr_pane.flag_action.setVisible(False)
 
         self.export_pane = self._build_export_pane()
 
@@ -1974,8 +2186,11 @@ class UcatsbGui(QMainWindow):
         self.cal1_box.setEnabled(has_masking)
         self.cal2_box.setEnabled(has_masking)
         self.cal_box.setEnabled(has_masking)
+        # flag_box is deliberately absent from that list -- see where it is
+        # built. Its readout is per gas, so it does have to follow along.
         if has_masking:
             self._apply_settings_to_controls(self.config[gas])
+        self._update_flag_readout()
 
     def on_gas_changed(self, new_gas: str):
         if not new_gas:
@@ -1998,7 +2213,8 @@ class UcatsbGui(QMainWindow):
 
     def _current_state(self):
         """Everything a config file holds, as comparable plain data."""
-        return copy.deepcopy({"config": self.config, "cals": self.cal_selection})
+        return copy.deepcopy({"config": self.config, "cals": self.cal_selection,
+                              "flagged": self.flagged})
 
     def _snapshot_state(self):
         """Take the current settings as "saved" -- called after a load or a
@@ -2051,7 +2267,8 @@ class UcatsbGui(QMainWindow):
             return False
         path = Path(path_str)
         try:
-            save_config(path, self.config, cal_selection=self.cal_selection)
+            save_config(path, self.config, cal_selection=self.cal_selection,
+                        flagged=flagged_to_yaml(self.flagged, len(self.raw_df)))
         except OSError as e:
             QMessageBox.warning(self, "Save configuration",
                                 f"Could not write {path.name}:\n{e}")
@@ -2265,6 +2482,131 @@ class UcatsbGui(QMainWindow):
         self._mark_dirty()
         self.refresh(preserve_view=False)
 
+    def on_flag_box(self, ax, x0, x1, y0, y1, unflag):
+        """Flag (or unflag) the rows inside a dragged box.
+
+        **The box is matched against the RAW value column**, never against
+        whichever trace happens to be drawn. A flag has to name the same rows
+        for the life of the flight: calibrated values move when the drift
+        model or the cal tanks change, so a flag resolved against the red
+        overlay would quietly come to mean a different set of points. The cost
+        is that a box drawn tightly around the calibrated trace can catch
+        nothing -- the overlay sits an intercept away from raw, ~10 ppm on
+        CO2 -- which is why an empty box says so rather than doing nothing
+        visible.
+
+        Only the main axes flags: the aux panel plots a different quantity
+        (detector pressure, T_gas) whose rows are not this gas's to remove.
+        """
+        if self.df is None or ax is not self.ax:
+            return
+        t0, t1 = (pd.Timestamp(mdates.num2date(x)).tz_localize(None)
+                  for x in (x0, x1))
+        in_time = self.df["datetime"].between(t0, t1)
+
+        # **Unflagging ignores the y-bounds and clears the whole time span.**
+        # Not an oversight and not mere leniency -- with y-bounds it would be
+        # unusable in the case this feature exists for. The default y-range is
+        # framed on the *filtered* series precisely so one 3500 ppb ozone
+        # spike does not squash the real record, which puts the flagged point
+        # off-screen: there would be no box the user could draw around a value
+        # they cannot see. Time-only also makes unflagging total -- anything
+        # flagged can always be removed -- and sidesteps an asymmetry, since
+        # `between` is False for NaN and a flag can otherwise cover rows the
+        # matching pass would refuse to select back.
+        if unflag:
+            selected = in_time
+            n = int((selected & self._flag_mask(self.current_gas)).sum())
+            if not n:
+                self.main_pane.set_stats_text(
+                    "Nothing flagged in that time span.")
+                return
+        else:
+            values = self.df[GASES[self.current_gas]["value_col"]]
+            selected = in_time & values.between(y0, y1)   # NaN -> False, never flagged
+            n = int(selected.sum())
+            if not n:
+                self.main_pane.set_stats_text(
+                    "Nothing in that box — the flag tool matches the raw (blue) "
+                    "trace, which the calibrated overlay sits an intercept away "
+                    "from.")
+                return
+        inside = selected
+
+        # Positions in the analysis frame, back to RAW file rows: the whole
+        # storage format is in raw numbering so it survives a change in how
+        # many pre-sync rows get trimmed. Contiguous by construction here (a
+        # time span), but merge_ranges makes the stored form canonical anyway.
+        pos = [i + self.presync_dropped for i in range(len(inside)) if inside.iat[i]]
+        spans = []
+        start = prev = pos[0]
+        for row in pos[1:]:
+            if row != prev + 1:
+                spans.append((start, prev))
+                start = row
+            prev = row
+        spans.append((start, prev))
+
+        targets = (list(self.config) + [g for g in self.available_gases
+                                        if not GASES[g].get("has_masking", True)]
+                   if self.flag_all_check.isChecked() else [self.current_gas])
+        self._flag_undo.append(copy.deepcopy(self.flagged))
+        for gas in dict.fromkeys(targets):
+            ranges = self.flagged.get(gas, [])
+            for lo, hi in spans:
+                ranges = (subtract_ranges(ranges, lo, hi) if unflag
+                          else add_ranges(ranges, lo, hi))
+            if ranges:
+                self.flagged[gas] = ranges
+            else:
+                self.flagged.pop(gas, None)
+        self.main_pane.set_stats_text(
+            f"{'Unflagged' if unflag else 'Flagged'} {n} point"
+            f"{'' if n == 1 else 's'}"
+            + ("" if len(targets) == 1 else f" on {len(targets)} gases"))
+        self._after_flag_change()
+
+    def _after_flag_change(self):
+        """Every path that edits self.flagged ends here.
+
+        refresh() and nothing lighter: the flags are inside `exclude_mask`, so
+        they change cal means, the calibration, the uncertainty and both
+        exports -- and _analysis_for is cached per gas until refresh() clears
+        it. preserve_view because flagging is a fine-grained edit made while
+        zoomed in on the very points being removed.
+        """
+        self._update_flag_readout()
+        self._mark_dirty()
+        self.refresh(preserve_view=True)
+
+    def _update_flag_readout(self):
+        """Label + button states for the Flagging box."""
+        ranges = self.flagged.get(self.current_gas, [])
+        points = ranges_row_count(ranges)
+        self.flag_label.setText(
+            "No points flagged" if not points else
+            f"{points} point{'' if points == 1 else 's'} flagged in "
+            f"{len(ranges)} region{'' if len(ranges) == 1 else 's'}")
+        self.flag_clear_button.setEnabled(bool(points))
+        self.flag_undo_button.setEnabled(bool(self._flag_undo))
+
+    def on_flag_undo(self):
+        if not self._flag_undo:
+            return
+        self.flagged = self._flag_undo.pop()
+        self._after_flag_change()
+
+    def on_flag_clear(self):
+        """Clear this gas's flags. Scoped to the current gas even when
+        "apply to all gases" is ticked: that box describes how a new flag is
+        spread, and reading it here would turn one click into a five-gas
+        deletion the button never advertised."""
+        if not self.flagged.get(self.current_gas):
+            return
+        self._flag_undo.append(copy.deepcopy(self.flagged))
+        self.flagged.pop(self.current_gas, None)
+        self._after_flag_change()
+
     def on_stats_box(self, ax, x0, x1, y0, y1):
         """Report n/mean/std for the points inside a dragged box, for whichever
         plotted trace the readout's combo box names.
@@ -2362,11 +2704,14 @@ class UcatsbGui(QMainWindow):
                 # No cal bottles: the physical floor is the only correction
                 # there is, and calling the result "calibrated" would claim
                 # something nobody established.
-                rejected = self._rejected_mask(gas_key)
+                removed = self._removed_mask(gas_key)
                 block["final"] = self._to_raw_rows(
-                    self.df[info["value_col"]].mask(rejected))
+                    self.df[info["value_col"]].mask(removed))
                 block["final_kind"] = "filtered"
-                block["masks"]["below_floor"] = self._to_raw_rows(rejected)
+                block["masks"]["below_floor"] = self._to_raw_rows(
+                    self._rejected_mask(gas_key))
+                block["masks"]["is_flagged"] = self._to_raw_rows(
+                    self._flag_mask(gas_key))
                 blocks.append(block)
                 continue
 
@@ -2384,6 +2729,10 @@ class UcatsbGui(QMainWindow):
                     "is_post_cal_flush": self._to_raw_rows(result["flushed"]),
                     "is_masked": self._to_raw_rows(result["excluded"]),
                     "is_extrapolated": self._to_raw_rows(result["extrapolated"]),
+                    # A subset of is_masked (flags ride inside exclude_mask),
+                    # written separately because it is the only removal a data
+                    # user cannot reconstruct from the settings.
+                    "is_flagged": self._to_raw_rows(analysis["flagged"]),
                 }
             else:
                 # No calibration is not a reason to export nothing for this
@@ -2394,6 +2743,7 @@ class UcatsbGui(QMainWindow):
                     "is_cal_period": self._to_raw_rows(analysis["not_air"]),
                     "is_post_cal_flush": self._to_raw_rows(analysis["post_cal_flush"]),
                     "is_masked": self._to_raw_rows(analysis["exclude_mask"]),
+                    "is_flagged": self._to_raw_rows(analysis["flagged"]),
                 }
             blocks.append(block)
         return blocks
@@ -2662,10 +3012,36 @@ class UcatsbGui(QMainWindow):
         Separate from `_analysis_for`'s masks and not cached with them: it
         depends on nothing the user can change, only on the gas's declared
         `valid_min`, and it applies to gases (Ozone) that have no analysis
-        settings at all.
+        settings at all. Kept floor-only on purpose -- the note text
+        distinguishes "below floor" from "flagged by hand", and conflating
+        them here would make that impossible.
         """
         floor = GASES[gas_key].get("valid_min")
         return below_floor_mask(self.df[GASES[gas_key]["value_col"]], floor)
+
+    def _flag_mask(self, gas_key):
+        """Rows this gas has been manually flagged on, as a boolean Series.
+
+        The inverse of _to_raw_rows: the ranges are stored in the RAW file's
+        row numbering and the analysis frame starts at raw row
+        `presync_dropped`, so the offset is subtracted here and nowhere else.
+        """
+        if self.df is None or gas_key is None:
+            return pd.Series(False, index=[] if self.df is None else self.df.index)
+        return ranges_to_mask(self.flagged.get(gas_key, []), self.df.index,
+                              offset=self.presync_dropped)
+
+    def _removed_mask(self, gas_key):
+        """Everything removed from a FLOOR gas's record: below-floor faults
+        plus manual flags.
+
+        Only for gases with has_masking=False (Ozone, H2O). A cal-bottle gas
+        gets its flags through `exclude_mask` in _analysis_for instead, which
+        is what makes them drop cal points as well as blanking output; those
+        gases never reach here because they have no `valid_min` and no
+        calibrate_series-free display path.
+        """
+        return self._rejected_mask(gas_key) | self._flag_mask(gas_key)
 
     def _analysis_for(self, gas_key):
         """Masks, cal intervals and per-injection cal means for one gas, from
@@ -2730,6 +3106,19 @@ class UcatsbGui(QMainWindow):
         pumps_off = (df["j_pumps"].fillna(0) != 1 if require_pumps
                      else pd.Series(False, index=df.index))
 
+        # Manually flagged rows join exclude_mask rather than getting a
+        # channel of their own, which is the whole design in one line: that
+        # mask is already handed BOTH to cal_mean_points (where it drops raw
+        # rows before the cal means are estimated, so flagging a visibly bad
+        # injection actually changes the calibration) and to calibrate_series
+        # (where it blanks the finished output). Flags therefore behave
+        # exactly like the warm-up, pressure and pumps masks, which is what
+        # the user asked for and what makes them predictable. Kept separately
+        # in the dict below for the markers and the note, which must be able
+        # to say *why* a row went.
+        flagged = self._flag_mask(gas_key)
+        exclude_mask = bad_pressure | trimmed | pumps_off | flagged
+
         cal_intervals, cal_points = [], []
         post_cal_flush = pd.Series(False, index=df.index)
         if has_masking:
@@ -2751,7 +3140,7 @@ class UcatsbGui(QMainWindow):
                 tuple(settings["cal1_window_s"]),
                 tuple(settings["cal2_window_s"]),
                 cal_bottles=self.cal_bottles, gas_key=gas_key,
-                exclude_mask=bad_pressure | trimmed | pumps_off,
+                exclude_mask=exclude_mask,
             )
 
         self._analysis[gas_key] = {
@@ -2759,7 +3148,8 @@ class UcatsbGui(QMainWindow):
             "warmup": warmup, "end_flight": end_flight, "trimmed": trimmed,
             "bad_pressure": bad_pressure,
             "pumps_off": pumps_off, "require_pumps": require_pumps,
-            "exclude_mask": bad_pressure | trimmed | pumps_off,
+            "flagged": flagged,
+            "exclude_mask": exclude_mask,
             "cal_intervals": cal_intervals, "cal_points": cal_points,
             "post_cal_flush": post_cal_flush,
             "has_masking": has_masking,
@@ -2865,8 +3255,13 @@ class UcatsbGui(QMainWindow):
         # rather than inventing a palette: on both figures red means "the
         # series you should be reading" and blue means "everything the
         # instrument recorded".
+        # For a floor gas this is the only place removals happen, so manual
+        # flags have to join here; a cal-bottle gas gets them through
+        # exclude_mask -> calibrate_series instead (see _removed_mask).
         rejected = self._rejected_mask(self.current_gas)
-        show_filtered = bool(rejected.any())
+        flagged = analysis["flagged"]
+        removed = rejected | flagged
+        show_filtered = bool(removed.any()) and not has_masking
 
         plot_data = df[["datetime", value_col]].dropna()
         line, = ax.plot(plot_data["datetime"], plot_data[value_col], color=LINE_COLOR,
@@ -2877,13 +3272,24 @@ class UcatsbGui(QMainWindow):
             # Rejected rows stay as NaN rather than being dropped, so the red
             # line breaks over them instead of drawing across the removal --
             # same reasoning as the calibrated trace below.
-            filtered = df[value_col].mask(rejected)
+            filtered = df[value_col].mask(removed)
             self._register_stats_trace(
                 "main:filtered", f"{self.current_gas} (filtered)", ax,
                 df["datetime"], filtered, unit)
-            keep = filtered.notna() | rejected
+            keep = filtered.notna() | removed
             filtered_line, = ax.plot(df["datetime"][keep], filtered[keep],
                                      color=CALIBRATED_COLOR, linewidth=1.2)
+
+        # Manually flagged points, struck out at their RAW values -- which is
+        # also the basis the flag box matches against, so the marker sits
+        # exactly where the user dragged. Drawn for every gas, and on top of
+        # everything, because "I removed this" has to stay visible after the
+        # trace it was removed from has broken over the gap.
+        flag_scatter = None
+        if flagged.any():
+            flag_scatter = ax.scatter(
+                df["datetime"][flagged], df[value_col][flagged],
+                marker="x", s=28, linewidths=1.1, color=FLAGGED_COLOR, zorder=6)
 
         cal_line = None
         if show_cal:
@@ -2936,6 +3342,9 @@ class UcatsbGui(QMainWindow):
             xs, ys = zip(*cal1_pts)
             handles.append(ax.scatter(xs, ys, color=CAL1_COLOR, s=40, zorder=5, edgecolors="none"))
             labels.append(f"{cal1_label}: {mean_std_label(ys)}")
+        if flag_scatter is not None:
+            handles.append(flag_scatter)
+            labels.append(f"flagged ({int(flagged.sum())})")
 
         ax.set_ylabel(gas["ylabel"], color=TEXT_COLOR)
         # Substituted, not appended: the stock title already says
@@ -2994,10 +3403,24 @@ class UcatsbGui(QMainWindow):
         # figure, so it is the only line that would explain the red trace.
         if show_filtered:
             floor = GASES[self.current_gas]["valid_min"]
+            n_below = int(rejected.sum())
             notes.append(
-                f"red = filtered, blue = raw; {int(rejected.sum())} reading"
-                f"{'' if rejected.sum() == 1 else 's'} below {floor:g} {unit} "
+                f"red = filtered, blue = raw; {n_below} reading"
+                f"{'' if n_below == 1 else 's'} below {floor:g} {unit} "
                 f"removed (sensor fault, not a measurement)"
+            )
+        # Its own line, and outside the has_masking gate: a manual flag is the
+        # one removal on this figure that no setting in the panel explains, so
+        # it has to say so for every gas, floor or cal-bottle.
+        n_flagged = int(flagged.sum())
+        if n_flagged:
+            notes.append(
+                f"black x = {n_flagged} point{'' if n_flagged == 1 else 's'} "
+                f"flagged by hand in "
+                f"{len(self.flagged.get(self.current_gas, []))} region"
+                f"{'' if len(self.flagged.get(self.current_gas, [])) == 1 else 's'}"
+                f" — removed from the "
+                f"{'filtered' if not has_masking else 'calibrated'} record"
             )
         notes_text = None
         if notes:
@@ -3240,7 +3663,7 @@ class UcatsbGui(QMainWindow):
             # Filtered, matching the red trace on the timeseries: a -2292 ppb
             # fault is not a point on a tracer-tracer plot, it is an outlier
             # that would set the axis range and drag the fit on its own.
-            values = self.df[gas["value_col"]].mask(self._rejected_mask(gas_key))
+            values = self.df[gas["value_col"]].mask(self._removed_mask(gas_key))
             qual = gas["value_col"]
             if gas.get("valid_min") is not None:
                 qual += f" ≥ {gas['valid_min']:g}"
@@ -3419,6 +3842,9 @@ class UcatsbGui(QMainWindow):
             if n_rejected:
                 note += (f"; {n_rejected} below "
                          f"{GASES[gas]['valid_min']:g} removed")
+            n_flagged = int(self._flag_mask(gas).sum())
+            if n_flagged:
+                note += f"; {n_flagged} flagged by hand"
             notes.append(note)
         # The fit summary rides in this block rather than in a legend: a
         # legend has to sit somewhere, and on a scatter that fills one corner

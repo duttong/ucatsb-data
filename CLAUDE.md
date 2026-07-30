@@ -703,6 +703,100 @@ Anything iterating gases must not assume a cal-bottle gas: check
   needed the help. The raw trace still runs off-scale, and the note says how
   many readings that is.
 
+### Manually flagged points ("Flag" toolbar toggle)
+
+The manual override for readings no rule catches — the ozone spikes on the Jul
+2026 flight reach 3500 ppb against a 0–900 ppb record, and no threshold
+separates them from real data. Drag a box on the Timeseries tab to flag,
+right-drag to unflag; the rows leave the calibrated (or filtered) series, both
+export products and the Correlations tab, while the raw trace keeps showing
+everything.
+
+**Stored as run-length-encoded RAW-file row ranges** in a `flagged:` block in
+the flight's `<dataset>_conf.yaml`, `{gas: {rows: N, ranges: [[lo, hi], ...]}}`,
+inclusive at both ends. Row ranges rather than timestamps or the drawn
+rectangles, for three reasons that each killed an alternative:
+
+- **Timestamps do not identify a row** — the Jul 2026 file has 1294 duplicate
+  timestamps, so flagging one spike would silently flag its twin.
+- **Storing the rectangle makes the flagged set drift.** A box resolved
+  against calibrated values catches different rows after a drift-model or
+  cal-tank change; row numbers mean the same thing forever.
+- **Set arithmetic.** Unflagging is `subtract_ranges`, splitting a range it
+  lands inside, with no paint/erase ordering to get wrong. One gesture is one
+  entry however wide, so "hundreds or thousands of points" is a handful of
+  lines of YAML.
+
+The helpers live in `ucatsb_analysis.py` (`merge_ranges`, `add_ranges`,
+`subtract_ranges`, `ranges_to_mask`, `ranges_row_count`). **`merge_ranges`
+merges *adjacent* runs as well as overlapping ones**, so a set of rows has
+exactly one representation — `_is_dirty()` deep-compares this, and two gesture
+orders reaching the same rows must not read as a change.
+
+`rows:` is a **tripwire, not an index**: raw row numbers only mean anything for
+the file they were drawn on, so a regenerated CSV of a different length would
+shift every flag silently. `load_flagged` still applies them and warns, because
+the user is better placed to judge — but silently wrong is the one outcome this
+feature cannot have.
+
+**Flags reach the pipeline by two different routes, and both are needed:**
+
+- **Cal-bottle gases** — OR-ed into `exclude_mask` in `_analysis_for`. That one
+  line covers both of that mask's documented uses, since it is already handed
+  to `cal_mean_points` (dropping raw rows before the cal means, so flagging a
+  bad injection genuinely changes the calibration — verified: one flagged
+  injection moves CO2's `span_gain` 0.9571 → 0.9645 and drops a cal point)
+  *and* to `calibrate_series` (blanking the output).
+- **Floor gases (Ozone, H2O)** — never reach `calibrate_series` at all, so
+  `_removed_mask(gas)` = `_rejected_mask | _flag_mask` is what the filtered
+  trace, `_corr_axis` and the export block use. `_rejected_mask` stays
+  floor-only so the note can say *which* removal a row belongs to.
+
+Because flags sit inside `exclude_mask`, **every edit must go through
+`refresh()`** — `_analysis_for` is cached per gas and that is its only
+invalidation site. `_after_flag_change` is the single funnel.
+
+Non-obvious behaviours, each deliberate:
+
+- **Flagging matches the box against the RAW value column**, never the
+  displayed trace, so a flag names the same rows after any recalibration. The
+  cost is that a box drawn tightly around the calibrated overlay (an intercept
+  away — ~10 ppm on CO2) can catch nothing, which is why an empty box says so
+  rather than doing nothing visible.
+- **Unflagging ignores the y-bounds entirely** and clears the whole time span.
+  Not leniency: the default y-range is framed on the *filtered* series
+  precisely so one 3500 ppb spike does not squash the record, which puts the
+  flagged point off-screen — there would be no box to draw around a value you
+  cannot see. It also makes unflagging total, and sidesteps the NaN asymmetry
+  below.
+- **NaN rows are never flagged** (`between` is False for NaN), the same
+  "absent is not invalid" rule `below_floor_mask` follows. A box over a span
+  containing gaps therefore stores several ranges, not one.
+- **The Flagging box is deliberately absent from the
+  `setEnabled(has_masking)` list** in `_select_gas`. Ozone is the gas this
+  exists for and is exactly the one with no masking settings to enable.
+- **"Apply to all gases" spreads new flags only; Clear is always current-gas.**
+  Reading that checkbox in `on_flag_clear` would turn one click into a
+  five-gas deletion the button never advertised.
+- **Flagging preserves the view** (`refresh(preserve_view=True)`) — it is a
+  fine-grained edit made while zoomed in on the points being removed. The
+  consequence is that the y-range does not reframe until Home is pressed,
+  which on Ozone is the difference between 0–3663 and −57–929.
+- **The Flag tool shares one selector with Stats** via `PlotPane.selector_mode`
+  rather than adding a second list; `attach_stats_selectors` rebuilds
+  `self.selectors` wholesale and disconnects the old handlers on every draw, so
+  a parallel list would duplicate that and leak canvas connections. The two
+  toolbar actions are mutually exclusive (both want left-drag), and flag mode
+  is built `interactive=False` with `button=[1, 3]` — a flag is an action that
+  fires and clears, not a standing selection.
+- **Undo is session-only.** A config that could undo its own contents would be
+  a strange object.
+
+`save_config` now carries **two** flight-config blocks, so its
+omitted-block-is-a-deletion trap is live again on that path: a save passing
+`cal_selection=` but forgetting `flagged=` discards every flagged point.
+`on_save_clicked` passes both.
+
 ### Export tab: two products from one set of "gas blocks"
 
 Its own tab, like Cal Tanks and for the same reason: both files are
