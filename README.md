@@ -221,6 +221,22 @@ Flags on a cal-bottle gas behave like every other mask: a flagged row inside a
 cal window is dropped before that injection's mean is computed, so flagging a
 visibly bad injection genuinely changes the calibration.
 
+**The same tool works on the Correlations tab**, which is often where a bad
+point is easiest to spot — one ozone reading far off the O3/N2O line stands out
+there while being near-impossible to hunt down in a timeseries. Because a point
+on that figure is a *pair* of measurements, the panel adds a **Flag applies to**
+combo: the Y tracer, the X tracer, or both. It defaults to the Y tracer and
+follows the axis pickers, so swapping the axes keeps you pointed at the same
+role rather than silently switching gases. An ozone spike says nothing about
+the N2O measured at the same instant, so flagging both is a deliberate choice
+rather than the default.
+
+Flagged points stay on the scatter as black `x` at the value they would have
+had, rather than vanishing — so you can see what you removed, and right-drag
+over them to unflag. Here the box is matched against the plotted (calibrated)
+values, since on that figure those *are* the axes, and unflagging uses the same
+box as flagging.
+
 The view is held still while you flag, since you are usually zoomed in on the
 points you are removing — press **Home** afterwards to reframe the y-axis on
 what is left.

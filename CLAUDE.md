@@ -792,15 +792,54 @@ Non-obvious behaviours, each deliberate:
 - **`attach_stats_selectors` snapshots and restores `ax.dataLim`, then calls
   `autoscale_view()`.** A RectangleSelector adds its rectangle — and, when
   interactive, three handle Line2Ds — to the Axes *at the origin*, and those
-  enlarge `dataLim` to include (0, 0). The timeseries survived it only because
-  its view limits are settled by other means, but its `dataLim.x0` was 0.0
-  (year 1970) rather than the record's start, which any later autoscale would
-  have inherited. Restoring `dataLim` alone is not enough — adding the artists
-  has already triggered an autoscale off the polluted limits and nothing
-  recomputes the view — hence the explicit `autoscale_view()`, safe because it
-  only touches an axis whose autoscale is still on.
+  enlarge `dataLim` to include (0, 0). On a tracer-tracer scatter that is
+  ruinous and obvious: N2O spans 304–341 ppb, so reaching back to zero
+  squashes the whole correlation into a corner. Restoring `dataLim` alone is
+  not enough — adding the artists has already triggered an autoscale off the
+  polluted limits and nothing recomputes the view — hence the explicit
+  `autoscale_view()`, which is safe because it only touches an axis whose
+  autoscale is still on, leaving a preserved view or the ozone y-framing
+  alone. The timeseries had the same corruption all along and survived only
+  because its view limits are settled by other means; the Correlations tab is
+  where it finally showed.
 - **Undo is session-only.** A config that could undo its own contents would be
   a strange object.
+
+#### Flagging from the Correlations tab
+
+The reason the tool is there at all: an outlier that is obvious against
+another tracer — one ozone point far off the O3/N2O line — can be
+near-impossible to find in a timeseries. Stats stays hidden on that pane;
+Flag does not.
+
+- **A point belongs to two gases**, so the target is explicit: a
+  "Flag applies to" combo offering the Y tracer, the X tracer, or both,
+  defaulting to Y. `_populate_corr_flag_target` rebuilds it whenever the axis
+  pickers change and **keeps the role, not the gas** — after a swap, "the Y
+  tracer" is still what the user meant, and re-resolving to a gas name would
+  silently retarget the tool. `on_corr_flag_clear` clears exactly the combo's
+  scope, so the button undoes what the tool does.
+- **The box is matched against the plotted values** — calibrated, or
+  floor-filtered for Ozone — because on this figure those *are* the axes.
+  That is the opposite of the timeseries rule (raw there, where two traces
+  overlap and one has to be picked) and it costs nothing: a box is resolved to
+  row numbers once, at the drag, and rows are what get stored. Nothing
+  re-resolves later, so no flag can drift when the calibration changes.
+- **Unflagging matches the same box**, again the opposite of the timeseries,
+  and for the same underlying reason. There a flagged point is off-screen
+  because the y-range is framed on the filtered data; here it is drawn in
+  place as a struck-out marker, so there is always a box to draw around it.
+- **`_corr_axis_flagged` recovers where a flagged point would have plotted.**
+  Flagging blanks the row, so it drops out of the pairing and vanishes —
+  leaving the outlier just removed invisible and unreachable. Nothing is
+  re-derived to get it back: `calibrate_series` emits `cal_slope`/
+  `cal_intercept` on *every* row, blanked ones included, precisely so a
+  blanked value can be recomputed. A floor gas needs no undoing, but its
+  below-floor faults stay out — those are a sensor fault, not a user choice.
+- **Selection for flagging is restricted to `keep`; unflagging is not.**
+  Flagged points are deliberately drawn *outside* the plotted record, so
+  unflag has to reach them, while flag must only ever take points that are
+  actually part of it.
 
 `save_config` now carries **two** flight-config blocks, so its
 omitted-block-is-a-deletion trap is live again on that path: a save passing

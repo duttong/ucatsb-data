@@ -651,12 +651,14 @@ class PlotPane(QWidget):
         for i, ax in enumerate(live):
             # A RectangleSelector adds its rectangle (and, when interactive,
             # its corner handles) to the Axes at the ORIGIN, and those artists
-            # enlarge ax.dataLim to include (0, 0). Restoring dataLim is not
-            # enough on its own: adding them has already triggered an autoscale
-            # off the polluted limits and nothing recomputes the view, hence
-            # the explicit autoscale_view() below -- which is safe because it
-            # only touches an axis whose autoscale is still on, leaving a
-            # preserved view or an explicitly framed y-range exactly as it was.
+            # enlarge ax.dataLim to include (0, 0). On a tracer-tracer scatter
+            # that is catastrophic and visible: N2O spans 304-341 ppb, so
+            # reaching back to zero turns the whole correlation into a blob in
+            # the corner. The timeseries survived it only by accident -- its
+            # view limits are settled by other means -- but its dataLim was
+            # being corrupted too, which any later autoscale would have
+            # inherited. Snapshot and restore, so the limits describe the data
+            # and nothing else.
             saved_limits = ax.dataLim.frozen()
             sel = RectangleSelector(
                 ax, functools.partial(self._on_select, ax), useblit=True,
@@ -679,6 +681,12 @@ class PlotPane(QWidget):
                     pass
             sel.set_visible(active and not flagging
                             and i == box_index and self._box is not None)
+            # Restoring dataLim is not enough on its own: adding the artists
+            # already triggered an autoscale off the polluted limits, and
+            # nothing recomputes the view afterwards. autoscale_view() is the
+            # safe way to redo it -- it only touches an axis whose autoscale
+            # is still on, so an explicitly set range (a preserved view, or
+            # the ozone y-framing) is left exactly as it was.
             ax.dataLim.set(saved_limits)
             ax.autoscale_view()
             self.selectors.append(sel)
@@ -803,6 +811,9 @@ class UcatsbGui(QMainWindow):
         # asking right now, not a property of the flight worth persisting.
         self.corr_x_gas = None
         self.corr_y_gas = None
+        # Set by redraw_corr; what the flag tool resolves a dragged box
+        # against. None until the tab has drawn something flaggable.
+        self._corr_plotted = None
         self.corr_marker_size = 4
         self.corr_error_bars = False
         # None = single-color points; otherwise a key into CORR_COLOR_BY.
@@ -1134,6 +1145,46 @@ class UcatsbGui(QMainWindow):
         style_form.addRow(color_row)
         vbox.addWidget(style_box)
 
+        # Flagging from this figure needs one thing the timeseries does not:
+        # a point here belongs to TWO gases, and striking out an ozone outlier
+        # must not discard the perfectly good N2O measured at the same instant.
+        # Hence an explicit target, defaulted to the Y tracer (the one usually
+        # read as the dependent variable) and repopulated whenever the axis
+        # pickers change.
+        self.corr_flag_box = QGroupBox("Flagged Points")
+        corr_flag_form = QVBoxLayout(self.corr_flag_box)
+        target_row = QHBoxLayout()
+        target_row.setSpacing(4)
+        target_row.addWidget(QLabel("Flag:"))
+        self.corr_flag_target = QComboBox()
+        self.corr_flag_target.setToolTip(
+            "Which tracer a flag drawn here applies to. A point is a pair of\n"
+            "measurements, and one of them is usually fine — an ozone spike\n"
+            "says nothing about the N2O measured at the same moment."
+        )
+        self.corr_flag_target.currentIndexChanged.connect(self.on_corr_flag_target_changed)
+        target_row.addWidget(self.corr_flag_target, 1)
+        corr_flag_form.addLayout(target_row)
+
+        self.corr_flag_label = QLabel("No points flagged")
+        self.corr_flag_label.setWordWrap(True)
+        self.corr_flag_label.setStyleSheet(f"color: {MUTED_COLOR};")
+        corr_flag_form.addWidget(self.corr_flag_label)
+
+        corr_flag_buttons = QHBoxLayout()
+        self.corr_flag_undo_button = QPushButton("Undo")
+        self.corr_flag_undo_button.setToolTip(
+            "Step back through this session's flagging, on any tab.")
+        self.corr_flag_undo_button.clicked.connect(self.on_flag_undo)
+        self.corr_flag_clear_button = QPushButton("Clear")
+        self.corr_flag_clear_button.setToolTip(
+            "Remove every flag on the tracer named above.")
+        self.corr_flag_clear_button.clicked.connect(self.on_corr_flag_clear)
+        corr_flag_buttons.addWidget(self.corr_flag_undo_button)
+        corr_flag_buttons.addWidget(self.corr_flag_clear_button)
+        corr_flag_form.addLayout(corr_flag_buttons)
+        vbox.addWidget(self.corr_flag_box)
+
         self.corr_note = QLabel(
             "Calibrated data wherever there is a calibration. A point needs a "
             "value in <i>both</i> tracers, so each gas's own masking, cal "
@@ -1192,6 +1243,7 @@ class UcatsbGui(QMainWindow):
             if current:
                 combo.setCurrentText(current)
             combo.blockSignals(False)
+        self._populate_corr_flag_target()
 
     def _rebuild_cal_bottles(self):
         """The two tanks matching is allowed to consider, from the current
@@ -1682,11 +1734,14 @@ class UcatsbGui(QMainWindow):
 
         self.tanks_pane = self._build_cal_tanks_pane()
         self.corr_pane = PlotPane()
-        # Same reason as the Calibration tab: the box-stats readout describes
-        # one trace over a time span, which a tracer-tracer scatter is not --
-        # and a box on a scatter names two gases' rows at once, not one gas's.
+        # Stats stays hidden here: its readout describes one trace over a time
+        # span, which a tracer-tracer scatter is not. Flagging is the opposite
+        # case and the reason this tab wanted the tool -- an outlier that is
+        # obvious against another tracer can be near-impossible to find in the
+        # timeseries. The ambiguity Stats could not resolve (a box names two
+        # gases' rows) is settled by the explicit target combo instead.
         self.corr_pane.stats_action.setVisible(False)
-        self.corr_pane.flag_action.setVisible(False)
+        self.corr_pane.on_flag_box = self.on_corr_flag_box
 
         self.export_pane = self._build_export_pane()
 
@@ -2405,10 +2460,145 @@ class UcatsbGui(QMainWindow):
             self.corr_x_gas = gas_key
         else:
             self.corr_y_gas = gas_key
+        self._populate_corr_flag_target()
         # A different tracer is a different set of numbers on that axis, so
         # the old limits mean nothing -- rescale, as a gas change does on the
         # timeseries.
         self._refresh_corr(preserve_view=False)
+
+    def _populate_corr_flag_target(self):
+        """Rebuild the "Flag applies to" choices for the current pair.
+
+        Keeps the previous *role* (Y / X / both) rather than the previous gas
+        name: after swapping the axes, "the Y tracer" is still what the user
+        meant, and re-resolving to a gas would silently retarget the tool.
+        """
+        previous = self.corr_flag_target.currentData()
+        x_gas, y_gas = self.corr_x_gas, self.corr_y_gas
+        if not x_gas or not y_gas:
+            return
+        entries = [("y", f"{y_gas}  (Y axis)"), ("x", f"{x_gas}  (X axis)")]
+        if x_gas != y_gas:
+            entries.append(("both", "both tracers"))
+        self._loading, loading = True, self._loading
+        self.corr_flag_target.clear()
+        for role, label in entries:
+            self.corr_flag_target.addItem(label, role)
+        index = self.corr_flag_target.findData(previous)
+        self.corr_flag_target.setCurrentIndex(index if index >= 0 else 0)
+        self._loading = loading
+        self._update_corr_flag_readout()
+
+    def _corr_flag_gases(self):
+        """Which gases a flag drawn on the scatter applies to."""
+        role = self.corr_flag_target.currentData() or "y"
+        if role == "x":
+            return [self.corr_x_gas]
+        if role == "both":
+            return list(dict.fromkeys([self.corr_y_gas, self.corr_x_gas]))
+        return [self.corr_y_gas]
+
+    def on_corr_flag_target_changed(self, _index):
+        if self._loading or self._initializing:
+            return
+        self._update_corr_flag_readout()
+
+    def _update_corr_flag_readout(self):
+        """Counts for the tracer(s) the tool is currently pointed at."""
+        gases = [g for g in self._corr_flag_gases() if g]
+        parts, total = [], 0
+        for gas in gases:
+            ranges = self.flagged.get(gas, [])
+            total += ranges_row_count(ranges)
+            if ranges:
+                parts.append(f"{gas}: {ranges_row_count(ranges)} in "
+                             f"{len(ranges)} region{'' if len(ranges) == 1 else 's'}")
+        self.corr_flag_label.setText(
+            "No points flagged" if not parts else "  ·  ".join(parts))
+        self.corr_flag_clear_button.setEnabled(bool(total))
+        self.corr_flag_undo_button.setEnabled(bool(self._flag_undo))
+
+    def on_corr_flag_clear(self):
+        """Clear the flags on whichever tracer the combo names -- the same
+        scope the tool writes to, so the button undoes what it does."""
+        gases = [g for g in self._corr_flag_gases() if self.flagged.get(g)]
+        if not gases:
+            return
+        self._flag_undo.append(copy.deepcopy(self.flagged))
+        for gas in gases:
+            self.flagged.pop(gas, None)
+        self._after_flag_change()
+
+    def on_corr_flag_box(self, ax, x0, x1, y0, y1, unflag):
+        """Flag (or unflag) the scatter points inside a dragged box.
+
+        The box is matched against the values actually plotted -- calibrated
+        for a cal-bottle gas, floor-filtered for Ozone -- because on this
+        figure those *are* the axes. That is not the rule the timeseries uses
+        (raw there, where two traces overlap and one has to be chosen), and it
+        costs nothing: a box is resolved to row numbers once, at the moment of
+        the drag, and it is the rows that get stored. Nothing re-resolves
+        later, so no flag can drift when the calibration changes.
+
+        Unflagging matches the same box rather than ignoring its height, the
+        opposite of the timeseries rule -- and for the same underlying reason.
+        There, a flagged point is off-screen because the y-range is framed on
+        the filtered data; here it is drawn in place as a struck-out marker,
+        so there is always a box the user can draw around it.
+        """
+        plotted = self._corr_plotted
+        if self.df is None or plotted is None or ax is not self._corr_ax:
+            return
+        fx, fy = plotted["x"], plotted["y"]
+        inside = (fx.between(min(x0, x1), max(x0, x1))
+                  & fy.between(min(y0, y1), max(y0, y1)))
+        # Flagged points are drawn outside `keep` (that is the whole point of
+        # keeping them visible), so selection may not be restricted to it --
+        # but for FLAGGING, only points that are actually part of the plotted
+        # record may be taken.
+        targets = [g for g in self._corr_flag_gases() if g]
+        if unflag:
+            selectable = inside & self._any_flag_mask(targets)
+        else:
+            selectable = inside & plotted["keep"]
+        n = int(selectable.sum())
+        if not n:
+            self.corr_pane.set_stats_text(
+                "Nothing flagged in that box." if unflag else
+                "No plotted points in that box.")
+            return
+
+        rows = [i + self.presync_dropped
+                for i in range(len(selectable)) if selectable.iat[i]]
+        spans, start, prev = [], rows[0], rows[0]
+        for row in rows[1:]:
+            if row != prev + 1:
+                spans.append((start, prev))
+                start = row
+            prev = row
+        spans.append((start, prev))
+
+        self._flag_undo.append(copy.deepcopy(self.flagged))
+        for gas in targets:
+            ranges = self.flagged.get(gas, [])
+            for lo, hi in spans:
+                ranges = (subtract_ranges(ranges, lo, hi) if unflag
+                          else add_ranges(ranges, lo, hi))
+            if ranges:
+                self.flagged[gas] = ranges
+            else:
+                self.flagged.pop(gas, None)
+        self.corr_pane.set_stats_text(
+            f"{'Unflagged' if unflag else 'Flagged'} {n} point"
+            f"{'' if n == 1 else 's'} on {', '.join(targets)}")
+        self._after_flag_change()
+
+    def _any_flag_mask(self, gases):
+        """Rows flagged on any of `gases`."""
+        mask = pd.Series(False, index=self.df.index)
+        for gas in gases:
+            mask |= self._flag_mask(gas)
+        return mask
 
     def on_corr_swap_axes(self):
         if self.corr_x_gas is None or self.corr_x_gas == self.corr_y_gas:
@@ -2419,6 +2609,10 @@ class UcatsbGui(QMainWindow):
         self.corr_x_combo.setCurrentText(self.corr_x_gas)
         self.corr_y_combo.setCurrentText(self.corr_y_gas)
         self._loading = loading
+        # Rebuilt after the swap, and it keeps the *role* rather than the gas
+        # -- swapping the axes should not silently retarget the flag tool from
+        # the tracer you were working on to the other one.
+        self._populate_corr_flag_target()
         self._refresh_corr(preserve_view=False)
 
     def on_corr_color_changed(self):
@@ -2587,6 +2781,7 @@ class UcatsbGui(QMainWindow):
         zoomed in on the very points being removed.
         """
         self._update_flag_readout()
+        self._update_corr_flag_readout()
         self._mark_dirty()
         self.refresh(preserve_view=True)
 
@@ -3685,6 +3880,34 @@ class UcatsbGui(QMainWindow):
         sigma = self._uncertainty_for(gas_key)[0] if self.corr_error_bars else None
         return result["calibrated"], sigma, unit, "calibrated", None
 
+    def _corr_axis_flagged(self, gas_key):
+        """What a MANUALLY FLAGGED row would have contributed to this axis.
+
+        Flagging blanks a row, so a flagged point drops straight out of the
+        scatter's pairing and disappears -- which would leave the outlier you
+        just struck out invisible, and unreachable for a right-drag unflag.
+        This recovers the value it would have had, so it can be drawn as a
+        struck-out marker instead.
+
+        Nothing is re-derived to do it: `calibrate_series` deliberately emits
+        `cal_slope`/`cal_intercept` on *every* row, blanked ones included,
+        exactly so a blanked row's calibrated value can be recomputed. A floor
+        gas has no calibration to undo, so its raw column is already the answer
+        -- but its below-floor faults stay out, since those are a sensor fault
+        rather than something the user chose to remove.
+
+        Returns a Series that is NaN everywhere except this gas's flagged rows.
+        """
+        flags = self._flag_mask(gas_key)
+        gas = GASES[gas_key]
+        raw = self.df[gas["value_col"]]
+        if not gas.get("has_masking", True):
+            return raw.mask(~flags | self._rejected_mask(gas_key))
+        result = self._calibration_for(gas_key)
+        if not (result or {}).get("ok"):
+            return pd.Series(float("nan"), index=self.df.index)
+        return (result["slope"] * raw + result["intercept"]).mask(~flags)
+
     def _median_sigmas(self, *gas_units):
         """[(gas, median 1σ, unit)] for those of `gas_units` that have a
         calibration to propagate one from, in the order given.
@@ -3747,6 +3970,7 @@ class UcatsbGui(QMainWindow):
             ax.set_xticks([]); ax.set_yticks([])
             self.corr_stats_label.setText("")
             self._corr_ax = None
+            self._corr_plotted = None
             self._last_corr_key = corr_key
             self.corr_pane.reset_nav()
             self.corr_pane.canvas.draw()
@@ -3808,6 +4032,24 @@ class UcatsbGui(QMainWindow):
             bar.outline.set_edgecolor(AXIS_COLOR)
             if CORR_COLOR_BY[self.corr_color_by][1] is None:
                 bar.ax.yaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+
+        # Manually flagged points, struck out where they would have plotted.
+        # They are NaN in x_vals/y_vals -- flagging is what blanked them -- so
+        # they would otherwise simply vanish, leaving the outlier you just
+        # removed invisible and out of reach of a right-drag unflag. A point
+        # is drawn when EITHER axis is flagged and both have a value to place
+        # it at; the pair is what has a position on this figure, even though
+        # only one gas may be the one struck out.
+        fx = x_vals.combine_first(self._corr_axis_flagged(x_gas))
+        fy = y_vals.combine_first(self._corr_axis_flagged(y_gas))
+        flagged_here = ((self._flag_mask(x_gas) | self._flag_mask(y_gas))
+                        & fx.notna() & fy.notna())
+        if z_vals is not None:
+            flagged_here &= z_vals.notna()
+        if flagged_here.any():
+            ax.scatter(fx[flagged_here], fy[flagged_here], marker="x",
+                       s=max(28, self.corr_marker_size ** 2), linewidths=1.1,
+                       color=FLAGGED_COLOR, zorder=4)
 
         fit = linear_fit(x, y) if self.corr_fit else None
         if fit:
@@ -3896,6 +4138,15 @@ class UcatsbGui(QMainWindow):
                 ha="left", va="top", color=MUTED_COLOR, fontsize=9)
 
         self._update_corr_stats(fit, x, y, x_gas, y_gas, x_unit, y_unit)
+
+        # What the flag tool resolves a box against. Recorded here rather than
+        # recomputed there for the same reason _register_stats_trace exists:
+        # the plotted set is the intersection of two masked series and the
+        # z-variable's own pairing rule, and rebuilding that from the outside
+        # would be a second implementation free to drift from this one.
+        self._corr_plotted = {"keep": keep, "x": fx, "y": fy,
+                              "x_gas": x_gas, "y_gas": y_gas}
+        self.corr_pane.attach_stats_selectors([ax])
 
         self.corr_pane.reset_nav()
         if old_view is not None:
