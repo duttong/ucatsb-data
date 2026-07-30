@@ -1556,9 +1556,13 @@ def plot_calibration_panels(fig, result, gas_key, ylabel, datetimes, unit=""):
     if not result.get("ok"):
         ax = fig.add_subplot(111)
         ax.set_axis_off()
+        # in_layout=False: an unclipped Text is part of the Axes' tight bbox,
+        # so under constrained_layout it sizes the very Axes it is positioned
+        # and (with wrap=True) wrapped against, and the two chase each other a
+        # little further on every redraw.
         ax.text(0.5, 0.5, result.get("reason") or "No calibration available.",
                 ha="center", va="center", color=MUTED_COLOR, fontsize=11,
-                wrap=True, transform=ax.transAxes)
+                wrap=True, transform=ax.transAxes, in_layout=False)
         return [ax]
 
     gs = fig.add_gridspec(3, 1, height_ratios=[2, 2, 1.5])

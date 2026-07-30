@@ -431,6 +431,25 @@ making one tab depend on state invisible from another); Correlations is the
 exception because it is inherently about *two* gases, so a per-gas panel
 beside it would be actively misleading about what is plotted.
 
+**Every note block drawn inside an Axes is created with `in_layout=False`.**
+The panes' Figures use `constrained_layout`, and a `Text` is unclipped by
+default, so the layout engine counts the note in the Axes' tight bbox and
+reserves room for whatever hangs off the right-hand edge. But a note anchored
+at `0.01` of the *axes* width moves with the Axes it is sizing: shrinking the
+Axes to make room moves the note left by less than the Axes lost, so the two
+never agree until the Axes is as wide as the note, and each draw walks part of
+the way there. The symptom is a plot that creeps wider on redraws that changed
+nothing — toggling **Hide flagged points** seven or eight times visibly grew
+the Correlations x axis before it saturated (2026-07-30) — and, in a narrow
+window, an Axes squeezed to ~77 px with matplotlib's "axes sizes collapsed to
+zero" warning. It surfaced on Correlations because that note is the widest
+text on any figure whenever Ozone is on *either* axis (the line naming
+`oz_o3best`, its floor and its hand-flagged count is ~1000 px by itself);
+without Ozone it fits inside the Axes and nothing moves. The feedback is
+latent in every note block, so the timeseries note and both "no calibration"
+messages set it too. Making room for a note is done deliberately instead —
+see `_text_height_frac`.
+
 ### The controls panel's size is a constraint on the whole window
 
 Both stack pages are `CONTROLS_WIDTH` wide and as tall as their contents, and

@@ -4180,6 +4180,9 @@ class UcatsbGui(QMainWindow):
                 # box to stay readable. Semi-transparent, like the legend's
                 # frame, so it dims the data underneath without hiding it.
                 bbox=dict(facecolor="white", alpha=0.72, edgecolor="none", pad=2),
+                # Kept out of constrained_layout's tight bbox; see the note
+                # block in redraw_corr for what happens when it is left in.
+                in_layout=False,
             )
 
         # Placed after the notes, and confined to the axes *above* them.
@@ -4504,10 +4507,13 @@ class UcatsbGui(QMainWindow):
         failed = [(gas, reason) for gas, reason in ((x_gas, x_reason), (y_gas, y_reason))
                   if reason]
         if failed:
+            # in_layout=False for the same reason as the note block below --
+            # and doubly so with wrap=True, which measures its line width
+            # against the Axes it is sizing.
             ax.text(0.5, 0.5,
                     "\n\n".join(f"{gas}: {reason}" for gas, reason in failed),
                     transform=ax.transAxes, ha="center", va="center",
-                    color=MUTED_COLOR, fontsize=10, wrap=True)
+                    color=MUTED_COLOR, fontsize=10, wrap=True, in_layout=False)
             ax.set_xticks([]); ax.set_yticks([])
             self.corr_stats_label.setText("")
             self._corr_ax = None
@@ -4679,8 +4685,22 @@ class UcatsbGui(QMainWindow):
             notes.append("median 1σ from the calibration: "
                          + ",  ".join(f"{gas} ±{value:.3g} {unit}"
                                       for gas, value, unit in sigmas))
+        # in_layout=False, and it has to be: a Text is unclipped by default, so
+        # constrained_layout counts it in the Axes' tight bbox and reserves
+        # room for the part that hangs off the right-hand edge. But the note is
+        # anchored at 0.01 of the AXES width, so shrinking the Axes to make
+        # room moves the note left by less than the Axes lost -- there is no
+        # width at which the two agree until the Axes is as wide as the note.
+        # Each draw walks part of the way there (~20 px, decaying), so the plot
+        # crept wider on every redraw that changed nothing: toggling "Hide
+        # flagged points" seven or eight times visibly grew the x axis, until
+        # it saturated. It showed up here because this note is the widest text
+        # on any of the figures -- the Ozone line naming oz_o3best, its floor
+        # and its hand-flagged count is ~1000 px on its own -- but the same
+        # feedback is latent in every note block, so they all set it.
         ax.text(0.01, 0.99, "\n".join(notes), transform=ax.transAxes,
-                ha="left", va="top", color=MUTED_COLOR, fontsize=9)
+                ha="left", va="top", color=MUTED_COLOR, fontsize=9,
+                in_layout=False)
 
         self._update_corr_stats(fit, x, y, x_gas, y_gas, x_unit, y_unit)
 
