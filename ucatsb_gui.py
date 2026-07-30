@@ -105,10 +105,10 @@ GASES = {
     # below it the sensor is faulting, not measuring. Declared per gas rather
     # than special-cased by name so the filtering code stays generic -- any
     # gas that gains a floor gets the same raw/filtered treatment.
-    "Ozone": {"value_col": "oz_o3best", "ylabel": "O3 (ppb)", "title": "UCATS-B O3 timeseries", "detector": None, "has_masking": False, "valid_min": O3_VALID_MIN_PPB, "short": "O3", "standard_name": "Gas_O3_InSitu_S_AVMR", "long_name": "Ozone mole fraction"},
+    "Ozone": {"value_col": "oz_o3best", "ylabel": "O3 (ppb)", "title": "UCATS-B O3 timeseries", "detector": None, "has_masking": False, "valid_min": O3_VALID_MIN_PPB, "short": "O3", "standard_name": "Gas_O3_InSitu_S_AVMR", "long_name": "Ozone volume mixing ratio in ambient air"},
     # Water vapour, from its own instrument (`w_*` columns) -- like Ozone it
     # has no cal bottles, so has_masking=False and it is plotted as recorded.
-    "H2O": {"value_col": "w_H2Obest", "ylabel": "H2O (ppm)", "title": "UCATS-B H2O timeseries", "detector": None, "has_masking": False, "valid_min": H2O_VALID_MIN_PPM, "standard_name": "Met_H2OMF_InSitu_None", "long_name": "Water vapour mole fraction"},
+    "H2O": {"value_col": "w_H2Obest", "ylabel": "H2O (ppm)", "title": "UCATS-B H2O timeseries", "detector": None, "has_masking": False, "valid_min": H2O_VALID_MIN_PPM, "standard_name": "Met_H2OMF_InSitu_None", "long_name": "Water vapour mole fraction in ambient air"},
 }
 
 
@@ -2012,13 +2012,13 @@ class UcatsbGui(QMainWindow):
     # tallest boxes.
     ICARTT_FIELDS = (
         ("data_id", "Data ID", 0,
-         "First part of the file name — the mission/instrument data product, "
-         "e.g. SABRE-UCATSB. The ICARTT standard calls it common practice to "
-         "prefix the project acronym, and requires the ID to match whatever "
-         "the archiving data center has registered, so check it against the "
-         "mission's data-management instructions rather than inventing one. "
-         "Hyphens are kept; underscores separate the file name's own fields "
-         "and are stripped."),
+         "First part of the file name — the mission/instrument data product. "
+         "UCATS-B is registered with the archive as SABRE-UCATSB, which is "
+         "what this should stay for SABRE. The ICARTT standard requires the "
+         "ID to match whatever the archiving data center has registered, so "
+         "a new campaign means asking them, not inventing one. Hyphens are "
+         "kept; underscores separate the file name's own fields and are "
+         "stripped."),
         ("location_id", "Location ID", 0,
          "Second part of the file name — normally the platform, e.g. WB57."),
         ("pi_name", "PI name(s)", 0,

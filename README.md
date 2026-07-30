@@ -597,7 +597,9 @@ vapour is not a `Gas` name in the convention at all, but a `Met` one, and
 `H2OMF` is a mole fraction with respect to ambient air. **Ozone is
 `Gas_O3_InSitu_S_AVMR`**: a volumetric mixing ratio with respect to ambient
 air, since nothing dries the 2B monitor's sample stream. Both live in
-`GASES[gas]["standard_name"]`.
+`GASES[gas]["standard_name"]`, and each one's description says the same thing
+in words — "in ambient air" — so the two fields on a variable line cannot
+contradict each other.
 
 #### Header metadata
 

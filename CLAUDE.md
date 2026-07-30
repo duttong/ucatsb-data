@@ -1001,6 +1001,14 @@ campaign meets one convention across both instruments:
     the 2B monitor's sample stream. Settled with Eric on 2026-07-29 after the
     entry had been `DMF` and then briefly `None`; unlike the other gases it
     could not be copied from the sister GC file, which has no ozone variable.
+
+  **`long_name` has to agree with the reporting attribute it sits beside.**
+  Both of these carry an *ambient* basis, so O3 reads "Ozone volume mixing
+  ratio in ambient air" and H2O "Water vapour mole fraction in ambient air" —
+  not the bare "mole fraction" they had while their standard names still said
+  `DMF`. The two end up on the same variable-definition line, and a
+  description contradicting the controlled-vocabulary field beside it is worse
+  than either alone.
 - **Units gain the trailing `v`** (`ppmv`/`ppbv`) via `ICARTT_UNITS`, for the
   ICARTT header only. Plot labels keep `ppm`/`ppb`.
 - **The 1σ variable is `<species>e_<suffix>`** (`CO2e_UCATSB`), not
