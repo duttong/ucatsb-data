@@ -25,8 +25,7 @@ icartt:
     RASTA was previously identified as UCATS-B. It was renamed to avoid
     confusion with the UCATS gas chromatograph flying on the same platform.
     The instrument, its inlet and its calibration are unchanged; only the name
-    has changed. Files delivered before this revision, and the variable names
-    within them, carry the UCATSB identifier.
+    has changed.
 
     Error estimates are based on the assigned values of the onboard calibration
     cylinders, the scatter of the in-flight calibration record, and the drift
