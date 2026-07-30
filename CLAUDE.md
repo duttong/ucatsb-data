@@ -491,6 +491,18 @@ latent in every note block, so the timeseries note and both "no calibration"
 messages set it too. Making room for a note is done deliberately instead —
 see `_text_height_frac`.
 
+**The same applies to every in-axes legend**, and it is not cosmetic there
+either: `constrained_layout` counts a `Legend` in its Axes' tight bbox *even
+when it is anchored inside*, so a legend wider than its panel asks for room
+the panel cannot give and the layout gives up entirely — "axes sizes collapsed
+to zero", the row squeezed to a few pixels. It went unnoticed while the
+residuals panel had the calibration figure's full width; splitting that row
+with the 1σ panel (2026-07-30) made its two-column legend wider than its Axes
+and the bottom row collapsed at 6.5 in. All four legends (both calibration
+panels, the timeseries main and aux) now call `.set_in_layout(False)`. The
+rule for these figures is one line: **something drawn inside an Axes must not
+size it.**
+
 ### The controls panel's size is a constraint on the whole window
 
 Both stack pages are `CONTROLS_WIDTH` wide and as tall as their contents, and
@@ -790,6 +802,28 @@ of the assigned values, `c = (1-f)A_lo + f A_hi` with
   calibration constrains it. So is any inflation over extrapolated spans,
   which are reported as a percentage of points instead — folding them in
   would disguise "we are guessing here" as ordinary uncertainty.
+
+**The Calibration tab's fourth panel plots that σ against mixing ratio**
+(`ax_sig`, bottom-right, added 2026-07-30), because the dominant term in the
+reported 1σ is usually *where the air sits relative to the tanks* rather than
+anything about the cal record, and that has no home on a plot against time.
+Between the bottles the two nodes constrain each other and the curve dips
+**below either bottle's own LOO scatter**, to
+`slope · sR_lo·sR_hi / √(sR_lo² + sR_hi²)` at `f = sR_lo²/(sR_lo² + sR_hi²)`
+— pulled toward the quieter bottle, not the midpoint. Outside, one bottle is
+levered by `f` (or `1 − f`) and the same scatter reports much larger: CO2 on
+2026-07-30 sits ~39% of a span above the higher tank, where `f = 1.39` turns
+LOO 0.59 into 0.87 ppm, against a 0.40 ppm minimum at ~406 ppm. The flight's
+1st–99th percentile is shaded and its median marked, so the panel answers
+"what is this flight paying for its bracket" directly.
+
+It is a *column* of the bottom row, not a fourth stacked panel: its x axis is
+a mixing ratio, so it cannot join the `sharex` group, and a full-width row
+under three time panels would invite it to be read as one. It uses the median
+slope rather than `slope(t)` — the shape is set by `f`, which moves by ones
+where slope moves by a couple of percent — and in `offset` mode it degrades to
+the flat line that mode implies rather than being hidden, so the returned axes
+list keeps a stable length (the GUI restores y-limits by zipping over it).
 
 **The z-axis coloring** (`CORR_COLOR_BY`, `CORR_COLORMAP`) maps each entry to
 `(label, column, colorbar label)`, with `column=None` meaning the time axis —

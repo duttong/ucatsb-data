@@ -4336,8 +4336,14 @@ class UcatsbGui(QMainWindow):
 
         reserved = self._text_height_frac(ax, notes_text)
         anchor = (0.0, reserved, 1.0, 1.0 - reserved)
+        # in_layout=False for the same reason the note block above carries
+        # it: constrained_layout counts an in-axes legend in the Axes' tight
+        # bbox, so a legend wider than the panel demands room the panel cannot
+        # give -- which on a narrow window ends in "axes sizes collapsed to
+        # zero" rather than in a legend that merely looks cramped.
         ax.legend(handles, labels, loc="best", fontsize=9, framealpha=0.9,
-                  bbox_to_anchor=anchor, bbox_transform=ax.transAxes)
+                  bbox_to_anchor=anchor,
+                  bbox_transform=ax.transAxes).set_in_layout(False)
 
         ax_aux2 = None
         if ax_aux is not None:
@@ -4383,7 +4389,8 @@ class UcatsbGui(QMainWindow):
                 aux_labels.append(self.right_axis_column)
 
             if has_right_axis:
-                ax_aux.legend(aux_handles, aux_labels, loc="upper right", fontsize=8, framealpha=0.9)
+                ax_aux.legend(aux_handles, aux_labels, loc="upper right",
+                              fontsize=8, framealpha=0.9).set_in_layout(False)
 
         # The new Axes were just built and auto-scaled to the full data
         # range -- reset the toolbar's view stack so Home returns to *this*

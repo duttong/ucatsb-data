@@ -1659,10 +1659,15 @@ def plot_calibration_panels(fig, result, gas_key, ylabel, datetimes, unit=""):
                 wrap=True, transform=ax.transAxes, in_layout=False)
         return [ax]
 
-    gs = fig.add_gridspec(3, 1, height_ratios=[2, 2, 1.5])
-    ax_resp = fig.add_subplot(gs[0])
-    ax_coef = fig.add_subplot(gs[1], sharex=ax_resp)
-    ax_res = fig.add_subplot(gs[2], sharex=ax_resp)
+    # The bottom row is split rather than a fourth stacked panel: the 1-sigma
+    # curve's x axis is a mixing ratio, not a time, so it cannot join the
+    # sharex group -- and a full-width row under three time panels would
+    # invite it to be read as one.
+    gs = fig.add_gridspec(3, 2, height_ratios=[2, 2, 1.5], width_ratios=[3, 1])
+    ax_resp = fig.add_subplot(gs[0, :])
+    ax_coef = fig.add_subplot(gs[1, :], sharex=ax_resp)
+    ax_res = fig.add_subplot(gs[2, 0], sharex=ax_resp)
+    ax_sig = fig.add_subplot(gs[2, 1])
     extrap = result["extrapolated"]
 
     state_colors = {result["low_state"]: CAL0_COLOR, result["high_state"]: CAL1_COLOR}
@@ -1698,7 +1703,16 @@ def plot_calibration_panels(fig, result, gas_key, ylabel, datetimes, unit=""):
                        color=TEXT_COLOR, fontsize=9)
     ax_resp.set_title("Cal bottle response, as deviation from assigned value",
                       color=TEXT_COLOR, loc="left", fontsize=10)
-    ax_resp.legend(loc="upper left", fontsize=7, framealpha=0.9)
+    # in_layout=False on every in-axes legend here, and it is not cosmetic:
+    # constrained_layout counts a legend in its Axes' tight bbox even when the
+    # legend is anchored INSIDE, so a legend wider than its panel demands room
+    # the panel cannot give and the layout gives up -- "axes sizes collapsed
+    # to zero", the bottom row squeezed to a few pixels. That went unnoticed
+    # while the residuals panel had the figure's full width; splitting the row
+    # with the 1-sigma panel is what made its two-column legend wider than its
+    # Axes. Same rule as the note blocks: something drawn inside an Axes must
+    # not size it.
+    ax_resp.legend(loc="upper left", fontsize=7, framealpha=0.9).set_in_layout(False)
 
     # --- Panel 2: derived coefficients -----------------------------------
     _shade_flagged(ax_coef, datetimes, extrap)
@@ -1743,7 +1757,105 @@ def plot_calibration_panels(fig, result, gas_key, ylabel, datetimes, unit=""):
                       color=TEXT_COLOR, fontsize=9)
     ax_res.set_title("Residuals: closure (filled) vs leave-one-out (hollow)",
                      color=TEXT_COLOR, loc="left", fontsize=10)
-    ax_res.legend(loc="upper left", fontsize=7, framealpha=0.9, ncol=2)
+    ax_res.legend(loc="upper left", fontsize=7, framealpha=0.9,
+                  ncol=2).set_in_layout(False)
+
+    # --- Panel 4: 1 sigma against mixing ratio -----------------------------
+    # The one thing the three time panels cannot answer: how much of the
+    # reported uncertainty is the cal record, and how much is where the air
+    # sits relative to the two tanks. Between them the nodes constrain each
+    # other and the curve dips BELOW either bottle's own scatter; outside,
+    # one bottle is levered by f (or 1-f) and the same scatter reports much
+    # larger. On a CO2 flight, ambient sits ~40% of a span above the higher
+    # tank and pays a factor of two for it -- a fact with no home on a plot
+    # against time, since it is a property of the concentration, not the
+    # clock.
+    #
+    # The curve is the same expression calibration_uncertainty evaluates per
+    # row, with the median slope standing in for slope(t): the shape is set
+    # by f, and slope moves a couple of percent across a flight where f moves
+    # by ones.
+    _, comp = calibration_uncertainty(result)
+    low, high = result["low_state"], result["high_state"]
+    a_lo = result["bottles"][low]["assigned"]
+    a_hi = result["bottles"][high]["assigned"]
+    s_a = comp.get("assigned_unc", {})
+    s_r = comp.get("response_sigma", {})
+    slope_med = result["slope"].median()
+    if pd.isna(slope_med):
+        slope_med = 1.0
+    span = (a_hi - a_lo) if (a_lo is not None and a_hi is not None) else 0
+
+    def _sigma_at(c):
+        """1 sigma at mixing ratio `c` -- the propagation of
+        calibration_uncertainty with slope held at its median."""
+        if not span:
+            # Offset-only: no gain term, so the answer does not depend on c.
+            return (((s_a.get(low) or 0.0) ** 2
+                     + (s_r.get(low) or 0.0) ** 2) ** 0.5)
+        f = (c - a_lo) / span
+        g = 1.0 - f
+        return ((g * (s_a.get(low) or 0.0)) ** 2
+                + (f * (s_a.get(high) or 0.0)) ** 2
+                + (slope_med * g * (s_r.get(low) or 0.0)) ** 2
+                + (slope_med * f * (s_r.get(high) or 0.0)) ** 2) ** 0.5
+
+    calibrated = result["calibrated"].dropna()
+    # 1st-99th percentile rather than min-max: one spike would stretch the
+    # axis over a range the flight never really occupied, which is the same
+    # framing argument the timeseries makes for the filtered series.
+    amb = ((float(calibrated.quantile(0.01)), float(calibrated.quantile(0.99)))
+           if len(calibrated) else None)
+    x_lo = min([a_lo, a_hi] + ([amb[0]] if amb else []))
+    x_hi = max([a_lo, a_hi] + ([amb[1]] if amb else []))
+    pad = 0.08 * (x_hi - x_lo) or 1.0
+    grid = [x_lo - pad + i * (x_hi - x_lo + 2 * pad) / 200 for i in range(201)]
+
+    if amb:
+        # Where this flight actually measured, so the curve is read at the
+        # place it is being paid at rather than in the abstract.
+        ax_sig.axvspan(amb[0], amb[1], color=LINE_COLOR, alpha=0.10, linewidth=0)
+    for state, assigned in ((low, a_lo), (high, a_hi)):
+        ax_sig.axvline(assigned, color=state_colors.get(state, MUTED_COLOR),
+                       linestyle=":", linewidth=1.1)
+    curve = [_sigma_at(c) for c in grid]
+    ax_sig.plot(grid, curve, color=TEXT_COLOR, linewidth=1.4)
+    if len(calibrated):
+        median_c = float(calibrated.median())
+        median_s = _sigma_at(median_c)
+        # Same blue as the band it sits in: on this panel blue is "where
+        # this flight is", dark is the uncertainty function itself, and the
+        # dotted verticals keep the tank colours they have on panel 1.
+        ax_sig.scatter([median_c], [median_s], color=LINE_COLOR, s=30,
+                       zorder=6, edgecolors="none")
+        # in_layout=False for the reason every note block on these figures
+        # carries it: an unclipped Text is part of the Axes' tight bbox, and
+        # this one is anchored to a point inside the Axes it would be sizing.
+        # Flipped to the marker's left in the right-hand half of the panel,
+        # which is where the median lands whenever ambient is above the tanks
+        # -- i.e. on every CO2 flight so far.
+        right_half = median_c > (grid[0] + grid[-1]) / 2
+        ax_sig.annotate(f"{median_s:.3g}", (median_c, median_s),
+                        textcoords="offset points",
+                        xytext=(-5, 4) if right_half else (5, 4),
+                        ha="right" if right_half else "left",
+                        color=LINE_COLOR, fontsize=8, in_layout=False)
+    # From zero, so the depth of the dip is read against something, with
+    # headroom for the label above the marker.
+    ax_sig.set_ylim(0, max(curve) * 1.15)
+    ax_sig.set_ylabel(f"1σ ({unit})" if unit else "1σ", color=TEXT_COLOR, fontsize=9)
+    ax_sig.set_xlabel(f"{gas_key} ({unit})" if unit else gas_key,
+                      color=MUTED_COLOR, fontsize=9)
+    # Short, and shorter than the other panels' titles: this one is a quarter
+    # of the figure wide, and a left-aligned title wider than its Axes runs
+    # off the figure's right edge (it no longer squeezes the panel -- see the
+    # legends above -- but it is still unreadable). The dotted verticals are
+    # left to the tank colours panel 1's legend already establishes.
+    ax_sig.set_title("1σ vs mixing ratio", color=TEXT_COLOR, loc="left",
+                     fontsize=10)
+    # Four ticks at most: this panel is a quarter of the figure's width, and
+    # a ppm value is five characters wide before it is rotated.
+    ax_sig.locator_params(axis="x", nbins=4)
 
     # --- Header block ------------------------------------------------------
     # Drawn as a figure suptitle rather than inside an Axes: these lines are
@@ -1772,7 +1884,7 @@ def plot_calibration_panels(fig, result, gas_key, ylabel, datetimes, unit=""):
         # keeping the neutral lines neutral.
         fig.texts[-1].set_color(PRESSURE_EXCLUDE_COLOR)
 
-    for ax in (ax_resp, ax_coef, ax_res):
+    for ax in (ax_resp, ax_coef, ax_res, ax_sig):
         ax.set_facecolor("#fcfcfb")
         ax.grid(True, color=GRID_COLOR, linewidth=0.6)
         for spine in ax.spines.values():
@@ -1785,4 +1897,4 @@ def plot_calibration_panels(fig, result, gas_key, ylabel, datetimes, unit=""):
     for label in ax_res.get_xticklabels():
         label.set_rotation(45)
         label.set_horizontalalignment("right")
-    return [ax_resp, ax_coef, ax_res, ax_icept]
+    return [ax_resp, ax_coef, ax_res, ax_icept, ax_sig]
