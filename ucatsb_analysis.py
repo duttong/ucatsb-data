@@ -1606,6 +1606,40 @@ def _shade_flagged(ax, datetimes, mask, color=CAL_SHADE_COLOR):
                    hatch="///", alpha=0.35, linewidth=0)
 
 
+def _wrap_to_figure(fig, text, fontsize, usable=0.98):
+    """Split `text` into lines that fit across `fig`, measured rather than
+    guessed at.
+
+    A fixed character count cannot be right for both a laptop and a large
+    display: 110 characters left the header wrapping a sentence a few words
+    early on a wide window while still overflowing a narrow one. The width of
+    the string is measured with the figure's own renderer instead, so the
+    header always uses the width it actually has. `usable` is the fraction of
+    the figure the header may occupy -- the block is drawn at x=0.01, so it
+    keeps the same margin at the other end.
+
+    Falls back to the old fixed width when there is no renderer to ask (a
+    Figure with no canvas), which is a degraded answer rather than a crash.
+    """
+    import textwrap
+
+    get_renderer = getattr(fig.canvas, "get_renderer", None)
+    if get_renderer is None:
+        return textwrap.wrap(text, width=110)
+    # Measured with a throwaway Text in the same font: matplotlib has no
+    # public "how wide would this string be" that does not go through an
+    # artist, and one probe per warning line is nothing beside the draw.
+    probe = fig.text(0, 0, text, fontsize=fontsize, in_layout=False)
+    width = probe.get_window_extent(get_renderer()).width
+    probe.remove()
+    available = fig.bbox.width * usable
+    if width <= available:
+        return [text]
+    # Proportional font, so characters-per-line is derived from this string's
+    # own average character width rather than from a nominal one.
+    return textwrap.wrap(text, width=max(20, int(len(text) * available / width)))
+
+
 def plot_calibration_panels(fig, result, gas_key, ylabel, datetimes, unit=""):
     """Draw the calibration diagnostics onto `fig`.
 
@@ -1708,8 +1742,9 @@ def plot_calibration_panels(fig, result, gas_key, ylabel, datetimes, unit=""):
     # --- Header block ------------------------------------------------------
     # Drawn as a figure suptitle rather than inside an Axes: these lines are
     # long enough to collide with the traces and legends at any in-axes anchor.
-    import textwrap
-
+    # One font size for both the measuring and the drawing below: wrapping to
+    # a width measured in a different size is wrapping to the wrong width.
+    head_size = 8
     head = [f"{gas_key}  |  mode: {result['mode']}"]
     if result.get("span_gain") is not None:
         head[0] += f"  |  span gain: {result['span_gain']:.4f}"
@@ -1720,10 +1755,10 @@ def plot_calibration_panels(fig, result, gas_key, ylabel, datetimes, unit=""):
         for s, info in sorted(result["bottles"].items())
     ))
     for warning in result["warnings"]:
-        head.extend(textwrap.wrap(warning, width=110))
+        head.extend(_wrap_to_figure(fig, warning, head_size))
     # No explicit y: constrained_layout only reserves room for the suptitle
     # when it positions it itself, and this block runs to several lines.
-    fig.suptitle("\n".join(head), color=MUTED_COLOR, fontsize=8,
+    fig.suptitle("\n".join(head), color=MUTED_COLOR, fontsize=head_size,
                  ha="left", x=0.01, linespacing=1.4)
     if result["warnings"]:
         # Color the whole block as a warning -- matplotlib has no per-line
