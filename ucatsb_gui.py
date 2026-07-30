@@ -66,6 +66,16 @@ from ucatsb_analysis import (
 CALIBRATED_COLOR = "#c0392b"
 STATS_BOX_COLOR = "#111111"
 
+# The "armed" look for the two selector tools (Stats, Flag). A checked
+# QToolButton's stock highlight is a grey barely darker than the toolbar, and
+# these two are modes -- while one is on, a drag on the canvas does something
+# other than nothing, so it has to be obvious at a glance which one is live.
+# Light green fill with a dark green label: the pair keeps the text at ~9:1
+# contrast, where the stock highlight leaves it at the toolbar's own.
+TOOL_ON_BG = "#c8e6c9"
+TOOL_ON_BG_HOVER = "#b2dfb4"
+TOOL_ON_FG = "#1b5e20"
+
 # `short`, `standard_name` and `long_name` exist for the exports: the ICARTT
 # variable name is `<short>_<suffix>` (so Ozone is delivered as O3, the name
 # every archive uses), `standard_name` is the controlled-vocabulary field the
@@ -581,6 +591,11 @@ class PlotPane(QWidget):
         self.flag_action.toggled.connect(self._on_flag_toggled)
         self.toolbar.addAction(self.flag_action)
 
+        # After addAction, not before: widgetForAction only has a button to
+        # return once the action is on the toolbar.
+        for action in (self.stats_action, self.flag_action):
+            self._style_toggle(action)
+
         # A view toggle, not a setting: it overlays this repo's calibrated
         # series on the figure and changes nothing else, so it belongs beside
         # the other things that decide what the figure shows rather than in the
@@ -644,6 +659,29 @@ class PlotPane(QWidget):
         # flag is an action, not a standing selection.
         self._box = None
         self._loading_traces = False
+
+    def _style_toggle(self, action):
+        """Give a checkable toolbar action a green ON state.
+
+        Styled per button rather than through one `QToolBar QToolButton` rule
+        on the toolbar: a stylesheet makes Qt draw the widget itself instead of
+        asking the platform style, and a toolbar-wide rule would take the
+        native look off the stock nav buttons (home/pan/zoom/save) as well --
+        for a colour change these two never asked for.
+
+        Only `:checked` is given a background, so the off state stays whatever
+        the platform draws. The padding is set in the base rule rather than
+        inside `:checked`, or the button would resize as it is toggled.
+        """
+        button = self.toolbar.widgetForAction(action)
+        if button is None:
+            return
+        button.setStyleSheet(
+            f"QToolButton {{ padding: 3px 8px; border-radius: 4px; }}"
+            f"QToolButton:checked {{ background-color: {TOOL_ON_BG};"
+            f" color: {TOOL_ON_FG}; }}"
+            f"QToolButton:checked:hover {{ background-color: {TOOL_ON_BG_HOVER}; }}"
+        )
 
     def reset_nav(self):
         """Point the toolbar's Home at the newly-built full-scale view; its
