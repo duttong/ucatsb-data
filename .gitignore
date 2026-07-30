@@ -18,3 +18,8 @@ __pycache__/
 # Written beside each loaded CSV by the viewer: per-flight analysis settings
 # travel with the flight, not with the repository.
 *_conf.yaml
+
+# Claude Code's per-machine settings: a Bash permission allowlist that suits
+# one person's workflow, not a property of the project. Committing it would
+# grant those permissions to everyone who clones.
+.claude/
