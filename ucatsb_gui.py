@@ -39,7 +39,8 @@ from ucatsb_analysis import (
     drop_presync_rows, find_intervals, merge_close_intervals,
     shade_intervals, bottle_for_interval, match_cal_serial, cal_mean_points,
     load_cal_roster, load_cal_assignment, select_cal_bottles,
-    most_common_serial, mean_std_label, calibrate_series, post_cal_flush_mask,
+    most_common_serial, mean_std_label, calibrate_series, interp_hold,
+    post_cal_flush_mask,
     cal_switch_mask, below_floor_mask, smooth_pressure, pt_correction_factor,
     O3_VALID_MIN_PPB, H2O_VALID_MIN_PPM,
     box_stats, calibration_uncertainty, linear_fit,
@@ -47,7 +48,8 @@ from ucatsb_analysis import (
     export_companion_csv, export_icartt, icartt_filename, icartt_time_base,
     DEFAULT_ICARTT_META,
     CALS_YAML_PATH, CAL_DRIFT_MODELS, CAL_DEFAULT_SMOOTH_EVENTS,
-    CAL_MERGE_GAP_S, D1_P_TARGET_MBARS, T_GAS_TARGET_K, KELVIN_OFFSET,
+    CAL_MERGE_GAP_S, D1_P_TARGET_MBARS, T_GAS_TARGET_K, T_GAS_REFERENCE_C,
+    T_GAS_REFERENCE_K, KELVIN_OFFSET,
     merge_ranges, add_ranges, subtract_ranges, ranges_to_mask, ranges_row_count,
     # The shared palette. These used to be declared a second time here, with
     # identical values -- two homes for one decision, agreeing only by
@@ -1021,6 +1023,7 @@ class UcatsbGui(QMainWindow):
         self.corr_hide_flagged = False
         self.corr_marker_size = 4
         self.corr_error_bars = False
+        self.corr_show_cals = False
         # None = single-color points; otherwise a key into CORR_COLOR_BY.
         self.corr_color_by = None
         # Off by default: a straight line through a tracer-tracer plot with
@@ -1360,6 +1363,15 @@ class UcatsbGui(QMainWindow):
         self.corr_error_check.toggled.connect(self.on_corr_style_changed)
         style_form.addRow(self.corr_error_check)
 
+        self.corr_cals_check = QCheckBox("Display cals")
+        self.corr_cals_check.setToolTip(
+            "Diagnostic overlay only. Draw paired cal-mean points on the\n"
+            "correlation figure without adding them to the fit, flagging,\n"
+            "tooltip search, or exported air data."
+        )
+        self.corr_cals_check.toggled.connect(self.on_corr_cals_changed)
+        style_form.addRow(self.corr_cals_check)
+
         self.corr_fit_check = QCheckBox("Linear fit (OLS)")
         self.corr_fit_check.setChecked(self.corr_fit)
         self.corr_fit_check.setToolTip(
@@ -1464,10 +1476,10 @@ class UcatsbGui(QMainWindow):
             self.on_corr_cal_target_changed)
         corr_cal_form.addRow("Tracer:", self.corr_cal_target)
 
-        self.corr_pressure_correct_check = QCheckBox(f"{D1_P_TARGET_MBARS:.0f}/P")
+        self.corr_pressure_correct_check = QCheckBox("Pdelt")
         self.corr_pressure_correct_check.setToolTip(self.pressure_correct_check.toolTip())
         self.corr_pressure_correct_check.toggled.connect(self.on_corr_cal_control_changed)
-        self.corr_temperature_correct_check = QCheckBox(f"T/{T_GAS_TARGET_K:.0f}")
+        self.corr_temperature_correct_check = QCheckBox("Tdelt")
         self.corr_temperature_correct_check.setToolTip(
             self.temperature_correct_check.toolTip())
         self.corr_temperature_correct_check.toggled.connect(
@@ -1946,16 +1958,15 @@ class UcatsbGui(QMainWindow):
 
         # Both corrections sit on a "Correct:" row of their own (2026-07-31).
         # 140/P used to share the tolerance's row, which was right while it was
-        # the only one -- it shares that row's input. With T/315 beside it the
+        # the only one -- it shares that row's input. With T-40 beside it the
         # pair belongs together more than either belongs to the tolerance, and
         # the arithmetic settles it anyway: tolerance + unit + two checkboxes
         # asks ~330 px against the ~300 the group box has, and a row too wide
         # for the panel clips its own right-hand edge in silence.
         #
-        # Labelled with the arithmetic rather than a word: it says exactly what
-        # each box does to the number, and both fit. Every candidate label was
-        # measured against the panel -- "×140/P" pushed the box past 312.
-        self.pressure_correct_check = QCheckBox(f"{D1_P_TARGET_MBARS:.0f}/P")
+        # Short labels keep both correction checkboxes inside the fixed-width
+        # panel; the tooltips carry the arithmetic.
+        self.pressure_correct_check = QCheckBox("Pdelt")
         self.pressure_correct_check.setToolTip(
             f"Scale the MEASUREMENT by {D1_P_TARGET_MBARS:.0f}/P before "
             f"calibrating it, normalising every\nreading to the detector's "
@@ -2033,21 +2044,15 @@ class UcatsbGui(QMainWindow):
         # the whole Jul 2026 flight where the pressure carries 0.16 mbar of
         # sample-to-sample noise. There is nothing to filter out, so there is
         # no "Smooth T" beside it.
-        self.temperature_correct_check = QCheckBox(f"T/{T_GAS_TARGET_K:.0f}")
+        self.temperature_correct_check = QCheckBox("Tdelt")
         self.temperature_correct_check.setToolTip(
-            f"Scale the MEASUREMENT by T/{T_GAS_TARGET_K:.0f} before "
-            f"calibrating it, normalising every\nreading to the cell's "
-            f"{T_GAS_TARGET_K:.0f} K spec temperature. T is that gas's own "
-            f"detector cell\ntemperature (d1_T_gas for CO2/N2O, d2_T_gas for "
-            f"CH4).\n\n"
-            f"Note the ratio is the other way up from 140/P -- it divides by "
-            f"the TARGET,\nnot by the reading. Number density goes as P/T, so "
-            f"a cell running hot holds\nless gas and the measurement is scaled "
-            f"up, where a cell running at high\npressure holds more and is "
-            f"scaled down.\n\n"
-            f"The arithmetic is in KELVIN: the column is degrees C, so "
-            f"273.15 is added\nfirst. A row with no reading gets no "
-            f"value, like 140/P.\n\n"
+            f"Scale the MEASUREMENT by 1 + (T_K - {T_GAS_REFERENCE_K:.2f})/"
+            f"{T_GAS_TARGET_K:.0f}\nbefore calibrating it. T is that gas's own "
+            f"detector cell temperature\n(d1_T_gas for CO2/N2O, d2_T_gas for "
+            f"CH4), in degrees C.\n\n"
+            f"Number density goes as P/T, so a cell running hotter than "
+            f"{T_GAS_REFERENCE_C:.0f} C ({T_GAS_REFERENCE_K:.2f} K)\nholds less gas and the measurement "
+            f"is scaled up. A row with no reading\ngets no value, like 140/P.\n\n"
             f"Like 140/P it is applied to the whole flight before the "
             f"calibration, so it\nmoves the cal means and the calibration with "
             f"them. The two multiply when\nboth are on, and reach the "
@@ -3779,7 +3784,7 @@ class UcatsbGui(QMainWindow):
         return [
             head,
             f"  P: raw {p_raw}; used {p_corr}",
-            f"  T: raw {t_raw}; target {t_corr}",
+            f"  T: raw {t_raw}; ref {t_corr}",
             f"  factor: {self._fmt_value(factor_value)}",
         ]
 
@@ -3808,7 +3813,7 @@ class UcatsbGui(QMainWindow):
         raw_k = raw_c + 273.15 if not pd.isna(raw_c) else float("nan")
         raw_text = f"{self._fmt_value(raw_c)} C ({self._fmt_value(raw_k)} K)"
         if analysis["temperature_corrected"]:
-            return raw_text, f"{T_GAS_TARGET_K:.0f} K"
+            return raw_text, f"{T_GAS_REFERENCE_C:.0f} C"
         return raw_text, "off"
 
     @staticmethod
@@ -3918,8 +3923,15 @@ class UcatsbGui(QMainWindow):
             return
         self.corr_marker_size = self.corr_size_spin.value()
         self.corr_error_bars = self.corr_error_check.isChecked()
+        self.corr_show_cals = self.corr_cals_check.isChecked()
         self.corr_fit = self.corr_fit_check.isChecked()
         self._refresh_corr(preserve_view=True)
+
+    def on_corr_cals_changed(self):
+        if self._loading or self._initializing:
+            return
+        self.corr_show_cals = self.corr_cals_check.isChecked()
+        self._refresh_corr(preserve_view=False)
 
     def _refresh_corr(self, preserve_view=True):
         """Redraw the correlation pane only.
@@ -4234,8 +4246,8 @@ class UcatsbGui(QMainWindow):
             temperature_c = pd.to_numeric(df[temperature_col], errors="coerce")
             diagnostics["temperature_raw_C"] = self._to_raw_rows(temperature_c)
             if analysis.get("temperature_corrected"):
-                diagnostics["temperature_for_correction_K"] = self._to_raw_rows(
-                    temperature_c + KELVIN_OFFSET)
+                diagnostics["temperature_delta_from_40_C"] = self._to_raw_rows(
+                    temperature_c - T_GAS_REFERENCE_C)
 
         masks = {
             "is_cal_mean_window": self._to_raw_rows(used),
@@ -4356,7 +4368,7 @@ class UcatsbGui(QMainWindow):
                         f"P to {D1_P_TARGET_MBARS:.0f} mbar"
                         + (f" [{smooth_s} s mean]" if smooth_s else ""))
                 if block.get("temperature_corrected"):
-                    corrections.append(f"T to {T_GAS_TARGET_K:.0f} K")
+                    corrections.append(f"T from {T_GAS_REFERENCE_C:.0f} C")
                 lines.append(f"{gas:<6} calibrated      {n:>7,} good ambient rows"
                              + (f"   (normalised before calibrating: "
                                 f"{', '.join(corrections)})"
@@ -4717,7 +4729,7 @@ class UcatsbGui(QMainWindow):
 
         # The temperature correction's column, or None when it is off. Not
         # smoothed: the cell temperature is already smooth (see the checkbox's
-        # tooltip), so the raw column is what T/315 is taken from.
+        # tooltip), so the raw column is what the T-40 correction is taken from.
         temperature_col = (self._temperature_column(gas_key)
                            if settings.get("temperature_correct", False)
                            else None)
@@ -5137,15 +5149,15 @@ class UcatsbGui(QMainWindow):
                            if smooth_s else
                            f" [raw air, {analysis['pressure_aircal_smooth_s']} s aircal]"))
                 if analysis["temperature_corrected"]:
-                    scaled_to.append(f"{T_GAS_TARGET_K:.0f} K")
+                    scaled_to.append(f"T from {T_GAS_REFERENCE_C:.0f} C")
                     terms.append(
-                        f"{analysis['temperature_col']}(K)/{T_GAS_TARGET_K:.0f}")
+                        f"1+({analysis['temperature_col']}(K)-{T_GAS_REFERENCE_K:.2f})/"
+                        f"{T_GAS_TARGET_K:.0f}")
                 # "measurement ... before calibrating", not "calibrated values
                 # scaled": since 2026-07-31 the correction lands on the input,
                 # so it moves the cal means and the calibration with them. The
-                # cal-mean dots on this figure are the corrected values, drawn
-                # over the raw trace -- said out loud, because they no longer
-                # sit exactly on it.
+                # The filled cal-mean dots stay on the raw scale; the open red
+                # dots show the same cal means after calibration.
                 #
                 # TWO lines: with both corrections and a smoothing window this
                 # runs to ~150 characters, and a note wider than the Axes runs
@@ -5157,7 +5169,7 @@ class UcatsbGui(QMainWindow):
                 )
                 notes.append(
                     f"  ×{' ×'.join(terms)}; cal means shown are the "
-                    f"corrected ones"
+                    f"raw-window means"
                 )
         # Outside the has_masking gate on purpose: Ozone has no masking
         # settings at all, and this is the one thing removing data from its
@@ -5448,15 +5460,14 @@ class UcatsbGui(QMainWindow):
         return col if col in self.df.columns else None
 
     def _temperature_column(self, gas_key):
-        """The detector cell temperature column this gas's T/315 correction is
+        """The detector cell temperature column this gas's T-40 correction is
         taken from, or None when the gas has no detector or the file has no
         such column. Per gas for the same reason as _pressure_column: CH4 comes
         off the second Aeris head, and its cell runs at a different temperature
         (40.8 C against d1's 42.3 C on the Jul 2026 flight).
 
-        The column is in degrees CELSIUS; the correction is in kelvin. That
-        conversion lives in calibrate_series, so this returns the column name
-        and nothing else.
+        The column is in degrees CELSIUS. The correction uses its delta from
+        40 C, so this returns the column name and nothing else.
         """
         detector = GASES[gas_key].get("detector")
         if detector is None or self.df is None:
@@ -5617,6 +5628,61 @@ class UcatsbGui(QMainWindow):
                         100.0 * median / assigned if assigned else None))
         return out
 
+    def _corr_cal_mean_points_for_gas(self, gas_key):
+        """Cal means on the axis scale used by the correlation figure.
+
+        These are display-only diagnostics. They are not part of the ambient
+        data pairing, fit, flagging, tooltip search, or export.
+        """
+        if not GASES[gas_key].get("has_masking", True):
+            return []
+        analysis = self._analysis_for(gas_key)
+        result = self._calibration_for(gas_key) or {}
+        if analysis is None or not result.get("ok"):
+            return []
+        points = []
+        for t, value, state, serial in analysis["cal_points"]:
+            slope = interp_hold(
+                self.df["datetime"], result["slope"], pd.Series([t])).iloc[0]
+            intercept = interp_hold(
+                self.df["datetime"], result["intercept"], pd.Series([t])).iloc[0]
+            if pd.isna(slope) or pd.isna(intercept) or pd.isna(value):
+                continue
+            points.append({
+                "time": pd.Timestamp(t),
+                "state": state,
+                "serial": serial,
+                "value": float(slope * value + intercept),
+            })
+        return points
+
+    def _corr_cal_mean_pairs(self, x_gas, y_gas):
+        """Paired cal means for the correlation diagnostic overlay."""
+        x_pts = self._corr_cal_mean_points_for_gas(x_gas)
+        if not x_pts:
+            return []
+        if x_gas == y_gas:
+            return [(p["value"], p["value"]) for p in x_pts]
+
+        y_pts = self._corr_cal_mean_points_for_gas(y_gas)
+        if not y_pts:
+            return []
+        used = set()
+        pairs = []
+        tolerance = pd.Timedelta(seconds=5)
+        for xp in x_pts:
+            best_i, best_dt = None, None
+            for i, yp in enumerate(y_pts):
+                if i in used or yp["state"] != xp["state"]:
+                    continue
+                dt = abs(yp["time"] - xp["time"])
+                if best_dt is None or dt < best_dt:
+                    best_i, best_dt = i, dt
+            if best_i is not None and best_dt <= tolerance:
+                used.add(best_i)
+                pairs.append((xp["value"], y_pts[best_i]["value"]))
+        return pairs
+
     def redraw_corr(self, preserve_view=False):
         """Draw the Correlations tab: one tracer against another.
 
@@ -5749,6 +5815,15 @@ class UcatsbGui(QMainWindow):
             ax.plot(xs, [fit["slope"] * v + fit["intercept"] for v in xs],
                     color=CALIBRATED_COLOR, linewidth=1.4, zorder=3)
 
+        cal_overlay_n = 0
+        if self.corr_show_cals:
+            cal_pairs = self._corr_cal_mean_pairs(x_gas, y_gas)
+            cal_overlay_n = len(cal_pairs)
+            if cal_pairs:
+                cal_x, cal_y = zip(*cal_pairs)
+                ax.scatter(cal_x, cal_y, s=6 ** 2, color=CALIBRATED_COLOR,
+                           edgecolors="none", zorder=5)
+
         # The qualifier rides on each axis label rather than only in the
         # title: with one calibrated axis and one raw one, a single title word
         # would have to lie about one of them.
@@ -5796,7 +5871,7 @@ class UcatsbGui(QMainWindow):
         # other note here that assumes a calibration exists.
         for key, target, what in (
                 ("pressure_corrected", f"{D1_P_TARGET_MBARS:.0f} mbar", "pressure"),
-                ("temperature_corrected", f"{T_GAS_TARGET_K:.0f} K", "temperature")):
+                ("temperature_corrected", f"T from {T_GAS_REFERENCE_C:.0f} C", "temperature")):
             corrected = [gas for gas in dict.fromkeys((x_gas, y_gas))
                          if GASES[gas].get("has_masking", True)
                          and self._analysis_for(gas)[key]]
@@ -5809,6 +5884,9 @@ class UcatsbGui(QMainWindow):
         if fit:
             notes.append(f"red line: OLS  {y_gas} = {fit['slope']:.4g}(±{fit['slope_err']:.2g})"
                          f"·{x_gas} {fit['intercept']:+.4g}    r = {fit['r']:.4f}")
+        if self.corr_show_cals:
+            notes.append(f"dark red dots = {cal_overlay_n} paired cal means "
+                         f"(diagnostic only)")
         if len(x) and extrapolated.any():
             notes.append(f"{extrapolated.mean():.0%} of points fall where at least one "
                          f"calibration is extrapolated")

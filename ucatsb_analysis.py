@@ -44,19 +44,18 @@ MUTED_COLOR = "#52514e"
 # which had fixed values here only to serve the removed CO2 CLI.
 D1_P_TARGET_MBARS = 140.0
 
-# The detector's spec cell temperature, for the T/315 companion to the 140/P
-# correction. Note the correction divides BY this, where the pressure one
-# divides by the reading: number density goes as P/T, so a cell running hot
-# holds less gas and the measurement needs scaling UP, not down. The two
-# corrections are deliberately not mirror images.
+# Temperature correction is expressed as a delta from a 40 C reference
+# temperature, carried as kelvin in the ratio:
 #
-# In KELVIN, and that is the whole trap: `d1_T_gas`/`d2_T_gas` are in DEGREES
-# CELSIUS (d1 runs ~42.3 C, d2 ~40.8 C on the Jul 2026 flight, i.e. 315.5 K and
-# 314.0 K), so every use has to add KELVIN_OFFSET first. A ratio of Celsius
-# numbers is not a ratio of temperatures -- it would read 42.3/315 = 0.134
-# rather than 1.001 -- which is why the constant is named for its unit.
-T_GAS_TARGET_K = 315.0
+#     1 + (T_K - 313.15 K) / 315 K
+#
+# The 315 K denominator keeps the correction on the detector-cell temperature
+# scale, but the offset is the observed change from the 40 C reference, not an
+# absolute T/315 ratio. The input column is in C, and delta C == delta K.
+T_GAS_REFERENCE_C = 40.0
 KELVIN_OFFSET = 273.15
+T_GAS_REFERENCE_K = T_GAS_REFERENCE_C + KELVIN_OFFSET
+T_GAS_TARGET_K = 315.0
 
 CAL_MERGE_GAP_S = 2   # bridge cal periods split by a single dropped-flag sample
 CALS_YAML_PATH = Path(__file__).parent / "cals.yaml"
@@ -400,11 +399,12 @@ def smooth_pressure(datetimes, pressure, window_s):
 
 
 def pt_correction_factor(pressure=None, pressure_target=D1_P_TARGET_MBARS,
-                         temperature_c=None, temperature_target_k=T_GAS_TARGET_K):
+                         temperature_c=None, temperature_target_k=T_GAS_TARGET_K,
+                         temperature_reference_k=T_GAS_REFERENCE_K):
     """The combined cell-condition multiplier, or None when neither correction
     is asked for.
 
-        140/P  * T/315        (P in mbar, T in KELVIN)
+        140/P  * (1 + (T_K - 313.15)/315)        (P in mbar, T in K)
 
     **This is applied to the MEASUREMENT, before anything else** (2026-07-31).
     The corrected series is what `cal_mean_points` averages and what
@@ -423,15 +423,13 @@ def pt_correction_factor(pressure=None, pressure_target=D1_P_TARGET_MBARS,
 
     Two directions, not one, and the asymmetry is physics rather than a typo:
     number density goes as P/T, so a cell holding gas at high pressure reads
-    high and is scaled DOWN by 140/P, while a cell running hot holds less and is
-    scaled UP by T/315.
+    high and is scaled DOWN by 140/P, while a cell running hotter than the
+    40 C reference holds less and is scaled UP.
 
     `temperature_c` is in DEGREES CELSIUS -- the unit `d1_T_gas`/`d2_T_gas` are
-    recorded in -- and KELVIN_OFFSET is added here. The `> 0` guard is on the
-    kelvin value, since 0 C is a real temperature; on the pressure it is on the
-    reading itself. A row failing either guard, or missing, gets NaN, which is
-    how it ends up blanked from the calibrated record rather than silently
-    uncorrected.
+    recorded in -- and is converted to kelvin here before the delta is taken.
+    A row with missing pressure or temperature gets NaN, which is how it ends
+    up blanked from the calibrated record rather than silently uncorrected.
     """
     factor = None
     if pressure is not None:
@@ -439,7 +437,7 @@ def pt_correction_factor(pressure=None, pressure_target=D1_P_TARGET_MBARS,
         factor = pressure_target / p.where(p > 0)
     if temperature_c is not None:
         t_k = pd.to_numeric(temperature_c, errors="coerce") + KELVIN_OFFSET
-        t_factor = t_k.where(t_k > 0) / temperature_target_k
+        t_factor = 1.0 + (t_k - temperature_reference_k) / temperature_target_k
         factor = t_factor if factor is None else factor * t_factor
     return factor
 
@@ -1632,21 +1630,24 @@ def companion_notes(gas_blocks, source_path=None, presync_rows=0):
                     targets.append(f"{D1_P_TARGET_MBARS:.0f} mbar")
                 if block.get("temperature_corrected"):
                     terms.append(
-                        f"({block.get('temperature_col', 'T_gas')} + "
-                        f"{KELVIN_OFFSET})/{T_GAS_TARGET_K:.0f}")
-                    targets.append(f"{T_GAS_TARGET_K:.0f} K")
+                        f"1 + ({block.get('temperature_col', 'T_gas')}(K) - "
+                        f"{T_GAS_REFERENCE_K:.2f})/{T_GAS_TARGET_K:.0f}")
+                    targets.append(
+                        f"T from {T_GAS_REFERENCE_C:.0f} C "
+                        f"({T_GAS_REFERENCE_K:.2f} K)")
                 notes.append(
                     f"{gas}: the measurement was normalised to the detector "
-                    f"cell's spec conditions ({' and '.join(targets)}) BEFORE "
+                    f"cell conditions ({' and '.join(targets)}) BEFORE "
                     f"the calibration, by multiplying {block['value_col']} by "
                     f"{gas}_pt_factor = {' * '.join(terms)}. The cal-bottle "
                     f"means, the drift model and slope/intercept are therefore "
-                    f"all on that corrected scale. Note the two ratios are the "
-                    f"other way up from each other: number density goes as P/T, "
+                    f"all on that corrected scale. Pressure uses the exact "
+                    f"ratio to {D1_P_TARGET_MBARS:.0f} mbar; temperature uses "
+                    f"the kelvin delta from {T_GAS_REFERENCE_C:.0f} C over a "
+                    f"{T_GAS_TARGET_K:.0f} K scale. Number density goes as P/T, "
                     f"so a cell holding gas at high pressure reads high and is "
                     f"scaled down, while a cell running hot holds less and is "
-                    f"scaled up. The temperature column is degrees C and the "
-                    f"correction is in kelvin, hence the {KELVIN_OFFSET}.")
+                    f"scaled up.")
             if block.get("diagnostics"):
                 notes.append(
                     f"{gas}: audit columns show how the calibration was made. "
