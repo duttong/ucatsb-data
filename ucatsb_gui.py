@@ -5666,24 +5666,6 @@ class UcatsbGui(QMainWindow):
             if raw_axes:
                 note += f"; none on {', '.join(raw_axes)}"
             notes.append(note)
-        # The size of that uncertainty, in the gas's own units, on the figure
-        # rather than only in the numbers panel: at flight scale the bars
-        # overlap into a band whose width cannot be read off the axes, and
-        # this is the figure that gets saved and shown to someone else.
-        # Independent of the error-bar toggle -- it is a property of the
-        # calibration, not of whether the bars are drawn.
-        sigmas = self._median_sigmas((x_gas, x_unit), (y_gas, y_unit))
-        if sigmas:
-            # The "% of" is spelled out once at the end rather than after
-            # each gas: with two tracers the qualifier is longer than the
-            # numbers it qualifies.
-            notes.append(
-                "median 1σ from the calibration: "
-                + ",  ".join(f"{gas} ±{value:.3g} {unit}"
-                             + (f" ({pct:.2g}%)" if pct else "")
-                             for gas, value, unit, pct in sigmas)
-                + ("    (% of that gas's high cal tank)"
-                   if any(pct for *_, pct in sigmas) else ""))
         # in_layout=False, and it has to be: a Text is unclipped by default, so
         # constrained_layout counts it in the Axes' tight bbox and reserves
         # room for the part that hangs off the right-hand edge. But the note is
