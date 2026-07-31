@@ -1696,8 +1696,8 @@ def export_companion_csv(path, datetimes, gas_blocks, source_path=None,
     block must already be aligned to the raw file row numbers. The GUI does
     that with `_to_raw_rows` before calling this writer.
 
-    When `comment_header` is off, the notes go to `<stem>_notes.txt` instead
-    of the top of the CSV. That keeps the CSV friendly to Excel and Igor.
+    When `comment_header` is off, the notes are omitted. That keeps the CSV
+    friendly to Excel and Igor without creating a second file.
     """
     columns = {"datetime": pd.Series(list(datetimes))}
     if time_seconds is not None:
@@ -1745,11 +1745,7 @@ def export_companion_csv(path, datetimes, gas_blocks, source_path=None,
         if comment_header:
             fh.write("".join(f"# {line}\n" for line in notes))
         out.to_csv(fh, index=False)
-    sidecar = None
-    if not comment_header:
-        sidecar = path.with_name(f"{path.stem}_notes.txt")
-        sidecar.write_text("\n".join(notes) + "\n")
-    return {"path": path, "notes_path": sidecar, "rows": len(out),
+    return {"path": path, "rows": len(out),
             "columns": list(out.columns)}
 
 

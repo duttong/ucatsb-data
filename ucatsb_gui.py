@@ -2726,8 +2726,7 @@ class UcatsbGui(QMainWindow):
         self.csv_comment_check.setChecked(False)
         self.csv_comment_check.setToolTip(
             "Off by default: neither Excel nor Igor skips a leading comment "
-            "block without being told to.\nWith it off the notes are written "
-            "to a <name>_notes.txt beside the CSV instead.")
+            "block without being told to.\nWith it off, no notes are written.")
         for widget in (self.csv_raw_check, self.csv_masks_check,
                        self.csv_unc_check, self.csv_coeff_check,
                        self.csv_comment_check):
@@ -4431,10 +4430,6 @@ class UcatsbGui(QMainWindow):
             return
         message = (f"Wrote {summary['path'].name}\n\n"
                    f"{summary['rows']:,} rows × {len(summary['columns'])} columns.")
-        if summary["notes_path"]:
-            message += (f"\n\nThe provenance and column notes went to "
-                        f"{summary['notes_path'].name} rather than into the CSV, "
-                        f"so it opens cleanly in Excel and Igor.")
         QMessageBox.information(self, "Export CSV", message)
 
     def on_export_icartt_clicked(self):
