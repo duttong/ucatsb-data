@@ -28,7 +28,7 @@ from PyQt5.QtWidgets import (
     QButtonGroup, QRadioButton, QPushButton, QFileDialog, QMessageBox,
     QTabWidget, QCheckBox, QAction, QStackedWidget, QMenu, QFrame, QStyle,
     QDialog, QDialogButtonBox, QLineEdit, QPlainTextEdit, QScrollArea,
-    QListWidget, QListWidgetItem,
+    QListWidget, QListWidgetItem, QToolButton,
 )
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg, NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
@@ -1526,6 +1526,17 @@ class UcatsbGui(QMainWindow):
             self.on_corr_cal_control_changed)
         self.corr_fixed_slope_spin.setVisible(False)
         corr_drift_row.addWidget(self.corr_fixed_slope_spin)
+        self.corr_fixed_slope_reset_button = QToolButton()
+        self.corr_fixed_slope_reset_button.setText("R")
+        self.corr_fixed_slope_reset_button.setFixedSize(28, 22)
+        self.corr_fixed_slope_reset_button.setStyleSheet(
+            "QToolButton { padding: 0; color: #222222; }")
+        self.corr_fixed_slope_reset_button.setToolTip(
+            "Reset fixed slope to the constant-model value")
+        self.corr_fixed_slope_reset_button.clicked.connect(
+            self.on_corr_fixed_slope_reset)
+        self.corr_fixed_slope_reset_button.setVisible(False)
+        corr_drift_row.addWidget(self.corr_fixed_slope_reset_button)
         corr_cal_form.addRow(corr_drift_row)
 
         vbox.addWidget(self.corr_cal_box)
@@ -2226,6 +2237,16 @@ class UcatsbGui(QMainWindow):
         self.fixed_slope_spin.setMaximumWidth(88)
         self.fixed_slope_spin.setVisible(False)
         drift_row.addWidget(self.fixed_slope_spin)
+        self.fixed_slope_reset_button = QToolButton()
+        self.fixed_slope_reset_button.setText("R")
+        self.fixed_slope_reset_button.setFixedSize(28, 22)
+        self.fixed_slope_reset_button.setStyleSheet(
+            "QToolButton { padding: 0; color: #222222; }")
+        self.fixed_slope_reset_button.setToolTip(
+            "Reset fixed slope to the constant-model value")
+        self.fixed_slope_reset_button.clicked.connect(self.on_fixed_slope_reset)
+        self.fixed_slope_reset_button.setVisible(False)
+        drift_row.addWidget(self.fixed_slope_reset_button)
         cal_grid.addLayout(drift_row, 3, 0, 1, 3)
 
         # "Show calibrated" is NOT here any more -- it is a checkable action on
@@ -2914,6 +2935,8 @@ class UcatsbGui(QMainWindow):
         """
         pinned = model == "fixed slope"
         self.fixed_slope_spin.setVisible(pinned)
+        self.fixed_slope_reset_button.setVisible(pinned)
+        self.fixed_slope_reset_button.setEnabled(pinned)
         self.smooth_spin.setVisible(not pinned)
         self.smooth_spin.setEnabled(model == "smooth")
 
@@ -3021,10 +3044,23 @@ class UcatsbGui(QMainWindow):
         result = self._calibration_for(gas_key) or {}
         span_gain = result.get("span_gain") if result.get("ok") else None
         if not span_gain:
-            return
+            return False
         spin.blockSignals(True)
         spin.setValue(1.0 / span_gain)
         spin.blockSignals(False)
+        return True
+
+    def on_fixed_slope_reset(self):
+        if self._loading or self._initializing or self.current_gas is None:
+            return
+        if self._seed_fixed_slope():
+            settings = self._controls_to_settings()
+            self.config[self.current_gas] = settings
+            self.fixed_slope = settings["fixed_slope"]
+            if hasattr(self, "corr_cal_target") and self._corr_cal_gas() == self.current_gas:
+                self._sync_corr_cal_controls()
+            self._mark_dirty()
+            self.refresh(preserve_view=True)
 
     def _current_state(self):
         """Everything a config file holds, as comparable plain data."""
@@ -3428,7 +3464,8 @@ class UcatsbGui(QMainWindow):
                     self.corr_temperature_correct_check,
                     self.corr_drift_combo,
                     self.corr_smooth_spin,
-                    self.corr_fixed_slope_spin):
+                    self.corr_fixed_slope_spin,
+                    self.corr_fixed_slope_reset_button):
                 widget.setEnabled(False)
             return
         settings = self.config.get(gas, DEFAULT_GAS_SETTINGS)
@@ -3459,8 +3496,26 @@ class UcatsbGui(QMainWindow):
         pinned = model == "fixed slope"
         self.corr_fixed_slope_spin.setVisible(pinned)
         self.corr_fixed_slope_spin.setEnabled(pinned)
+        self.corr_fixed_slope_reset_button.setVisible(pinned)
+        self.corr_fixed_slope_reset_button.setEnabled(pinned)
         self.corr_smooth_spin.setVisible(not pinned)
         self.corr_smooth_spin.setEnabled(model == "smooth")
+
+    def on_corr_fixed_slope_reset(self):
+        if self._loading or self._initializing:
+            return
+        gas = self._corr_cal_gas()
+        if not gas or not GASES[gas].get("has_masking", True):
+            return
+        if not self._seed_fixed_slope(gas_key=gas, spin=self.corr_fixed_slope_spin):
+            return
+        settings = copy.deepcopy(self.config[gas])
+        settings["fixed_slope"] = self.corr_fixed_slope_spin.value()
+        self.config[gas] = settings
+        if gas == self.current_gas:
+            self._apply_settings_to_controls(settings)
+        self._mark_dirty()
+        self.refresh(preserve_view=True)
 
     def on_corr_cal_control_changed(self):
         if self._loading or self._initializing:
