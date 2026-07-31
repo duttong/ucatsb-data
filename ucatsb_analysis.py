@@ -742,11 +742,8 @@ def drift_nodes(times, values, model="linear", window=CAL_DEFAULT_SMOOTH_EVENTS)
                     so all three models flow through one evaluation path.
 
     "fixed slope" is a fourth entry in CAL_DRIFT_MODELS but says nothing about
-    the nodes -- it pins the calibration's gain and lets the intercept follow
-    the cals (see calibrate_series), and its nodes are the "linear" ones. It
-    lands on the fall-through below rather than in a branch of its own, which
-    is stated here because a silent fall-through is how a real model gets
-    mis-handled later.
+    smoothing the bottle responses. It uses the individual cal means directly
+    as intercept anchors, so its nodes are the "linear" ones.
     """
     times, values = list(times), list(values)
     if not times:
@@ -991,15 +988,10 @@ def calibrate_series(df, value_col, cal_points, cal_bottles, gas_key,
     its slope is `(A_hi - A_lo) / (mean_hi - mean_lo)` and never varies. The
     effective value is returned as `fixed_slope` so a caller can show it.
 
-    With two bottles the intercept cannot satisfy both at once unless the fixed
-    slope happens to equal the tanks' own span, so it takes the MEAN of the two
-    solutions -- `mean_b(A_b - S*R_b(t))` -- splitting the disagreement rather
-    than honouring one tank and letting the other drift off. The leftover shows
-    up honestly as a non-zero closure residual of +-half the mismatch, which
-    under `linear` would be a bug signal and here is the model working: the
-    residuals panel is where you see what the chosen slope costs. It also feeds
-    the reported 1 sigma through `response_sigma`'s closure term, which is what
-    that term is for.
+    With two bottles and a fixed slope, each cal injection anchors its own
+    intercept: `intercept_at_cal = assigned - fixed_slope * cal_mean`. Those
+    intercepts are then interpolated in time. This makes the cal injections
+    close exactly by construction while holding the gain fixed.
     """
     import statistics
 
@@ -1017,7 +1009,8 @@ def calibrate_series(df, value_col, cal_points, cal_bottles, gas_key,
             "in_cal": false_series, "excluded": false_series,
             "non_ambient": false_series, "blanked": false_series,
             "residuals": [], "loo_rms": {}, "loo_rms_plain": {},
-            "span_gain": None, "warnings": [],
+            "span_gain": None, "fixed_intercept_nodes": [],
+            "times": df["datetime"], "warnings": [],
         }
 
     if not cal_points:
@@ -1057,6 +1050,7 @@ def calibrate_series(df, value_col, cal_points, cal_bottles, gas_key,
     distinct = {bottles[s]["assigned"] for s in usable}
     two_point = len(usable) >= 2 and len(distinct) >= 2
     pin_slope = model == "fixed slope"
+    fixed_intercept_nodes = []
     if two_point:
         low_state = min(usable, key=lambda s: bottles[s]["assigned"])
         high_state = max(usable, key=lambda s: bottles[s]["assigned"])
@@ -1079,10 +1073,16 @@ def calibrate_series(df, value_col, cal_points, cal_bottles, gas_key,
                               if d_mean and abs(d_mean) >= 1e-6 else None)
             fixed_slope = fixed_slope or constant_slope or 1.0
             slope = pd.Series(float(fixed_slope), index=df.index)
-            # Both tanks pull on the one free parameter; the mean splits the
-            # difference. See the docstring for why the leftover is left
-            # visible in the closure residual rather than absorbed.
-            intercept = ((a_lo - slope * r_lo) + (a_hi - slope * r_hi)) / 2.0
+            intercept_times, intercept_values = [], []
+            for state in span_states:
+                assigned = bottles[state]["assigned"]
+                node_times, node_values = bottles[state]["nodes"]
+                for t, value in zip(node_times, node_values):
+                    if pd.notna(value):
+                        intercept_times.append(t)
+                        intercept_values.append(assigned - float(fixed_slope) * value)
+                        fixed_intercept_nodes.append((t, state))
+            intercept = interp_hold(intercept_times, intercept_values, times)
             mode = "fixed-slope"
         else:
             d_r = r_hi - r_lo
@@ -1105,6 +1105,11 @@ def calibrate_series(df, value_col, cal_points, cal_bottles, gas_key,
         if pin_slope and fixed_slope:
             slope = pd.Series(float(fixed_slope), index=df.index)
             mode = "fixed-slope"
+            fixed_intercept_nodes = [
+                (t, state)
+                for t, value in zip(*bottles[state]["nodes"])
+                if pd.notna(value)
+            ]
             warnings.append(
                 f"Only one usable cal bottle -- holding the slope at the "
                 f"{float(fixed_slope):.4f} given and fitting the intercept to "
@@ -1139,8 +1144,8 @@ def calibrate_series(df, value_col, cal_points, cal_bottles, gas_key,
     extrapolated |= slope.isna()
 
     # Closure residual: what the calibration makes of its own input. Exact
-    # zero by construction under "linear" -- a non-zero value there is a bug
-    # signal, not a quality metric (that's what loo is for).
+    # zero by construction under "linear" and the cal-anchored "fixed slope";
+    # leave-one-out is the quality metric for those cases.
     residuals, loo_rms, loo_rms_plain = [], {}, {}
     for state in span_states:
         info = bottles[state]
@@ -1209,7 +1214,8 @@ def calibrate_series(df, value_col, cal_points, cal_bottles, gas_key,
         "non_ambient": non_ambient, "blanked": blanked,
         "residuals": residuals, "loo_rms": loo_rms,
         "loo_rms_plain": loo_rms_plain,
-        "span_gain": span_gain, "warnings": warnings,
+        "span_gain": span_gain, "fixed_intercept_nodes": fixed_intercept_nodes,
+        "times": times, "warnings": warnings,
     }
 
 
@@ -1326,17 +1332,51 @@ def calibration_uncertainty(result):
         "response_sigma": {s: response_sigma(s) for s in {low, high}},
     }
 
+    if result["mode"] == "fixed-slope":
+        # Fixed slope now anchors the intercept at each cal injection and
+        # interpolates those intercepts in time. Its uncertainty follows the
+        # same anchors: each anchor carries the tank assignment uncertainty and
+        # the response uncertainty for that bottle, scaled by the fixed slope.
+        anchors = result.get("fixed_intercept_nodes") or []
+        target_times = result.get("times")
+        if anchors and target_times is not None:
+            slope_med = slope.median()
+            if pd.isna(slope_med):
+                slope_med = 1.0
+            anchor_vars = []
+            anchor_times = []
+            for t, state in anchors:
+                s_a = bottles[state].get("assigned_unc") or 0.0
+                s_r = response_sigma(state)
+                anchor_times.append(t)
+                anchor_vars.append(s_a * s_a + slope_med * slope_med * s_r * s_r)
+            nodes = pd.Series(anchor_vars, index=pd.DatetimeIndex(anchor_times)).sort_index()
+            nodes = nodes[~nodes.index.duplicated(keep="last")]
+            node_times = list(nodes.index)
+            node_vars = list(nodes.to_numpy())
+            targets = pd.DatetimeIndex(target_times)
+            vars_out = []
+            for t in targets:
+                if len(node_times) == 1 or t <= node_times[0]:
+                    vars_out.append(node_vars[0])
+                    continue
+                if t >= node_times[-1]:
+                    vars_out.append(node_vars[-1])
+                    continue
+                hi_i = nodes.index.searchsorted(t, side="right")
+                lo_i = hi_i - 1
+                dt = (node_times[hi_i] - node_times[lo_i]).total_seconds()
+                w_hi = ((t - node_times[lo_i]).total_seconds() / dt
+                        if dt else 1.0)
+                w_lo = 1.0 - w_hi
+                vars_out.append(w_lo * w_lo * node_vars[lo_i]
+                                + w_hi * w_hi * node_vars[hi_i])
+            sigma = pd.Series(vars_out, index=calibrated.index).pow(0.5)
+            return sigma.mask(calibrated.isna()), components
+
     if result["mode"] in ("offset", "fixed-slope"):
-        # Both hold the gain fixed and fit only the intercept, so they are one
-        # formula: c = S*m + mean_b(A_b - S*R_b), giving dc/dA_b = 1/n and
-        # dc/dR_b = -S/n. `offset` is the n = 1, S = 1 case of it.
-        #
-        # No `f` lever, so the answer does NOT grow as the air moves away from
-        # the tanks -- unlike the two-point mode, where that is the dominant
-        # term. The 1-sigma panel's flat line under these modes is real, not a
-        # plotting failure: with the gain pinned, extrapolating away from the
-        # bottles costs nothing the calibration knows about. What it does cost
-        # rides in the closure residual instead (see response_sigma).
+        # Offset-only has one intercept series. This fallback also covers an
+        # unusual fixed-slope result with no anchor list.
         states = sorted({low, high})
         n = len(states)
         var_a = sum((bottles[s].get("assigned_unc") or 0.0) ** 2 for s in states) / (n * n)
@@ -2141,12 +2181,11 @@ def plot_calibration_panels(fig, result, gas_key, ylabel, datetimes, unit=""):
         """1 sigma at mixing ratio `c` -- the propagation of
         calibration_uncertainty with slope held at its median."""
         if pinned:
-            # Gain pinned, only the intercept fitted: no `f` lever, so the
-            # answer is the same everywhere. Drawn as the flat line that
-            # implies rather than hidden, so the panel keeps a stable meaning
-            # across models -- and so the drop from the two-point curve's
-            # extrapolated wings is visible for what it is. The cost of a
-            # wrong slope is in the closure residual, not here.
+            # Gain pinned: no `f` lever, so the uncertainty does not depend on
+            # mole fraction the way a two-point calibration does. The actual
+            # fixed-slope product is anchored in time to individual cals; this
+            # panel is concentration-based, so it draws a representative flat
+            # line from the same per-bottle uncertainty terms.
             states = sorted({low, high})
             n = len(states)
             return ((sum((s_a.get(s) or 0.0) ** 2 for s in states) / (n * n)

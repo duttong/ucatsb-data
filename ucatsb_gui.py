@@ -2182,7 +2182,7 @@ class UcatsbGui(QMainWindow):
             "How the per-injection cal means become a calibration.\n\n"
             "linear / smooth / constant shape each bottle's response in time\n"
             "and solve the two-point line at every sample. 'fixed slope' pins\n"
-            "the gain instead and fits only the intercept to the tanks."
+            "the gain and lets each cal set an intercept anchor."
         )
         drift_label = QLabel("Model:")
         drift_label.setToolTip(drift_tip)
@@ -2222,14 +2222,13 @@ class UcatsbGui(QMainWindow):
         self.fixed_slope_spin.setSpecialValueText("auto")
         self.fixed_slope_spin.setToolTip(
             'The gain held fixed by the "fixed slope" model, with the\n'
-            "intercept then fitted to the cal tanks at every point in time.\n\n"
+            "intercept anchored to each cal mean and interpolated in time.\n\n"
             "Seeded from the slope the constant model gives (= 1/span gain)\n"
             "when you pick the model, and editable from there. 0 shows as\n"
             '"auto" and means exactly that seed, recomputed per flight.\n\n'
-            "With two tanks the intercept cannot satisfy both unless this\n"
-            "matches their own span, so it splits the difference -- the\n"
-            "leftover shows up in the residuals panel, which is where to\n"
-            "judge the number you have chosen."
+            "Each cal injection is forced to match its assigned tank value;\n"
+            "the fixed slope controls how the response is carried between\n"
+            "those cal anchors."
         )
         self.fixed_slope_spin.valueChanged.connect(self.on_control_changed)
         # 88, not the 72 the smoothing spin uses: four decimals plus the step
