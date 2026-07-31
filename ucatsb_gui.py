@@ -37,7 +37,7 @@ import matplotlib.dates as mdates
 
 from ucatsb_analysis import (
     drop_presync_rows, find_intervals, merge_close_intervals,
-    shade_intervals, bottle_for_interval, match_cal_serial, cal_mean_points,
+    shade_intervals, cal_mean_windows,
     load_cal_roster, load_cal_assignment, select_cal_bottles,
     most_common_serial, mean_std_label, calibrate_series, interp_hold,
     post_cal_flush_mask,
@@ -3809,7 +3809,7 @@ class UcatsbGui(QMainWindow):
         if col is None:
             return "n/a", "n/a"
         raw_c = pd.to_numeric(self.df[col].loc[row], errors="coerce")
-        raw_k = raw_c + 273.15 if not pd.isna(raw_c) else float("nan")
+        raw_k = raw_c + KELVIN_OFFSET if not pd.isna(raw_c) else float("nan")
         raw_text = f"{self._fmt_value(raw_c)} C ({self._fmt_value(raw_k)} K)"
         if analysis["temperature_corrected"]:
             return raw_text, f"{T_GAS_REFERENCE_C:.0f} C"
@@ -4187,7 +4187,6 @@ class UcatsbGui(QMainWindow):
         temperature values were used.
         """
         df = self.df
-        settings = self._settings_for(gas_key)
         index = df.index
         used = pd.Series(False, index=index)
         mean_id = pd.Series(pd.NA, index=index, dtype="Int64")
@@ -4195,32 +4194,13 @@ class UcatsbGui(QMainWindow):
         mean_state = pd.Series(pd.NA, index=index, dtype="Int64")
         mean_serial = pd.Series(pd.NA, index=index, dtype="object")
 
-        event_id = 0
-        measured = analysis["corrected"]
-        for start, end in analysis.get("cal_intervals", []):
-            digital_state = bottle_for_interval(df, start, end)
-            offsets = (tuple(settings["cal1_window_s"]) if digital_state == 0
-                       else tuple(settings["cal2_window_s"]))
-            window_start = end + pd.Timedelta(seconds=offsets[0])
-            window_end = end + pd.Timedelta(seconds=offsets[1])
-            window = df[(df["datetime"] >= window_start)
-                        & (df["datetime"] <= window_end)]
-            if window.empty:
-                continue
-            window = window[~analysis["exclude_mask"].loc[window.index]]
-            if window.empty:
-                continue
-            value = measured.loc[window.index].mean()
-            if pd.isna(value):
-                continue
-            event_id += 1
-            serial = match_cal_serial(value, gas_key, self.cal_bottles)
-            rows = window.index
+        for event_id, rec in enumerate(analysis.get("cal_mean_records", []), start=1):
+            rows = rec["rows"]
             used.loc[rows] = True
             mean_id.loc[rows] = event_id
-            mean_value.loc[rows] = value
-            mean_state.loc[rows] = digital_state
-            mean_serial.loc[rows] = serial
+            mean_value.loc[rows] = rec["value"]
+            mean_state.loc[rows] = rec["state"]
+            mean_serial.loc[rows] = rec["serial"]
 
         diagnostics = {
             "cal_mean_id": self._to_raw_rows(mean_id),
@@ -4712,12 +4692,17 @@ class UcatsbGui(QMainWindow):
         if pressure_col is not None:
             pressure_series = pressure_smoothed
 
-        # The pressure filter follows the same pressure basis that the product is
-        # corrected with. With pressure correction off it remains the raw d1
-        # detector pressure historical mask; with correction on it filters the
-        # corrected pressure series, including the fixed 5 s j_sol_aircal smooth.
+        # The pressure filter follows the same detector as the gas. With
+        # pressure correction on, it uses the smoothed pressure series that the
+        # correction divides by; with pressure correction off, it uses that gas's
+        # raw detector pressure. Gases with no detector keep the historical d1
+        # fallback for auxiliary display only.
+        raw_filter_pressure = (
+            pd.to_numeric(df[detector_col], errors="coerce")
+            if detector_col is not None else
+            pd.to_numeric(df["d1_P_mbars"], errors="coerce"))
         pressure_filter_series = (pressure_series if pressure_series is not None
-                                  else pd.to_numeric(df["d1_P_mbars"], errors="coerce"))
+                                  else raw_filter_pressure)
         bad_pressure = ((pressure_filter_series - D1_P_TARGET_MBARS).abs()
                         > pressure_tol)
         bad_pressure = bad_pressure.fillna(False)
@@ -4780,7 +4765,8 @@ class UcatsbGui(QMainWindow):
         flagged = self._flag_mask(gas_key)
         exclude_mask = bad_pressure | trimmed | pumps_off | flagged
 
-        cal_intervals, cal_points, display_cal_points = [], [], []
+        cal_intervals, cal_mean_records, cal_points = [], [], []
+        display_cal_mean_records, display_cal_points = [], []
         post_cal_flush = pd.Series(False, index=df.index)
         if has_masking:
             cal_intervals = merge_close_intervals(
@@ -4797,23 +4783,31 @@ class UcatsbGui(QMainWindow):
             # can be dropped entirely if its window has no valid data -- and
             # from the P/T-CORRECTED measurement, which is what makes the
             # correction reach the calibration itself.
-            cal_points = cal_mean_points(
+            cal_mean_records = cal_mean_windows(
                 df, cal_intervals, value_col,
                 tuple(settings["cal1_window_s"]),
                 tuple(settings["cal2_window_s"]),
                 cal_bottles=self.cal_bottles, gas_key=gas_key,
                 exclude_mask=exclude_mask, values=corrected,
             )
+            cal_points = [
+                (rec["time"], rec["value"], rec["state"], rec["serial"])
+                for rec in cal_mean_records
+            ]
             # Timeseries cal markers stay in the instrument's recorded units.
             # The calibration itself uses `cal_points` above, which may be
             # P/T-corrected; these points are only for visual reference.
-            display_cal_points = cal_mean_points(
+            display_cal_mean_records = cal_mean_windows(
                 df, cal_intervals, value_col,
                 tuple(settings["cal1_window_s"]),
                 tuple(settings["cal2_window_s"]),
                 cal_bottles=self.cal_bottles, gas_key=gas_key,
                 exclude_mask=exclude_mask,
             )
+            display_cal_points = [
+                (rec["time"], rec["value"], rec["state"], rec["serial"])
+                for rec in display_cal_mean_records
+            ]
 
         self._analysis[gas_key] = {
             "cal": cal, "cal_switch": cal_switch, "not_air": not_air,
@@ -4822,7 +4816,10 @@ class UcatsbGui(QMainWindow):
             "pumps_off": pumps_off, "require_pumps": require_pumps,
             "flagged": flagged,
             "exclude_mask": exclude_mask,
-            "cal_intervals": cal_intervals, "cal_points": cal_points,
+            "cal_intervals": cal_intervals,
+            "cal_mean_records": cal_mean_records,
+            "cal_points": cal_points,
+            "display_cal_mean_records": display_cal_mean_records,
             "display_cal_points": display_cal_points,
             "post_cal_flush": post_cal_flush,
             "has_masking": has_masking,
@@ -5636,7 +5633,9 @@ class UcatsbGui(QMainWindow):
         if analysis is None or not result.get("ok"):
             return []
         points = []
-        for t, value, state, serial in analysis["cal_points"]:
+        for rec in analysis.get("cal_mean_records", []):
+            t = rec["time"]
+            value = rec["value"]
             slope = interp_hold(
                 self.df["datetime"], result["slope"], pd.Series([t])).iloc[0]
             intercept = interp_hold(
@@ -5644,9 +5643,10 @@ class UcatsbGui(QMainWindow):
             if pd.isna(slope) or pd.isna(intercept) or pd.isna(value):
                 continue
             points.append({
+                "interval_id": rec["interval_id"],
                 "time": pd.Timestamp(t),
-                "state": state,
-                "serial": serial,
+                "state": rec["state"],
+                "serial": rec["serial"],
                 "value": float(slope * value + intercept),
             })
         return points
@@ -5662,20 +5662,15 @@ class UcatsbGui(QMainWindow):
         y_pts = self._corr_cal_mean_points_for_gas(y_gas)
         if not y_pts:
             return []
-        used = set()
         pairs = []
-        tolerance = pd.Timedelta(seconds=5)
+        y_by_event = {
+            (p["interval_id"], p["state"]): p
+            for p in y_pts
+        }
         for xp in x_pts:
-            best_i, best_dt = None, None
-            for i, yp in enumerate(y_pts):
-                if i in used or yp["state"] != xp["state"]:
-                    continue
-                dt = abs(yp["time"] - xp["time"])
-                if best_dt is None or dt < best_dt:
-                    best_i, best_dt = i, dt
-            if best_i is not None and best_dt <= tolerance:
-                used.add(best_i)
-                pairs.append((xp["value"], y_pts[best_i]["value"]))
+            yp = y_by_event.get((xp["interval_id"], xp["state"]))
+            if yp is not None:
+                pairs.append((xp["value"], yp["value"]))
         return pairs
 
     def redraw_corr(self, preserve_view=False):

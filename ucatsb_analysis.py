@@ -607,14 +607,11 @@ def mean_std_label(values):
     return f"{mean:.2f}"
 
 
-def cal_mean_points(df, cal_intervals, value_col, cal0_window, cal1_window,
+def cal_mean_windows(df, cal_intervals, value_col, cal0_window, cal1_window,
                      cal_bottles=None, gas_key=None, exclude_mask=None,
                      values=None):
-    """For each calibration interval, average `value_col` over a window
-    relative to the interval's last timestamp (cal_p), tag which digital
-    state (0 or 1) was active (from j_sol_cals over the whole interval), and
-    identify the bottle serial by matching the measured mean against
-    cal_bottles' nominal concentrations for gas_key (if provided).
+    """For each calibration interval, average `value_col` over the configured
+    mean window and keep the rows that contributed to the mean.
 
     cal0_window / cal1_window: (start_offset_s, end_offset_s), e.g. (-15, -1),
     applied as [cal_p + start_offset, cal_p + end_offset]. The digital state
@@ -632,13 +629,14 @@ def cal_mean_points(df, cal_intervals, value_col, cal0_window, cal1_window,
     `value_col` is still required and still names the raw column, because it is
     what the correction was derived from and what the caller reports.
 
-    Returns a list of (x_time, mean_value, digital_state, serial) where
-    digital_state is 0 or 1, serial is a matched bottle serial or None, and
-    x_time is the last timestamp within the (masked) window.
+    Returns one dict per usable calibration interval. `interval_id` is tied to
+    the original cal interval, so two gases can still be paired even if their
+    mean-window timestamps differ. `rows` is the exact df index used in the
+    average, for audit exports.
     """
     measured = df[value_col] if values is None else values
-    points = []
-    for start, end in cal_intervals:
+    records = []
+    for interval_id, (start, end) in enumerate(cal_intervals, start=1):
         digital_state = bottle_for_interval(df, start, end)
         offsets = cal0_window if digital_state == 0 else cal1_window
         window_start = end + pd.Timedelta(seconds=offsets[0])
@@ -656,7 +654,29 @@ def cal_mean_points(df, cal_intervals, value_col, cal0_window, cal1_window,
             match_cal_serial(value_mean, gas_key, cal_bottles)
             if cal_bottles and gas_key else None
         )
-        points.append((x_time, value_mean, digital_state, serial))
+        records.append({
+            "interval_id": interval_id,
+            "time": x_time,
+            "value": value_mean,
+            "state": digital_state,
+            "serial": serial,
+            "rows": window.index.copy(),
+        })
+    return records
+
+
+def cal_mean_points(df, cal_intervals, value_col, cal0_window, cal1_window,
+                     cal_bottles=None, gas_key=None, exclude_mask=None,
+                     values=None):
+    """Compatibility wrapper returning the original tuple form of cal means."""
+    records = cal_mean_windows(
+        df, cal_intervals, value_col, cal0_window, cal1_window,
+        cal_bottles=cal_bottles, gas_key=gas_key,
+        exclude_mask=exclude_mask, values=values,
+    )
+    points = []
+    for rec in records:
+        points.append((rec["time"], rec["value"], rec["state"], rec["serial"]))
     return points
 
 
@@ -955,9 +975,9 @@ def calibrate_series(df, value_col, cal_points, cal_bottles, gas_key,
     blanked from it as the last step: `cal_mask` (rows inside a cal period)
     and `flush_mask` (post_cal_flush_mask), which are not air; and
     `exclude_mask` (warm-up + out-of-spec detector pressure), which is air the
-    instrument was in no state to measure. None of the three affects the
-    calibration itself -- the nodes, slope, intercept and residuals are all
-    derived before this point.
+    instrument was in no state to measure. At this point the cal means have
+    already been chosen by the caller; blanking rows here does not recalculate
+    the nodes, slope, intercept or residuals.
 
     `exclude_mask` here is the *same* mask that is handed to
     `cal_mean_points`, but the two uses are independent and must stay that
