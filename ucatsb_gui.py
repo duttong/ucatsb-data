@@ -227,6 +227,7 @@ RECENT_FILES_MAX = 10
 # the schema differs between flights.
 CORR_COLOR_BY = {
     "time": ("Time", None, "Time (UTC-ish)"),
+    "ozone": ("Ozone", "oz_o3best", "Ozone (ppb)"),
     "oz_p": ("Pressure (oz_p)", "oz_p", "oz_p (mbar)"),
 }
 # "turbo" rather than "jet" or "rainbow": it is the same rainbow ordering,
@@ -1564,7 +1565,8 @@ class UcatsbGui(QMainWindow):
 
     def _populate_corr_color_combo(self):
         """Offer the z-axis encodings this file can actually supply. Time
-        always works; `oz_p` only if the flight's schema has it."""
+        always works; file columns such as Ozone and `oz_p` are offered only
+        when the loaded CSV has them."""
         available = [(key, spec) for key, spec in CORR_COLOR_BY.items()
                      if spec[1] is None or spec[1] in self.df.columns]
         combo = self.corr_color_combo
@@ -3778,7 +3780,7 @@ class UcatsbGui(QMainWindow):
         return [
             head,
             f"  P: raw {p_raw}; used {p_corr}",
-            f"  T: raw {t_raw}; used {t_corr}",
+            f"  T: raw {t_raw}; target {t_corr}",
             f"  factor: {self._fmt_value(factor_value)}",
         ]
 
@@ -3807,7 +3809,7 @@ class UcatsbGui(QMainWindow):
         raw_k = raw_c + 273.15 if not pd.isna(raw_c) else float("nan")
         raw_text = f"{self._fmt_value(raw_c)} C ({self._fmt_value(raw_k)} K)"
         if analysis["temperature_corrected"]:
-            return raw_text, f"{self._fmt_value(raw_k)} K"
+            return raw_text, f"{T_GAS_TARGET_K:.0f} K"
         return raw_text, "off"
 
     @staticmethod
@@ -5642,7 +5644,9 @@ class UcatsbGui(QMainWindow):
                 z_vals = pd.Series(mdates.date2num(self.df["datetime"]),
                                    index=self.df.index)
             elif z_col in self.df.columns:
-                z_vals = self.df[z_col]
+                z_vals = pd.to_numeric(self.df[z_col], errors="coerce")
+                if self.corr_color_by == "ozone":
+                    z_vals = z_vals.mask(self._removed_mask("Ozone"))
             if z_vals is not None:
                 keep &= z_vals.notna()
 
