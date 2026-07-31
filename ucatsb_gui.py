@@ -37,8 +37,8 @@ import matplotlib.dates as mdates
 
 from ucatsb_analysis import (
     drop_presync_rows, find_intervals, merge_close_intervals,
-    shade_intervals, cal_mean_points, load_cal_roster, load_cal_assignment,
-    select_cal_bottles,
+    shade_intervals, bottle_for_interval, match_cal_serial, cal_mean_points,
+    load_cal_roster, load_cal_assignment, select_cal_bottles,
     most_common_serial, mean_std_label, calibrate_series, post_cal_flush_mask,
     cal_switch_mask, below_floor_mask, smooth_pressure, pt_correction_factor,
     O3_VALID_MIN_PPB, H2O_VALID_MIN_PPM,
@@ -47,7 +47,7 @@ from ucatsb_analysis import (
     export_companion_csv, export_icartt, icartt_filename, icartt_time_base,
     DEFAULT_ICARTT_META,
     CALS_YAML_PATH, CAL_DRIFT_MODELS, CAL_DEFAULT_SMOOTH_EVENTS,
-    CAL_MERGE_GAP_S, D1_P_TARGET_MBARS, T_GAS_TARGET_K,
+    CAL_MERGE_GAP_S, D1_P_TARGET_MBARS, T_GAS_TARGET_K, KELVIN_OFFSET,
     merge_ranges, add_ranges, subtract_ranges, ranges_to_mask, ranges_row_count,
     # The shared palette. These used to be declared a second time here, with
     # identical values -- two homes for one decision, agreeing only by
@@ -2714,8 +2714,8 @@ class UcatsbGui(QMainWindow):
         self.csv_coeff_check = QCheckBox("Include cal slope / intercept columns")
         self.csv_coeff_check.setChecked(True)
         self.csv_coeff_check.setToolTip(
-            "Given on every row, so the calibrated value of a blanked row can "
-            "be recomputed by anyone who wants to check it.")
+            "Also includes the cal-mean, pressure, temperature, and P/T factor "
+            "columns used to check how each calibrated value was made.")
         self.csv_comment_check = QCheckBox("Put the provenance notes in the CSV as # lines")
         self.csv_comment_check.setChecked(False)
         self.csv_comment_check.setToolTip(
@@ -4171,6 +4171,82 @@ class UcatsbGui(QMainWindow):
         shifted.index = shifted.index + offset
         return shifted.reindex(range(offset + len(shifted)))
 
+    def _export_cal_diagnostics(self, gas_key, analysis):
+        """Row-level audit columns for the cal-bottle gases.
+
+        This does not choose a calibration. It repeats cal_mean_points' window
+        logic so the export can show which source rows made each cal mean and
+        what pressure/temperature-corrected values the calibration actually
+        saw.
+        """
+        df = self.df
+        settings = self._settings_for(gas_key)
+        index = df.index
+        used = pd.Series(False, index=index)
+        mean_id = pd.Series(pd.NA, index=index, dtype="Int64")
+        mean_value = pd.Series(float("nan"), index=index)
+        mean_state = pd.Series(pd.NA, index=index, dtype="Int64")
+        mean_serial = pd.Series(pd.NA, index=index, dtype="object")
+
+        event_id = 0
+        measured = analysis["corrected"]
+        for start, end in analysis.get("cal_intervals", []):
+            digital_state = bottle_for_interval(df, start, end)
+            offsets = (tuple(settings["cal1_window_s"]) if digital_state == 0
+                       else tuple(settings["cal2_window_s"]))
+            window_start = end + pd.Timedelta(seconds=offsets[0])
+            window_end = end + pd.Timedelta(seconds=offsets[1])
+            window = df[(df["datetime"] >= window_start)
+                        & (df["datetime"] <= window_end)]
+            if window.empty:
+                continue
+            window = window[~analysis["exclude_mask"].loc[window.index]]
+            if window.empty:
+                continue
+            value = measured.loc[window.index].mean()
+            if pd.isna(value):
+                continue
+            event_id += 1
+            serial = match_cal_serial(value, gas_key, self.cal_bottles)
+            rows = window.index
+            used.loc[rows] = True
+            mean_id.loc[rows] = event_id
+            mean_value.loc[rows] = value
+            mean_state.loc[rows] = digital_state
+            mean_serial.loc[rows] = serial
+
+        diagnostics = {
+            "cal_mean_id": self._to_raw_rows(mean_id),
+            "cal_mean": self._to_raw_rows(mean_value),
+            "cal_mean_state": self._to_raw_rows(mean_state),
+            "cal_mean_serial": self._to_raw_rows(mean_serial),
+            "corrected_input": self._to_raw_rows(analysis["corrected"]),
+            "pressure_filter_mbar": self._to_raw_rows(
+                analysis["pressure_filter_series"]),
+        }
+
+        detector_col = analysis.get("detector_col")
+        if detector_col is not None and detector_col in df.columns:
+            diagnostics["pressure_raw_mbar"] = self._to_raw_rows(
+                pd.to_numeric(df[detector_col], errors="coerce"))
+        if analysis.get("pressure_series") is not None:
+            diagnostics["pressure_for_correction_mbar"] = self._to_raw_rows(
+                analysis["pressure_series"])
+
+        temperature_col = self._temperature_column(gas_key)
+        if temperature_col is not None and temperature_col in df.columns:
+            temperature_c = pd.to_numeric(df[temperature_col], errors="coerce")
+            diagnostics["temperature_raw_C"] = self._to_raw_rows(temperature_c)
+            if analysis.get("temperature_corrected"):
+                diagnostics["temperature_for_correction_K"] = self._to_raw_rows(
+                    temperature_c + KELVIN_OFFSET)
+
+        masks = {
+            "is_cal_mean_window": self._to_raw_rows(used),
+            "is_pressure_filtered": self._to_raw_rows(analysis["bad_pressure"]),
+        }
+        return masks, diagnostics
+
     def _export_gas_blocks(self):
         """One block per gas in this file, for either exporter.
 
@@ -4213,6 +4289,8 @@ class UcatsbGui(QMainWindow):
             result = self._calibration_for(gas_key)
             if result and result.get("ok"):
                 sigma, _ = self._uncertainty_for(gas_key)
+                audit_masks, diagnostics = self._export_cal_diagnostics(
+                    gas_key, analysis)
                 block["final"] = self._to_raw_rows(result["calibrated"])
                 block["final_kind"] = "calibrated"
                 # A property of the delivered numbers, so both writers can say
@@ -4241,6 +4319,7 @@ class UcatsbGui(QMainWindow):
                 block["sigma"] = self._to_raw_rows(sigma)
                 block["slope"] = self._to_raw_rows(result["slope"])
                 block["intercept"] = self._to_raw_rows(result["intercept"])
+                block["diagnostics"] = diagnostics
                 block["masks"] = {
                     "is_cal_period": self._to_raw_rows(result["in_cal"]),
                     "is_post_cal_flush": self._to_raw_rows(result["flushed"]),
@@ -4251,6 +4330,7 @@ class UcatsbGui(QMainWindow):
                     # user cannot reconstruct from the settings.
                     "is_flagged": self._to_raw_rows(analysis["flagged"]),
                 }
+                block["masks"].update(audit_masks)
             else:
                 # No calibration is not a reason to export nothing for this
                 # gas: the masks are still the answer to "which rows are air",

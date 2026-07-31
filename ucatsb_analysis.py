@@ -1604,6 +1604,20 @@ def companion_notes(gas_blocks, source_path=None, presync_rows=0):
                     f"scaled down, while a cell running hot holds less and is "
                     f"scaled up. The temperature column is degrees C and the "
                     f"correction is in kelvin, hence the {KELVIN_OFFSET}.")
+            if block.get("diagnostics"):
+                notes.append(
+                    f"{gas}: audit columns show how the calibration was made. "
+                    f"{gas}_corrected_input is the raw gas value after any "
+                    f"P/T normalisation and before the slope/intercept. "
+                    f"{gas}_cal_mean is the bottle mean calculated from the "
+                    f"rows where {gas}_is_cal_mean_window = 1; the same mean "
+                    f"is repeated on those rows. {gas}_cal_mean_id groups rows "
+                    f"from the same cal event, {gas}_cal_mean_state is the "
+                    f"cal valve state, and {gas}_cal_mean_serial is the tank "
+                    f"matched to that mean. Pressure and temperature columns "
+                    f"show the raw readings and the values used for correction "
+                    f"or filtering. {gas}_is_pressure_filtered = 1 means the "
+                    f"row failed the pressure filter.")
         elif block.get("final_kind") == "filtered":
             notes.append(
                 f"{gas}: {_column_for(block)} is {block['value_col']} "
@@ -1625,6 +1639,15 @@ def export_companion_csv(path, datetimes, gas_blocks, source_path=None,
                          time_seconds=None):
     """Write the derived record for every gas, one row per row of the RAW CSV.
 
+    Plain-language map:
+    - The GUI has already done the scientific choices: which rows are good
+      air, which cal rows make a bottle mean, and what correction factor was
+      applied.
+    - This function is the spreadsheet writer. It lines those finished
+      columns up with the original raw file rows and writes them out.
+    - If a row is blank here, this function did not decide to throw it away;
+      it is only preserving the decision made by the analysis code.
+
     A companion to the acquisition file rather than a replacement: it adds the
     masks and the filtered/calibrated values, repeats the raw columns only on
     request, and is the same length as the file it complements, so the two
@@ -1636,11 +1659,12 @@ def export_companion_csv(path, datetimes, gas_blocks, source_path=None,
 
     Each entry of `gas_blocks` is a dict with `gas`, `value_col`, `unit`,
     `raw`, optionally `final`/`final_kind`/`sigma`/`slope`/`intercept`, a
-    `masks` dict of named boolean Series, and `reason` when a gas that should
-    have a calibration has none. **Every Series must already be indexed on the
-    raw file's row numbering** -- reconciling the trimmed analysis frame with
-    the untrimmed file is the caller's job (the GUI's `_to_raw_rows`), since
-    only the caller knows how many rows came off the front.
+    `masks` dict of named boolean Series, a `diagnostics` dict of extra audit
+    Series, and `reason` when a gas that should have a calibration has none.
+    **Every Series must already be indexed on the raw file's row numbering** --
+    reconciling the trimmed analysis frame with the untrimmed file is the
+    caller's job (the GUI's `_to_raw_rows`), since only the caller knows how
+    many rows came off the front.
 
     `comment_header` defaults False: the stated consumers are Excel and Igor
     Pro, and neither skips a leading `#` block without being told to. With it
@@ -1677,6 +1701,10 @@ def export_companion_csv(path, datetimes, gas_blocks, source_path=None,
             # file with no correction gains no column.
             if block.get("pt_factor") is not None:
                 columns[f"{gas}_pt_factor"] = block["pt_factor"]
+        if include_coefficients:
+            for name, values in block.get("diagnostics", {}).items():
+                if values is not None:
+                    columns[f"{gas}_{name}"] = values
         if include_masks:
             for name, mask in block.get("masks", {}).items():
                 if mask is None:
