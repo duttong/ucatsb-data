@@ -3713,7 +3713,7 @@ class UcatsbGui(QMainWindow):
 
         info = GASES[gas_key]
         if not info.get("has_masking", True):
-            return [head, "  P raw/corr: n/a", "  T raw/corr: n/a", "  factor: n/a"]
+            return [head, "  P: n/a", "  T: n/a", "  factor: n/a"]
 
         analysis = self._analysis_for(gas_key)
         p_raw, p_corr = self._corr_tooltip_pressure(gas_key, row, analysis)
@@ -3722,8 +3722,8 @@ class UcatsbGui(QMainWindow):
         factor_value = 1.0 if factor is None else factor.loc[row]
         return [
             head,
-            f"  P raw/corr: {p_raw} -> {p_corr}",
-            f"  T raw/corr: {t_raw} -> {t_corr}",
+            f"  P: raw {p_raw}; used {p_corr}",
+            f"  T: raw {t_raw}; used {t_corr}",
             f"  factor: {self._fmt_value(factor_value)}",
         ]
 
@@ -3737,9 +3737,11 @@ class UcatsbGui(QMainWindow):
         raw_text = f"{self._fmt_value(raw)} mbar"
         if analysis["pressure_corrected"]:
             src = f"{self._fmt_value(used_value)} mbar" if used is not None else raw_text
-            if analysis["pressure_smooth_s"]:
-                src += f" ({analysis['pressure_smooth_s']} s mean)"
-            return raw_text, f"{D1_P_TARGET_MBARS:.0f} mbar from {src}"
+            if self.df["j_sol_aircal"].fillna(0).astype(bool).loc[row]:
+                src += f" ({analysis['pressure_aircal_smooth_s']} s aircal mean)"
+            elif analysis["pressure_smooth_s"]:
+                src += f" ({analysis['pressure_smooth_s']} s air mean)"
+            return raw_text, src
         return raw_text, "off"
 
     def _corr_tooltip_temperature(self, gas_key, row, analysis):
@@ -3750,7 +3752,7 @@ class UcatsbGui(QMainWindow):
         raw_k = raw_c + 273.15 if not pd.isna(raw_c) else float("nan")
         raw_text = f"{self._fmt_value(raw_c)} C ({self._fmt_value(raw_k)} K)"
         if analysis["temperature_corrected"]:
-            return raw_text, f"{T_GAS_TARGET_K:.0f} K"
+            return raw_text, f"{self._fmt_value(raw_k)} K"
         return raw_text, "off"
 
     @staticmethod
@@ -4552,9 +4554,6 @@ class UcatsbGui(QMainWindow):
         cal_switch = cal_switch_mask(df["datetime"], cal)
         not_air = cal | cal_switch
 
-        bad_pressure = (df["d1_P_mbars"] - D1_P_TARGET_MBARS).abs() > pressure_tol
-        bad_pressure = bad_pressure.fillna(False)
-
         # The column the pressure correction will divide by, or None when it
         # is switched off (or the gas has no detector of its own). Resolved
         # here so every view can name it without re-deriving the rule.
@@ -4562,23 +4561,40 @@ class UcatsbGui(QMainWindow):
         pressure_col = (detector_col
                         if settings.get("pressure_correct", False) else None)
 
-        # The smoothed cell pressure, over the WHOLE flight -- air and cal
-        # alike (2026-07-31). Computed whenever a window is set and this gas
-        # has a detector, NOT only when the correction is on: the aux panel
-        # draws it over the raw trace, which is how the window gets chosen in
-        # the first place. See smooth_pressure for why the air/cal split went.
+        # The pressure used by the correction and, when pressure correction is
+        # on, by the pressure filter. The selectable smoothing window is for air
+        # rows. During j_sol_aircal periods the transition is sharper and the
+        # correction uses a fixed 5 s smooth instead, so a long air window cannot
+        # pull cal-pressure transitions into the cal means.
         smooth_s = settings.get("pressure_smooth_s", 0)
         pressure_smoothed = None
-        if detector_col is not None and smooth_s:
-            pressure_smoothed = smooth_pressure(
-                df["datetime"], df[detector_col], smooth_s)
+        pressure_air_smoothed = None
+        pressure_aircal_smoothed = None
+        if detector_col is not None:
+            raw_pressure = df[detector_col]
+            pressure_air_smoothed = smooth_pressure(
+                df["datetime"], raw_pressure, smooth_s)
+            pressure_aircal_smoothed = smooth_pressure(
+                df["datetime"], raw_pressure, 5)
+            aircal = df["j_sol_aircal"].fillna(0).astype(bool)
+            pressure_smoothed = pressure_air_smoothed.mask(
+                aircal, pressure_aircal_smoothed)
         # What the correction actually divides by: smoothed when there is a
         # window, the raw column when there is not, None when the correction
         # is off. One key, so no call site has to re-derive that choice.
         pressure_series = None
         if pressure_col is not None:
-            pressure_series = (df[pressure_col] if pressure_smoothed is None
-                               else pressure_smoothed)
+            pressure_series = pressure_smoothed
+
+        # The pressure filter follows the same pressure basis that the product is
+        # corrected with. With pressure correction off it remains the raw d1
+        # detector pressure historical mask; with correction on it filters the
+        # corrected pressure series, including the fixed 5 s j_sol_aircal smooth.
+        pressure_filter_series = (pressure_series if pressure_series is not None
+                                  else pd.to_numeric(df["d1_P_mbars"], errors="coerce"))
+        bad_pressure = ((pressure_filter_series - D1_P_TARGET_MBARS).abs()
+                        > pressure_tol)
+        bad_pressure = bad_pressure.fillna(False)
 
         # The temperature correction's column, or None when it is off. Not
         # smoothed: the cell temperature is already smooth (see the checkbox's
@@ -4685,8 +4701,12 @@ class UcatsbGui(QMainWindow):
             "pressure_corrected": pressure_col is not None,
             "pressure_col": pressure_col,
             "detector_col": detector_col,
-            "pressure_smooth_s": smooth_s if pressure_smoothed is not None else 0,
+            "pressure_smooth_s": smooth_s if detector_col is not None else 0,
+            "pressure_aircal_smooth_s": 5 if detector_col is not None else 0,
+            "pressure_filter_series": pressure_filter_series,
             "pressure_smoothed": pressure_smoothed,
+            "pressure_air_smoothed": pressure_air_smoothed,
+            "pressure_aircal_smoothed": pressure_aircal_smoothed,
             "pressure_series": pressure_series,
             "temperature_corrected": temperature_col is not None,
             "temperature_col": temperature_col,
@@ -4921,8 +4941,17 @@ class UcatsbGui(QMainWindow):
                     ends.append(f"last {end_flight_minutes} min of flight")
                 notes.append("orange = excluded (" + ", ".join(ends) + ")")
             if bad_pressure.any():
+                pressure_basis = (analysis["pressure_col"] or "d1_P_mbars")
+                if analysis["pressure_corrected"]:
+                    smooth_note = (
+                        f"; {analysis['pressure_smooth_s']} s air mean"
+                        if analysis["pressure_smooth_s"] else "; raw air")
+                    smooth_note += (
+                        f", {analysis['pressure_aircal_smooth_s']} s aircal mean")
+                    pressure_basis += smooth_note
                 notes.append(
-                    f"light red = excluded (d1_P_mbars outside {D1_P_TARGET_MBARS:.0f}±{pressure_tol:.2f} mbar)"
+                    f"light red = excluded ({pressure_basis} outside "
+                    f"{D1_P_TARGET_MBARS:.0f}±{pressure_tol:.2f} mbar)"
                 )
             if analysis["pumps_off"].any():
                 notes.append(
@@ -4960,7 +4989,10 @@ class UcatsbGui(QMainWindow):
                         # line is already the widest thing on the figure, and
                         # the tooltip and the export notes carry the full
                         # "centred, whole flight" description.
-                        + (f" [{smooth_s} s mean]" if smooth_s else ""))
+                        + (f" [{smooth_s} s air mean, "
+                           f"{analysis['pressure_aircal_smooth_s']} s aircal]"
+                           if smooth_s else
+                           f" [raw air, {analysis['pressure_aircal_smooth_s']} s aircal]"))
                 if analysis["temperature_corrected"]:
                     scaled_to.append(f"{T_GAS_TARGET_K:.0f} K")
                     terms.append(
@@ -5115,8 +5147,13 @@ class UcatsbGui(QMainWindow):
                     smooth_data["datetime"], smooth_data["p"],
                     color=CALIBRATED_COLOR, linewidth=1.0)
                 aux_handles.append(smooth_line)
-                aux_labels.append(
-                    f"{analysis['pressure_smooth_s']} s centred mean")
+                if analysis["pressure_smooth_s"]:
+                    aux_labels.append(
+                        f"{analysis['pressure_smooth_s']} s air mean; "
+                        f"{analysis['pressure_aircal_smooth_s']} s aircal mean")
+                else:
+                    aux_labels.append(
+                        f"raw air; {analysis['pressure_aircal_smooth_s']} s aircal mean")
             if has_right_axis:
                 ax_aux2 = ax_aux.twinx()
                 self._register_stats_trace(
