@@ -1531,12 +1531,12 @@ class UcatsbGui(QMainWindow):
         vbox.addWidget(self.corr_cal_box)
 
         self.corr_note = QLabel(
-            "Calibrated data wherever there is a calibration. A point needs a "
-            "value in <i>both</i> tracers, so each gas's own masking, cal "
-            "periods and post-cal flush all remove points. Ozone has no cal "
-            "bottles, so it is plotted as recorded (<tt>oz_o3best</tt>) and "
-            "gets no error bars. The calibration settings here edit whichever "
-            "axis tracer is selected."
+            "Calibrated where available.\n"
+            "Masks, cals, and flush apply per gas."
+        )
+        self.corr_note.setToolTip(
+            "Correlation uses calibrated values where available.\n"
+            "Masks, cal periods, and flush filters are applied per gas."
         )
         self.corr_note.setWordWrap(True)
         self.corr_note.setStyleSheet(f"color: {MUTED_COLOR};")
@@ -3395,9 +3395,9 @@ class UcatsbGui(QMainWindow):
         previous = self.corr_cal_target.currentData()
         entries = []
         if self.corr_y_gas:
-            entries.append(("y", f"{self.corr_y_gas}  (Y axis)"))
+            entries.append(("y", f"{self.corr_y_gas} (Y)"))
         if self.corr_x_gas and self.corr_x_gas != self.corr_y_gas:
-            entries.append(("x", f"{self.corr_x_gas}  (X axis)"))
+            entries.append(("x", f"{self.corr_x_gas} (X)"))
         loading = self._loading
         self._loading = True
         self.corr_cal_target.clear()
