@@ -1025,6 +1025,7 @@ class UcatsbGui(QMainWindow):
         # Off by default: a straight line through a tracer-tracer plot with
         # real structure in it describes almost none of that structure.
         self.corr_fit = False
+        self.corr_tooltip_popup = None
         self._corr_ax = None
         self._last_corr_key = None
 
@@ -2389,6 +2390,7 @@ class UcatsbGui(QMainWindow):
         self.corr_pane.stats_action.setVisible(False)
         self.corr_pane.calibrated_action.setVisible(False)
         self.corr_pane.on_flag_box = self.on_corr_flag_box
+        self.corr_pane.canvas.mpl_connect("button_press_event", self.on_corr_tooltip_press)
 
         self.export_pane = self._build_export_pane()
 
@@ -3608,6 +3610,154 @@ class UcatsbGui(QMainWindow):
         for gas in gases:
             self.flagged.pop(gas, None)
         self._after_flag_change()
+
+    def on_corr_tooltip_press(self, event):
+        """Persistent readout for the nearest displayed correlation point."""
+        if event.button != 3 or event.inaxes is not self._corr_ax:
+            return
+        text = self._corr_tooltip_text(event)
+        if text:
+            self._show_corr_tooltip_popup(text, event)
+
+    def _show_corr_tooltip_popup(self, text, event):
+        self._close_corr_tooltip_popup()
+
+        popup = QWidget(self, Qt.Tool | Qt.FramelessWindowHint)
+        popup.setAttribute(Qt.WA_DeleteOnClose)
+        popup.setStyleSheet(
+            "QWidget { background: #ffffff; color: #222222; "
+            "border: 1px solid #8a8a8a; }"
+            "QPushButton { border: none; padding: 1px 6px; font-weight: bold; }"
+            "QPushButton:hover { background: #e8e8e8; }"
+        )
+        layout = QVBoxLayout(popup)
+        layout.setContentsMargins(8, 4, 8, 8)
+        layout.setSpacing(4)
+
+        top = QHBoxLayout()
+        top.setContentsMargins(0, 0, 0, 0)
+        top.addStretch(1)
+        close_button = QPushButton("x")
+        close_button.setFixedSize(20, 20)
+        close_button.setToolTip("Close")
+        top.addWidget(close_button)
+        layout.addLayout(top)
+
+        label = QLabel(text)
+        label.setTextFormat(Qt.PlainText)
+        label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        label.setStyleSheet("font-family: Menlo, monospace; border: none;")
+        layout.addWidget(label)
+
+        close_button.clicked.connect(self._close_corr_tooltip_popup)
+        popup.destroyed.connect(
+            lambda _=None, p=popup: setattr(
+                self, "corr_tooltip_popup", None
+            ) if self.corr_tooltip_popup is p else None)
+
+        self.corr_tooltip_popup = popup
+        popup.adjustSize()
+        qevent = getattr(event, "guiEvent", None)
+        if qevent is not None and hasattr(qevent, "globalPos"):
+            pos = qevent.globalPos()
+        else:
+            pos = self.corr_pane.canvas.mapToGlobal(
+                self.corr_pane.canvas.rect().center())
+        popup.move(pos.x() + 12, pos.y() + 12)
+        popup.show()
+
+    def _close_corr_tooltip_popup(self):
+        popup = self.corr_tooltip_popup
+        self.corr_tooltip_popup = None
+        if popup is not None:
+            popup.close()
+
+    def _corr_tooltip_text(self, event):
+        plotted = self._corr_plotted
+        if not plotted or event.x is None or event.y is None:
+            return None
+        mask = plotted["keep"].copy()
+        if not self.corr_hide_flagged:
+            mask |= plotted["flagged"]
+        if not mask.any():
+            return None
+
+        x_vals = plotted["x"][mask]
+        y_vals = plotted["y"][mask]
+        points = self._corr_ax.transData.transform(
+            list(zip(x_vals.to_numpy(), y_vals.to_numpy())))
+        dx = points[:, 0] - event.x
+        dy = points[:, 1] - event.y
+        dist2 = dx * dx + dy * dy
+        nearest_pos = int(dist2.argmin())
+        max_px = max(10.0, self.corr_marker_size + 8.0)
+        if dist2[nearest_pos] > max_px * max_px:
+            return None
+
+        row = x_vals.index[nearest_pos]
+        lines = [f"row {row + self.presync_dropped}   {self.df['datetime'].loc[row]}"]
+        for axis, gas_key, values, sigma, unit in (
+                ("X", plotted["x_gas"], plotted["x"], plotted["x_sigma"], plotted["x_unit"]),
+                ("Y", plotted["y_gas"], plotted["y"], plotted["y_sigma"], plotted["y_unit"])):
+            lines.extend(self._corr_tooltip_gas_lines(
+                axis, gas_key, row, values, sigma, unit))
+        return "\n".join(lines)
+
+    def _corr_tooltip_gas_lines(self, axis, gas_key, row, values, sigma, unit):
+        value = values.loc[row]
+        sigma_value = None if sigma is None else sigma.loc[row]
+        head = f"{axis} {gas_key}: {self._fmt_value(value)}"
+        if sigma_value is not None and not pd.isna(sigma_value):
+            head += f" ± {float(sigma_value):.3f}"
+        head += f" {unit}".rstrip()
+
+        info = GASES[gas_key]
+        if not info.get("has_masking", True):
+            return [head, "  P raw/corr: n/a", "  T raw/corr: n/a", "  factor: n/a"]
+
+        analysis = self._analysis_for(gas_key)
+        p_raw, p_corr = self._corr_tooltip_pressure(gas_key, row, analysis)
+        t_raw, t_corr = self._corr_tooltip_temperature(gas_key, row, analysis)
+        factor = analysis["correction_factor"]
+        factor_value = 1.0 if factor is None else factor.loc[row]
+        return [
+            head,
+            f"  P raw/corr: {p_raw} -> {p_corr}",
+            f"  T raw/corr: {t_raw} -> {t_corr}",
+            f"  factor: {self._fmt_value(factor_value)}",
+        ]
+
+    def _corr_tooltip_pressure(self, gas_key, row, analysis):
+        col = self._pressure_column(gas_key)
+        if col is None:
+            return "n/a", "n/a"
+        raw = self.df[col].loc[row]
+        used = analysis["pressure_series"]
+        used_value = None if used is None else used.loc[row]
+        raw_text = f"{self._fmt_value(raw)} mbar"
+        if analysis["pressure_corrected"]:
+            src = f"{self._fmt_value(used_value)} mbar" if used is not None else raw_text
+            if analysis["pressure_smooth_s"]:
+                src += f" ({analysis['pressure_smooth_s']} s mean)"
+            return raw_text, f"{D1_P_TARGET_MBARS:.0f} mbar from {src}"
+        return raw_text, "off"
+
+    def _corr_tooltip_temperature(self, gas_key, row, analysis):
+        col = self._temperature_column(gas_key)
+        if col is None:
+            return "n/a", "n/a"
+        raw_c = pd.to_numeric(self.df[col].loc[row], errors="coerce")
+        raw_k = raw_c + 273.15 if not pd.isna(raw_c) else float("nan")
+        raw_text = f"{self._fmt_value(raw_c)} C ({self._fmt_value(raw_k)} K)"
+        if analysis["temperature_corrected"]:
+            return raw_text, f"{T_GAS_TARGET_K:.0f} K"
+        return raw_text, "off"
+
+    @staticmethod
+    def _fmt_value(value):
+        if value is None or pd.isna(value):
+            return "n/a"
+        return f"{float(value):.6g}"
 
     def on_corr_flag_box(self, ax, x0, x1, y0, y1, unflag):
         """Flag (or unflag) the scatter points inside a dragged box.
@@ -5213,10 +5363,12 @@ class UcatsbGui(QMainWindow):
 
         Nothing is re-derived to do it: `calibrate_series` deliberately emits
         `cal_slope`/`cal_intercept` on *every* row, blanked ones included,
-        exactly so a blanked row's calibrated value can be recomputed. A floor
-        gas has no calibration to undo, so its raw column is already the answer
-        -- but its below-floor faults stay out, since those are a sensor fault
-        rather than something the user chose to remove.
+        exactly so a blanked row's calibrated value can be recomputed. The value
+        they multiply must be the same P/T-corrected measurement the calibration
+        used, not the raw column, or flagged markers move when corrections are
+        on. A floor gas has no calibration to undo, so its raw column is already
+        the answer -- but its below-floor faults stay out, since those are a
+        sensor fault rather than something the user chose to remove.
 
         Returns a Series that is NaN everywhere except this gas's flagged rows.
         """
@@ -5228,7 +5380,8 @@ class UcatsbGui(QMainWindow):
         result = self._calibration_for(gas_key)
         if not (result or {}).get("ok"):
             return pd.Series(float("nan"), index=self.df.index)
-        return (result["slope"] * raw + result["intercept"]).mask(~flags)
+        corrected = self._analysis_for(gas_key)["corrected"]
+        return (result["slope"] * corrected + result["intercept"]).mask(~flags)
 
     def _median_sigmas(self, *gas_units):
         """[(gas, median 1σ, unit, percent)] for those of `gas_units` that
@@ -5279,6 +5432,7 @@ class UcatsbGui(QMainWindow):
         """
         if self.df is None or not self.corr_x_gas or not self.corr_y_gas:
             return
+        self._close_corr_tooltip_popup()
         x_gas, y_gas = self.corr_x_gas, self.corr_y_gas
         fig = self.corr_pane.figure
 
@@ -5517,9 +5671,15 @@ class UcatsbGui(QMainWindow):
         # the plotted set is the intersection of two masked series and the
         # z-variable's own pairing rule, and rebuilding that from the outside
         # would be a second implementation free to drift from this one.
+        x_tip_sigma = (self._uncertainty_for(x_gas)[0]
+                       if GASES[x_gas].get("has_masking", True) else None)
+        y_tip_sigma = (self._uncertainty_for(y_gas)[0]
+                       if GASES[y_gas].get("has_masking", True) else None)
         self._corr_plotted = {"keep": keep, "x": fx, "y": fy,
                               "flagged": flagged_here,
-                              "x_gas": x_gas, "y_gas": y_gas}
+                              "x_gas": x_gas, "y_gas": y_gas,
+                              "x_sigma": x_tip_sigma, "y_sigma": y_tip_sigma,
+                              "x_unit": x_unit, "y_unit": y_unit}
         self.corr_pane.attach_stats_selectors([ax])
 
         # Frame a rescale on what is actually visible. A hidden artist keeps
