@@ -1541,8 +1541,11 @@ def _column_for(block):
 
 
 def companion_notes(gas_blocks, source_path=None, presync_rows=0):
-    """The provenance block for the companion CSV: what produced it, what the
-    columns mean, and how many rows each mask covers."""
+    """Notes written beside the companion CSV.
+
+    These notes are for the scientist opening the file later: where the file
+    came from, what the main columns mean, and how many rows each mask caught.
+    """
     import datetime as _dt
 
     notes = [
@@ -1566,7 +1569,7 @@ def companion_notes(gas_blocks, source_path=None, presync_rows=0):
         if block.get("final_kind") == "calibrated":
             notes.append(
                 f"{gas}: {_column_for(block)} is the calibrated GOOD "
-                f"AMBIENT record ({unit}) -- blank wherever the instrument was "
+                f"AMBIENT record ({unit}) - blank wherever the instrument was "
                 f"not sampling air, or was sampling it in a state the masking "
                 f"settings exclude. The raw {block['value_col']} is untouched "
                 f"on every row, and {gas}_cal_slope/{gas}_cal_intercept are "
@@ -1576,9 +1579,9 @@ def companion_notes(gas_blocks, source_path=None, presync_rows=0):
                    if block.get("pt_corrected") else
                    f" as slope * {block['value_col']} + intercept."))
             if block.get("pt_corrected"):
-                # Stated as its own sentence, not folded into the one above:
-                # the correction happens BEFORE the calibration, so it changes
-                # the slope and intercept themselves, not just the answer.
+                # Keep this separate because the order matters: P/T correction
+                # is applied before calibration, so the cal means and fitted
+                # coefficients are already on the corrected scale.
                 terms, targets = [], []
                 if block.get("pressure_corrected"):
                     terms.append(
@@ -1637,40 +1640,23 @@ def export_companion_csv(path, datetimes, gas_blocks, source_path=None,
                          include_coefficients=True, include_uncertainty=True,
                          presync_rows=0, comment_header=False,
                          time_seconds=None):
-    """Write the derived record for every gas, one row per row of the RAW CSV.
+    """Write the derived CSV, keeping one row for every raw CSV row.
 
-    Plain-language map:
-    - The GUI has already done the scientific choices: which rows are good
-      air, which cal rows make a bottle mean, and what correction factor was
-      applied.
-    - This function is the spreadsheet writer. It lines those finished
-      columns up with the original raw file rows and writes them out.
-    - If a row is blank here, this function did not decide to throw it away;
-      it is only preserving the decision made by the analysis code.
+    The calibration and masking decisions have already been made by the GUI.
+    This function only writes those finished columns to disk. If a value is
+    blank, the writer is preserving an earlier decision; it is not deciding
+    which data are good or bad.
 
-    A companion to the acquisition file rather than a replacement: it adds the
-    masks and the filtered/calibrated values, repeats the raw columns only on
-    request, and is the same length as the file it complements, so the two
-    open side by side in Excel or Igor with no alignment step. That row-for-row
-    promise is why the pre-sync rows dropped by drop_presync_rows are still
-    present here, blank and flagged, rather than silently absent: a quiet
-    offset of a few dozen rows between two files that look alignable is a very
-    effective way to corrupt an analysis.
+    The file is meant to sit beside the raw CSV. It uses the same row order and
+    the same row count, including pre-sync rows, so the two files can be opened
+    side by side or pasted together without shifting the data.
 
-    Each entry of `gas_blocks` is a dict with `gas`, `value_col`, `unit`,
-    `raw`, optionally `final`/`final_kind`/`sigma`/`slope`/`intercept`, a
-    `masks` dict of named boolean Series, a `diagnostics` dict of extra audit
-    Series, and `reason` when a gas that should have a calibration has none.
-    **Every Series must already be indexed on the raw file's row numbering** --
-    reconciling the trimmed analysis frame with the untrimmed file is the
-    caller's job (the GUI's `_to_raw_rows`), since only the caller knows how
-    many rows came off the front.
+    `gas_blocks` contains the prepared columns for each gas. Every Series in a
+    block must already be aligned to the raw file row numbers. The GUI does
+    that with `_to_raw_rows` before calling this writer.
 
-    `comment_header` defaults False: the stated consumers are Excel and Igor
-    Pro, and neither skips a leading `#` block without being told to. With it
-    off the provenance goes to a sidecar `<stem>_notes.txt` instead, so it is
-    never simply lost. Turn it on for a file meant to be read back with
-    pd.read_csv(path, comment="#").
+    When `comment_header` is off, the notes go to `<stem>_notes.txt` instead
+    of the top of the CSV. That keeps the CSV friendly to Excel and Igor.
     """
     columns = {"datetime": pd.Series(list(datetimes))}
     if time_seconds is not None:
@@ -1694,11 +1680,8 @@ def export_companion_csv(path, datetimes, gas_blocks, source_path=None,
         if include_coefficients and block.get("slope") is not None:
             columns[f"{gas}_cal_slope"] = block["slope"]
             columns[f"{gas}_cal_intercept"] = block["intercept"]
-            # The P/T multiplier belongs beside them: since 2026-07-31 the
-            # correction is applied to the MEASUREMENT, so
-            # slope*raw+intercept no longer reproduces the calibrated column
-            # without it. Written only when a correction was applied, so a
-            # file with no correction gains no column.
+            # The factor is needed to recompute a calibrated row because the
+            # raw value is P/T-corrected before the slope and intercept.
             if block.get("pt_factor") is not None:
                 columns[f"{gas}_pt_factor"] = block["pt_factor"]
         if include_coefficients:
@@ -1709,10 +1692,8 @@ def export_companion_csv(path, datetimes, gas_blocks, source_path=None,
             for name, mask in block.get("masks", {}).items():
                 if mask is None:
                     continue
-                # Int64, not bool: pandas would write True/False, which Igor
-                # loads as a text wave and Excel as text. The nullable dtype
-                # leaves the pre-sync rows genuinely empty rather than
-                # claiming 0 for rows where the mask was never evaluated.
+                # Use 1/0, with blanks allowed, so Excel and Igor read these as
+                # numbers and pre-sync rows can stay empty.
                 columns[f"{gas}_{name}"] = mask.astype("boolean").astype("Int64")
 
     out = pd.DataFrame(columns)

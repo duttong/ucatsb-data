@@ -4154,15 +4154,11 @@ class UcatsbGui(QMainWindow):
     # ---------------------------------------------------------------- export
 
     def _to_raw_rows(self, series):
-        """Put a Series computed on the trimmed analysis frame back onto the
-        RAW file's row numbering.
+        """Put an analysis Series back on the raw CSV row numbers.
 
-        drop_presync_rows both removes leading rows and resets the index, so
-        self.df row 0 is raw row `presync_dropped`. Everything the Export tab
-        writes goes through here, because the companion CSV's entire promise
-        is that its row N is the source file's row N -- an unshifted Series
-        would line every gas up a few dozen rows early, silently and
-        plausibly.
+        The plots use `self.df`, which starts after any pre-sync rows. The CSV
+        export uses `self.raw_df`, which still has those rows. This shift keeps
+        row N in the export matched to row N in the raw file.
         """
         shifted = series.reset_index(drop=True)
         offset = self.presync_dropped
@@ -4172,12 +4168,11 @@ class UcatsbGui(QMainWindow):
         return shifted.reindex(range(offset + len(shifted)))
 
     def _export_cal_diagnostics(self, gas_key, analysis):
-        """Row-level audit columns for the cal-bottle gases.
+        """Build the audit columns for one cal-bottle gas.
 
-        This does not choose a calibration. It repeats cal_mean_points' window
-        logic so the export can show which source rows made each cal mean and
-        what pressure/temperature-corrected values the calibration actually
-        saw.
+        These columns answer practical questions about the calibration: which
+        rows made each cal mean, what that mean was, and what pressure and
+        temperature values were used.
         """
         df = self.df
         settings = self._settings_for(gas_key)
@@ -4248,14 +4243,11 @@ class UcatsbGui(QMainWindow):
         return masks, diagnostics
 
     def _export_gas_blocks(self):
-        """One block per gas in this file, for either exporter.
+        """Collect the prepared export columns for every available gas.
 
-        Built for every available gas rather than the one on display -- both
-        products are whole-flight deliverables, and the per-gas control panel
-        is the only reason the old export could describe just one. Each gas
-        is analysed with its own saved settings via _analysis_for /
-        _calibration_for, exactly as the Correlations tab does, so a gas
-        nobody has selected this session still exports correctly.
+        Export is always whole-flight and all-gas. Each gas is analysed with
+        its own saved settings, whether or not that gas is currently selected
+        in the GUI.
         """
         blocks = []
         for gas_key in self.available_gases:
@@ -4271,9 +4263,8 @@ class UcatsbGui(QMainWindow):
                 "masks": {},
             }
             if not info.get("has_masking", True):
-                # No cal bottles: the physical floor is the only correction
-                # there is, and calling the result "calibrated" would claim
-                # something nobody established.
+                # Ozone and water do not use cal bottles here. Keep their
+                # filtered values, but do not call them calibrated.
                 removed = self._removed_mask(gas_key)
                 block["final"] = self._to_raw_rows(
                     self.df[info["value_col"]].mask(removed))
@@ -4293,25 +4284,19 @@ class UcatsbGui(QMainWindow):
                     gas_key, analysis)
                 block["final"] = self._to_raw_rows(result["calibrated"])
                 block["final_kind"] = "calibrated"
-                # A property of the delivered numbers, so both writers can say
-                # so -- a column of mole fractions normalised to 140 mbar is
-                # not the same quantity as one that is not.
+                # These fields describe the delivered values, so both CSV and
+                # ICARTT can report the same correction settings.
                 block["pressure_corrected"] = analysis["pressure_corrected"]
                 block["pressure_col"] = analysis["pressure_col"]
-                # Only when the correction is actually applied: with 140/P off
-                # the smoothing touches nothing in either delivered file, and a
-                # note describing a divisor nothing divided by would be worse
-                # than no note.
+                # Only report pressure smoothing when the pressure correction
+                # was actually applied.
                 block["pressure_smooth_s"] = (
                     analysis["pressure_smooth_s"]
                     if block["pressure_corrected"] else 0)
                 block["temperature_corrected"] = analysis["temperature_corrected"]
                 block["temperature_col"] = analysis["temperature_col"]
-                # The factor goes in the CSV as its own column, because since
-                # the correction moved ahead of the calibration
-                # slope*raw+intercept no longer reproduces <gas>_cal without
-                # it -- and that recompute-a-blanked-row promise is the reason
-                # the coefficients are exported at all.
+                # Keep the P/T factor with the slope and intercept so a user
+                # can reproduce the calibrated value from the raw value.
                 block["pt_corrected"] = result.get("correction_factor") is not None
                 block["pt_factor"] = (
                     None if result.get("correction_factor") is None
@@ -4325,16 +4310,14 @@ class UcatsbGui(QMainWindow):
                     "is_post_cal_flush": self._to_raw_rows(result["flushed"]),
                     "is_masked": self._to_raw_rows(result["excluded"]),
                     "is_extrapolated": self._to_raw_rows(result["extrapolated"]),
-                    # A subset of is_masked (flags ride inside exclude_mask),
-                    # written separately because it is the only removal a data
-                    # user cannot reconstruct from the settings.
+                    # Manual flags are also part of is_masked, but they are
+                    # useful to see on their own.
                     "is_flagged": self._to_raw_rows(analysis["flagged"]),
                 }
                 block["masks"].update(audit_masks)
             else:
-                # No calibration is not a reason to export nothing for this
-                # gas: the masks are still the answer to "which rows are air",
-                # and they are what the raw column needs beside it.
+                # Even without a usable calibration, export the masks so the
+                # raw column still has the air/non-air decisions beside it.
                 block["reason"] = (result or {}).get("reason", "no calibration")
                 block["masks"] = {
                     "is_cal_period": self._to_raw_rows(analysis["not_air"]),
