@@ -46,7 +46,8 @@ standalone CO2 figure CLI that was removed in the same change.)
 
 `ucatsb_gui.py` imports from it rather than duplicating: `drop_presync_rows`,
 `find_intervals`, `merge_close_intervals`, `shade_intervals`,
-`cal_mean_points`, `load_cal_roster`, `load_cal_assignment`,
+`cal_mean_points`, `smooth_pressure`, `pt_correction_factor`,
+`load_cal_roster`, `load_cal_assignment`,
 `select_cal_bottles`, `most_common_serial`, `mean_std_label`,
 `CALS_YAML_PATH`, plus the calibration functions below and the two export
 writers (`export_companion_csv`, `export_icartt`, with
@@ -205,46 +206,131 @@ A two-point (slope + intercept) form is required rather than a simple offset:
 the measured span error is several percent (span gain 0.96 on the Jul 2026
 flight, 1.06 on Feb 2025), so gain must be corrected too.
 
-**The pressure correction is a post-multiplier on the calibrated series, and
-only that.** `calibrate_series(pressure=…)` (the **140/P** checkbox beside the
-pressure tolerance, `pressure_correct` in the per-gas settings) scales the
-calibrated value by `D1_P_TARGET_MBARS / P`, normalising each reading to the
-cell's spec pressure. Four properties, all deliberate:
+### The P/T correction is applied to the MEASUREMENT, before the calibration
 
-- **It is applied after the calibration and cannot move it.** The cal-bottle
-  responses, the drift nodes, `slope`/`intercept`, every residual and
-  `span_gain` are all computed on the uncorrected measurement, so the
-  Calibration tab reads identically with the box on and off — verify that
-  after touching this, the same way the flush and `exclude_mask` invariants
-  are verified. Correcting the raw signal *before* the calibration would be
-  defensible physics, but the two-point fit would then absorb most of it
-  through the bottle responses, which is a different and far less legible
-  operation. It also means `slope*raw + intercept` (both still exported on
-  every row) gives the **un**corrected value — the companion CSV's notes say
-  so, because otherwise that recipe silently disagrees with the column beside
-  it.
-- **P is the gas's OWN detector pressure** — `d1_P_mbars` for CO2/N2O,
-  `d2_P_mbars` for CH4, from `GASES[gas]["detector"]`, unlike the pressure
-  *mask*, which reads `d1_P_mbars` for everything. Correcting a d2 measurement
-  by the d1 cell's pressure would be meaningless arithmetic. A gas with no
-  detector (Ozone, H2O) has no correction, and the checkbox disables itself in
-  `_select_gas` for a gas whose column the loaded file lacks — per gas, not
-  once at load like `Pumps on`, because which detector a gas comes off varies
-  by gas *and* by flight.
-- **A row with no usable pressure (missing, or ≤ 0) gets no value.** It goes
-  NaN in `calibrated` and joins `blanked` — the join is what makes the trace
-  break over it rather than the row being dropped and drawn across. Mixing
-  corrected and uncorrected values in one series is the outcome being avoided.
-- **The 1σ is scaled by the same factor**, in `calibration_uncertainty`, which
-  divides the factor back out before recovering `f` (the blend of the two
-  assigned values only holds on the uncorrected scale) and multiplies it into
-  the answer. The factor itself is treated as exact: the pressure reading has
-  its own error, but nothing in the calibration constrains it, and inventing a
-  number would be the same mistake as inventing a missing `<GAS>_unc`.
+`pt_correction_factor` builds one multiplier out of the two per-gas checkboxes
+on the **Correct:** row — `140/P` (`pressure_correct`) and `T/315`
+(`temperature_correct`) — and `_analysis_for` multiplies the raw value column by
+it. That corrected series is what `cal_mean_points` averages **and** what
+`calibrate_series` calibrates, handed to both from one place so they cannot end
+up on different scales:
 
-Nothing about it is written into the ICARTT file, following the rule that the
-delivered file describes the data and not the analysis. The companion CSV's
-notes and the Export tab's summary both name it.
+    factor    = 140/P  ×  (T + 273.15)/315
+    corrected = raw × factor
+    calibrated(t) = slope(t) × corrected(t) + intercept(t)
+
+**This replaced a post-multiplier on the calibrated output (2026-07-31, on the
+PI's instruction), and the difference is the whole point.** The old design was
+chosen so the correction could not move the calibration — the Calibration tab
+read identically with the boxes on and off. It now moves it, deliberately: the
+cal-bottle means, the drift nodes, `slope`/`intercept`, `span_gain` and every
+residual are all on the corrected scale. A cal injection measured at 138 mbar is
+put on the same footing as ambient air measured at 140 *before* it becomes a
+calibration node, which is what the operator expects when they tick a box that
+says "normalise to the cell's spec conditions". On 2026-07-30, CO2's
+`span_gain` moves 0.9646 → 0.9674 and the cal means shift ~0.5 ppm. **Cal curves
+changing when these boxes are toggled is correct behaviour, not a regression** —
+the old invariant is retired, and any check asserting it is stale.
+
+Consequences that are easy to get wrong:
+
+- **`slope*raw + intercept` no longer reproduces `<gas>_cal`.** The recipe is
+  `slope × (raw × factor) + intercept`. The companion CSV therefore exports
+  `<GAS>_pt_factor` beside `<GAS>_cal_slope`/`_cal_intercept` whenever a
+  correction is on, and the notes give the formula — the "a blanked row can be
+  recomputed" promise is why those coefficients are exported at all, and it
+  would otherwise be quietly false.
+- **`calibration_uncertainty` no longer unwinds anything.** It used to divide
+  the factor out to recover `f` and multiply it back into the answer; now
+  `calibrated` *is* the blend of the two assigned values, so `f` comes straight
+  off it and the sigma comes out in real units. If you find yourself
+  reintroducing a `rescale()` there, the correction has drifted back to being a
+  post-multiplier.
+- **Everything else about `calibrate_series` is unchanged.** `values=` overrides
+  the measurement; `correction_factor=` is echoed back for description and to
+  blank its NaN rows, and is *not* applied inside. The blanking invariants
+  (`cal_mask`, `flush_mask`, `exclude_mask` are output-only) still hold and are
+  still worth verifying: cal points, `span_gain` and `loo_rms` must be identical
+  with the flush at 0 s and 30 s.
+
+The two checkboxes themselves:
+
+- **The ratios are the other way up from each other, and that is physics, not a
+  typo.** 140/P divides by the *reading*; T/315 divides by the *target*. Number
+  density goes as P/T, so a cell running hot holds less gas and its measurement
+  is scaled **up**, where a cell at high pressure holds more and is scaled down.
+  T shipped briefly as 315/T (2026-07-31, matching 140/P's form by symmetry) and
+  was flipped the same day. Anyone "restoring the symmetry" is reintroducing the
+  bug — the labels read `140/P` and `T/315` precisely so the asymmetry is
+  visible in the UI.
+- **P and T are the gas's OWN detector's**, from `GASES[gas]["detector"]` —
+  `d1_P_mbars`/`d1_T_gas` for CO2/N2O, `d2_*` for CH4 (whose cell runs 1.5 °C
+  cooler). This is unlike the pressure *mask*, which reads `d1_P_mbars` for
+  everything. A gas with no detector (Ozone, H2O) has no correction, and each
+  checkbox disables itself in `_select_gas` for a gas whose column the loaded
+  file lacks — per gas, not once at load like `Pumps on`, because which detector
+  a gas comes off varies by gas *and* by flight.
+- **The temperature arithmetic is in KELVIN and the column is in CELSIUS.**
+  `d1_T_gas` reads ~42.3, not ~315.4. A ratio of Celsius numbers is not a ratio
+  of temperatures — it would apply 0.134 rather than 1.001. `KELVIN_OFFSET` is
+  added inside `pt_correction_factor`, whose parameter is named `temperature_c`
+  so the signature says which unit it wants. The `> 0` guard is on the *kelvin*
+  value, since 0 °C is a real temperature; on the pressure it is on the reading.
+- **A row with no usable P or T gets no value.** It is NaN in `corrected`, so
+  NaN in `calibrated`, and it joins `blanked` — the join is what makes the trace
+  break over it rather than the row being dropped and drawn across.
+- **The cal-mean dots stay on the raw trace.** They are the *corrected* means
+  now, so they sit ~0.5 ppm off the raw line they are drawn over. Left that way
+  on the PI's instruction rather than computing a second, display-only set of
+  raw means — two numbers for one thing is exactly what this codebase avoids —
+  and the figure note says so in as many words.
+
+Nothing about any of this is written into the ICARTT file, following the rule
+that the delivered file describes the data and not the analysis. The companion
+CSV's notes and the Export tab's summary both name it.
+
+**P is smoothed first** (`smooth_pressure`, **Smooth P**, `pressure_smooth_s`,
+2026-07-31). Dividing by a noisy pressure adds that sensor's noise to every mole
+fraction: `d1_P_mbars` scatters ~0.07 mbar sample-to-sample, which is 0.05% and
+therefore ~0.2 ppm of CO2. Defaults to 0, like every other new masking setting,
+so an existing config's numbers do not move until it is asked for. Four
+properties, each of which kills a plausible implementation:
+
+- **The WHOLE flight, air and cal alike.** It first shipped smoothing only the
+  air position, leaving every cal row exactly as measured, because the cell
+  steps by ~2 mbar when the solenoid opens and a window reaching across an
+  injection drags the air on both sides of it. That was replaced the same day:
+  the correction now applies to the cal windows too (it is what the cal means
+  are computed from), and one rule the operator can hold in their head beats a
+  special case. The cost is real and is an argument for a SHORT window —
+  10–30 s gets essentially all the noise reduction available (within-flight
+  sd of diffs 0.086 → 0.009 mbar at 30 s), while a long one reads between the
+  two levels for half a window either side of every transition.
+- **Centred, and the window SHRINKS symmetrically at the two ends of the
+  record.** `rolling(center=True, min_periods=1)` looks like the answer and is
+  not: at the first row it averages only what exists, i.e. purely forward, which
+  is a shifted mean. The half-width is capped at the distance to the end of the
+  record instead. Verified on an exact ramp: distortion ~1e-3 mbar, from
+  irregular sampling alone.
+- **The window is a time span, and the record is done in one vectorised pass.**
+  The file is nominally 1 Hz but carries duplicate timestamps and dropped
+  samples (1937 and 822 on 2026-07-30), so "30 samples" and "30 seconds" differ.
+  Bounds come from `searchsorted` and the means from prefix sums, since every
+  row's window has a different width — which is what `rolling` cannot express.
+  A per-segment loop cost 108 ms against the ~9 ms the whole drift interpolation
+  takes, all of it pandas per-call overhead; the flat version is ~15 ms.
+- **It is drawn, on the same axis as the raw trace.** Whenever "Above:" is
+  showing this gas's own Detector Pressure the smoothed line goes over it in
+  `CALIBRATED_COLOR` with the raw faded to 0.55 — the calibrated overlay's
+  convention, hue not fading — because choosing a window is a judgement about
+  how the mean sits against the excursions it has to keep, and a second scale
+  would make that unjudgeable. It is drawn whether or not 140/P is on, which is
+  why the smoothed series is computed independently of `pressure_col`.
+
+T is deliberately **not** smoothed, on the PI's instruction and because the
+signal does not need it: `d1_T_gas` moves 0.34 °C across the whole Jul 2026
+flight where the pressure carries 0.16 mbar of sample-to-sample noise. There is
+no "Smooth T" beside "Smooth P".
 
 Non-obvious properties, each of which has bitten a plausible implementation:
 
@@ -547,9 +633,12 @@ Two failure modes to know, because neither announces itself:
   A panel taller than the viewport now scrolls. A panel *wider* than
   `CONTROLS_WIDTH` neither scrolls (the horizontal bar is off by policy) nor
   wraps — it clips its own right-hand edge, and buttons quietly lose their
-  right halves. `CONTROLS_WIDTH` is 312 against a widest group box of 300
-  (Data Masking, since the 140/P checkbox joined the pressure row) for exactly
-  that headroom. If you add a wide control, measure
+  right halves. `CONTROLS_WIDTH` is 312 against a widest group box of 292
+  (Data Masking) for exactly that headroom. It was 300 while the 140/P
+  checkbox shared the pressure row; adding T/315 beside it would have asked
+  ~330, which is what moved both corrections onto a "Correct:" row of their
+  own — the arithmetic decided a layout question that was already arguable.
+  If you add a wide control, measure
   `box.minimumSizeHint().width()`, don't eyeball it — and measure the
   *rendered* widget too. The pressure row's " mbar" suffix had to leave the
   spin box and become a muted tag beside it, because a spin box narrow enough

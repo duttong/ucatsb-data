@@ -43,6 +43,21 @@ MUTED_COLOR = "#52514e"
 # DEFAULT_GAS_SETTINGS. So are the warm-up length and the cal-mean windows,
 # which had fixed values here only to serve the removed CO2 CLI.
 D1_P_TARGET_MBARS = 140.0
+
+# The detector's spec cell temperature, for the T/315 companion to the 140/P
+# correction. Note the correction divides BY this, where the pressure one
+# divides by the reading: number density goes as P/T, so a cell running hot
+# holds less gas and the measurement needs scaling UP, not down. The two
+# corrections are deliberately not mirror images.
+#
+# In KELVIN, and that is the whole trap: `d1_T_gas`/`d2_T_gas` are in DEGREES
+# CELSIUS (d1 runs ~42.3 C, d2 ~40.8 C on the Jul 2026 flight, i.e. 315.5 K and
+# 314.0 K), so every use has to add KELVIN_OFFSET first. A ratio of Celsius
+# numbers is not a ratio of temperatures -- it would read 42.3/315 = 0.134
+# rather than 1.001 -- which is why the constant is named for its unit.
+T_GAS_TARGET_K = 315.0
+KELVIN_OFFSET = 273.15
+
 CAL_MERGE_GAP_S = 2   # bridge cal periods split by a single dropped-flag sample
 CALS_YAML_PATH = Path(__file__).parent / "cals.yaml"
 
@@ -283,6 +298,152 @@ def post_cal_flush_mask(datetimes, cal_intervals, flush_s, cal_mask=None):
     return flagged
 
 
+def smooth_pressure(datetimes, pressure, window_s):
+    """Centred rolling mean of a detector's cell pressure over the WHOLE
+    record -- air and cal alike.
+
+    The 140/P correction divides the measurement by this pressure, so the
+    sensor's own sample-to-sample noise lands straight on the mole fraction: on
+    the Jul 2026 flight the high-frequency scatter on `d1_P_mbars` is ~0.07 mbar
+    (0.05%), i.e. ~0.2 ppm of CO2 -- a third of that gas's reported 1 sigma,
+    manufactured by the correction rather than measured. A mean over `window_s`
+    seconds divides that by roughly sqrt(n) while leaving the real excursions
+    (altitude changes move the cell by whole mbar over minutes) intact.
+
+    **The whole flight, with no air/cal distinction** (2026-07-31, on the PI's
+    instruction). An earlier version smoothed the air position only and left
+    every cal-position row exactly as measured, because the cell steps by ~2
+    mbar when the solenoid switches and a window reaching across an injection
+    drags the air on both sides of it. That is a real effect, but it bought a
+    rule the operator had to hold in their head, and the correction now applies
+    to the whole record -- cal windows included, since it is what the cal means
+    are computed from (see pt_correction_factor). One rule, one series: the
+    cell pressure is smoothed, full stop. The cost is that a window spanning a
+    solenoid transition reads between the two levels for up to half a window
+    either side of it, which is an argument for a SHORT window (10-30 s covers
+    most of the noise reduction available) rather than for a special case.
+
+    Three properties, all deliberate:
+
+    - **Centred, so it introduces no time shift.** A trailing window would slide
+      the pressure a few seconds late against the mole fraction it divides, and
+      the correction would then be wrong in exactly the places it matters most
+      -- the fast pressure moves. A centred mean is unbiased on a ramp; only
+      curvature survives it.
+    - **The window SHRINKS symmetrically at the two ends of the record** rather
+      than going one-sided there, which is the same "no time shift" rule applied
+      at the boundary: `rolling(center=True, min_periods=1)` averages only the
+      rows that exist, so the first row of the flight gets a purely FORWARD mean
+      -- a shifted one. The half-width is capped at the distance to the end of
+      the record instead, so every mean is centred on its own row and only the
+      noise reduction is lost there.
+    - **A missing or non-positive reading is neither smoothed nor smoothed
+      over.** Those rows are what the correction blanks the output on, so
+      inventing a value for them from their neighbours would silently resurrect
+      rows that have no pressure; letting them into the mean would poison the
+      neighbours instead.
+
+    The window is a time span, not a sample count: the record is nominally 1 Hz
+    but carries duplicate timestamps and dropped samples (1937 and 822
+    respectively on the Jul 2026 flight), so "30 samples" and "30 seconds" are
+    not the same window. That needs an ordered index -- `drop_presync_rows` is
+    what makes the record monotonic, and if it somehow is not, the pressure is
+    returned as measured rather than raising.
+
+    Returns the numeric pressure unchanged when `window_s` is 0, so callers can
+    use it unconditionally.
+    """
+    p = pd.to_numeric(pressure, errors="coerce")
+    if not window_s or window_s <= 0 or not datetimes.is_monotonic_increasing:
+        return p
+    usable = p.where(p > 0)
+    if not usable.notna().any():
+        return p
+
+    # Vectorised over the whole record rather than looped: the per-call overhead
+    # of pandas is what costs here (a per-run loop was 108 ms against the ~9 ms
+    # the whole drift interpolation takes).
+    times = pd.DatetimeIndex(datetimes)
+    values = usable.reset_index(drop=True)
+    last = len(times) - 1
+
+    # min(half the window, distance to either end of the record) -- the
+    # symmetric shrink described above. 0 at the first and last rows, which
+    # therefore keep exactly what was measured.
+    half_window = pd.Timedelta(seconds=float(window_s) / 2)
+    half = pd.concat([
+        pd.Series(times - times[0]),
+        pd.Series(times[last] - times),
+    ], axis=1).min(axis=1).clip(upper=half_window)
+
+    # Bounds by time, not by row count: duplicate timestamps and dropped
+    # samples both make those differ. side left/right so a duplicate of the
+    # window's own edge is in rather than half in.
+    lo = times.searchsorted(times - pd.TimedeltaIndex(half), side="left")
+    hi = times.searchsorted(times + pd.TimedeltaIndex(half), side="right")
+
+    # Prefix sums, so each row's mean is two lookups rather than a scan -- the
+    # windows all differ in width here (the shrink at the ends), which is
+    # exactly what `rolling` cannot express. The leading 0 makes `lo == 0` need
+    # no special case.
+    totals = pd.concat([pd.Series([0.0]), values.fillna(0.0).cumsum()], ignore_index=True)
+    counts = pd.concat([pd.Series([0]), values.notna().astype(int).cumsum()], ignore_index=True)
+    window_sum = totals.take(hi).to_numpy() - totals.take(lo).to_numpy()
+    window_n = pd.Series(counts.take(hi).to_numpy() - counts.take(lo).to_numpy())
+    # `where` rather than a guard: a window holding nothing but gaps gives NaN,
+    # which is what the row had to begin with.
+    smoothed = pd.Series((pd.Series(window_sum) / window_n.where(window_n > 0)).to_numpy(),
+                         index=p.index)
+    # Where the reading itself was missing or nonsense, hand back what was
+    # there; `where` keeps the smoothed value only where the row had one.
+    return smoothed.where(usable.notna(), p)
+
+
+def pt_correction_factor(pressure=None, pressure_target=D1_P_TARGET_MBARS,
+                         temperature_c=None, temperature_target_k=T_GAS_TARGET_K):
+    """The combined cell-condition multiplier, or None when neither correction
+    is asked for.
+
+        140/P  * T/315        (P in mbar, T in KELVIN)
+
+    **This is applied to the MEASUREMENT, before anything else** (2026-07-31).
+    The corrected series is what `cal_mean_points` averages and what
+    `calibrate_series` calibrates, so the cal-bottle responses, the drift nodes,
+    slope/intercept, span_gain and the residuals are all on the corrected scale
+    too. That is the whole point of the change: one number describes the
+    instrument's state, the operator does not have to reason about a correction
+    that lands after the calibration, and a cal injection measured at 138 mbar
+    is put on the same footing as ambient air measured at 140 before it becomes
+    a calibration node.
+
+    It replaces an earlier design where the same factor was a post-multiplier on
+    the calibrated output only, chosen so the correction could not move the
+    calibration. It can now, and the numbers on the Calibration tab change when
+    these boxes are toggled -- expected, not a regression.
+
+    Two directions, not one, and the asymmetry is physics rather than a typo:
+    number density goes as P/T, so a cell holding gas at high pressure reads
+    high and is scaled DOWN by 140/P, while a cell running hot holds less and is
+    scaled UP by T/315.
+
+    `temperature_c` is in DEGREES CELSIUS -- the unit `d1_T_gas`/`d2_T_gas` are
+    recorded in -- and KELVIN_OFFSET is added here. The `> 0` guard is on the
+    kelvin value, since 0 C is a real temperature; on the pressure it is on the
+    reading itself. A row failing either guard, or missing, gets NaN, which is
+    how it ends up blanked from the calibrated record rather than silently
+    uncorrected.
+    """
+    factor = None
+    if pressure is not None:
+        p = pd.to_numeric(pressure, errors="coerce")
+        factor = pressure_target / p.where(p > 0)
+    if temperature_c is not None:
+        t_k = pd.to_numeric(temperature_c, errors="coerce") + KELVIN_OFFSET
+        t_factor = t_k.where(t_k > 0) / temperature_target_k
+        factor = t_factor if factor is None else factor * t_factor
+    return factor
+
+
 def box_stats(datetimes, values, t0, t1, y0=None, y1=None):
     """Summarise the points inside a drawn box (Igor-style marquee stats).
 
@@ -449,7 +610,8 @@ def mean_std_label(values):
 
 
 def cal_mean_points(df, cal_intervals, value_col, cal0_window, cal1_window,
-                     cal_bottles=None, gas_key=None, exclude_mask=None):
+                     cal_bottles=None, gas_key=None, exclude_mask=None,
+                     values=None):
     """For each calibration interval, average `value_col` over a window
     relative to the interval's last timestamp (cal_p), tag which digital
     state (0 or 1) was active (from j_sol_cals over the whole interval), and
@@ -465,10 +627,18 @@ def cal_mean_points(df, cal_intervals, value_col, cal0_window, cal1_window,
     before averaging. A window left with no unmasked rows is dropped
     entirely -- a cal point can disappear rather than average over bad data.
 
+    values: an optional Series to average INSTEAD of `df[value_col]`, aligned
+    with df's index. This is how the P/T-corrected measurement reaches the cal
+    means -- the caller corrects once and hands the same series here and to
+    calibrate_series, so the two cannot disagree about what was calibrated.
+    `value_col` is still required and still names the raw column, because it is
+    what the correction was derived from and what the caller reports.
+
     Returns a list of (x_time, mean_value, digital_state, serial) where
     digital_state is 0 or 1, serial is a matched bottle serial or None, and
     x_time is the last timestamp within the (masked) window.
     """
+    measured = df[value_col] if values is None else values
     points = []
     for start, end in cal_intervals:
         digital_state = bottle_for_interval(df, start, end)
@@ -480,7 +650,7 @@ def cal_mean_points(df, cal_intervals, value_col, cal0_window, cal1_window,
             window = window[~exclude_mask.loc[window.index]]
         if window.empty:
             continue
-        value_mean = window[value_col].mean()
+        value_mean = measured.loc[window.index].mean()
         if pd.isna(value_mean):
             continue
         x_time = window["datetime"].iloc[-1]
@@ -745,8 +915,7 @@ def cal_mismatch_notes(bottles, gas_key, roster, rel_threshold=0.01):
 def calibrate_series(df, value_col, cal_points, cal_bottles, gas_key,
                      model="linear", smooth_window=CAL_DEFAULT_SMOOTH_EVENTS,
                      roster=None, flush_mask=None, cal_mask=None,
-                     exclude_mask=None, pressure=None,
-                     pressure_target=D1_P_TARGET_MBARS):
+                     exclude_mask=None, values=None, correction_factor=None):
     """Build a time-varying two-point calibration from the per-injection cal
     means and apply it to every row of df[value_col].
 
@@ -762,8 +931,10 @@ def calibrate_series(df, value_col, cal_points, cal_bottles, gas_key,
                                            and "loo" residuals
       low_state/high_state  int|None
       slope, intercept, calibrated      -- Series on df.index, NaN where undefined
-      pressure_factor  Series|None      -- the applied pressure correction,
-                                           None when it was not asked for
+      correction_factor Series|None     -- echoed back: the P/T multiplier
+                                           already applied to `values` by the
+                                           caller, for description and for
+                                           blanking its NaN rows
       extrapolated  Series[bool]        -- outside the INTERSECTION of the two
                                            bottles' node spans, or in a long gap
       flushed       Series[bool]        -- post-cal flush rows
@@ -793,23 +964,21 @@ def calibrate_series(df, value_col, cal_points, cal_bottles, gas_key,
     Removing these rows here rather than in each caller keeps the plotted
     trace and the exported CSV from ever disagreeing about which rows are good.
 
-    `pressure` (a Series of the gas's own detector pressure, in mbar) turns on
-    the pressure correction: the calibrated value is scaled by
-    `pressure_target / P`, normalising each reading to the cell's spec
-    pressure. It is applied to the *calibrated* series only, deliberately --
-    the cal-bottle responses, the drift nodes, the slope/intercept and every
-    residual are the uncorrected measurement, so turning the correction on or
-    off cannot move the calibration itself, only its product. (Correcting the
-    raw signal first would also be defensible, but the two-point calibration
-    would then absorb most of it through the bottle responses, which is a
-    different and much less legible operation.)
+    `values` overrides `df[value_col]` as the measurement to calibrate. It is
+    how the P/T-corrected series gets in: the caller builds it once with
+    `pt_correction_factor` and hands the *same* series to `cal_mean_points`, so
+    the nodes and the record being calibrated are on one scale by construction.
+    `value_col` still names the raw column and is still what everything reports.
 
-    Rows with no usable pressure (missing, or <= 0) get no corrected value:
-    they go NaN in `calibrated` and join `blanked`, so the trace breaks over
-    them rather than mixing corrected and uncorrected values in one series.
+    `correction_factor` is that multiplier, echoed back rather than applied --
+    this function does not touch `values`. It is kept for two jobs: describing
+    what was done, and blanking. A row with no usable pressure or temperature is
+    already NaN in `values`; joining `blanked` is what makes the trace break
+    over it instead of the row being dropped and drawn across.
     """
     import statistics
 
+    measured = df[value_col] if values is None else values
     nan_series = pd.Series(float("nan"), index=df.index)
     false_series = pd.Series(False, index=df.index)
 
@@ -818,7 +987,7 @@ def calibrate_series(df, value_col, cal_points, cal_bottles, gas_key,
             "ok": False, "reason": reason, "mode": None, "bottles": {},
             "low_state": None, "high_state": None,
             "slope": nan_series, "intercept": nan_series, "calibrated": nan_series,
-            "pressure_factor": None,
+            "correction_factor": None,
             "extrapolated": false_series, "flushed": false_series,
             "in_cal": false_series, "excluded": false_series,
             "non_ambient": false_series, "blanked": false_series,
@@ -895,18 +1064,10 @@ def calibrate_series(df, value_col, cal_points, cal_bottles, gas_key,
             "bottle's concentration."
         )
 
-    calibrated = slope * df[value_col] + intercept
-
-    # Pressure correction, applied to the calibrated product and nothing else:
-    # everything above -- the bottle responses, the nodes, slope/intercept --
-    # is left on the uncorrected measurement, so this cannot move the
-    # calibration. A pressure of 0 or NaN yields no factor and therefore no
-    # value, which is why the resulting NaNs join `blanked` below.
-    pressure_factor = None
-    if pressure is not None:
-        p = pd.to_numeric(pressure.reindex(df.index), errors="coerce")
-        pressure_factor = pressure_target / p.where(p > 0)
-        calibrated = calibrated * pressure_factor
+    # `measured` is already P/T-corrected when the caller asked for it, and the
+    # nodes above came off the same series -- so slope/intercept are on that
+    # scale too and there is nothing left to multiply here.
+    calibrated = slope * measured + intercept
 
     # The trustworthy region is the INTERSECTION of the bottles' node spans,
     # not "first to last cal event": one bottle can lose its points to masking
@@ -969,11 +1130,11 @@ def calibrate_series(df, value_col, cal_points, cal_bottles, gas_key,
     excluded = _align(exclude_mask)
     non_ambient = flushed | in_cal
     blanked = non_ambient | excluded
-    if pressure_factor is not None:
-        # A row the correction could not be computed for is already NaN in
+    if correction_factor is not None:
+        # A row a correction could not be computed for is already NaN in
         # `calibrated`; joining `blanked` is what makes the trace break over
         # it instead of the row being dropped and drawn across.
-        blanked = blanked | pressure_factor.isna()
+        blanked = blanked | correction_factor.isna()
     if blanked.any():
         calibrated = calibrated.mask(blanked)
 
@@ -981,7 +1142,7 @@ def calibrate_series(df, value_col, cal_points, cal_bottles, gas_key,
         "ok": True, "reason": None, "mode": mode, "bottles": bottles,
         "low_state": low_state, "high_state": high_state,
         "slope": slope, "intercept": intercept, "calibrated": calibrated,
-        "pressure_factor": pressure_factor,
+        "correction_factor": correction_factor,
         "extrapolated": extrapolated, "flushed": flushed,
         "in_cal": in_cal, "excluded": excluded,
         "non_ambient": non_ambient, "blanked": blanked,
@@ -1078,19 +1239,14 @@ def calibration_uncertainty(result):
 
     bottles, slope = result["bottles"], result["slope"]
 
-    # The pressure correction is a pure scaling of the calibrated value, so it
-    # is divided back out before f is recovered (the blend of the two assigned
-    # values only holds on the uncorrected scale) and multiplied back into the
-    # answer at the end. The factor itself is treated as exact: the detector
-    # pressure carries its own measurement error, but nothing in the
-    # calibration constrains it, and inventing a number for it here would be
-    # the same mistake as inventing a missing <GAS>_unc.
-    factor = result.get("pressure_factor")
-    uncorrected = calibrated if factor is None else calibrated / factor
-
-    def rescale(sigma):
-        return sigma if factor is None else sigma * factor
-
+    # No P/T factor to unwind here any more (2026-07-31): the correction is
+    # applied to the measurement, so the whole calibration -- bottle responses,
+    # nodes, slope/intercept, residuals -- is already on the corrected scale and
+    # `calibrated` is directly the blend of the two assigned values. The factor
+    # is still treated as exact wherever it is described: the detector pressure
+    # and cell temperature each carry their own measurement error, but nothing
+    # in the calibration constrains either, and inventing a number for them
+    # would be the same mistake as inventing a missing <GAS>_unc.
     closure_rms = {}
     for _, state, closure, _ in result.get("residuals", []):
         closure_rms.setdefault(state, []).append(closure)
@@ -1115,18 +1271,18 @@ def calibration_uncertainty(result):
         s_a = bottles[low].get("assigned_unc") or 0.0
         s_r = response_sigma(low)
         sigma = pd.Series((s_a * s_a + s_r * s_r) ** 0.5, index=calibrated.index)
-        return rescale(sigma).mask(calibrated.isna()), components
+        return sigma.mask(calibrated.isna()), components
 
     a_lo, a_hi = bottles[low]["assigned"], bottles[high]["assigned"]
     s_a_lo = bottles[low].get("assigned_unc") or 0.0
     s_a_hi = bottles[high].get("assigned_unc") or 0.0
     s_r_lo, s_r_hi = response_sigma(low), response_sigma(high)
 
-    f = (uncorrected - a_lo) / (a_hi - a_lo)
+    f = (calibrated - a_lo) / (a_hi - a_lo)
     g = 1.0 - f
     var = ((g * s_a_lo) ** 2 + (f * s_a_hi) ** 2
            + (slope * g * s_r_lo) ** 2 + (slope * f * s_r_hi) ** 2)
-    return rescale(var.pow(0.5)).mask(calibrated.isna()), components
+    return var.pow(0.5).mask(calibrated.isna()), components
 
 
 # --------------------------------------------------------------------------
@@ -1343,18 +1499,40 @@ def companion_notes(gas_blocks, source_path=None, presync_rows=0):
                 f"not sampling air, or was sampling it in a state the masking "
                 f"settings exclude. The raw {block['value_col']} is untouched "
                 f"on every row, and {gas}_cal_slope/{gas}_cal_intercept are "
-                f"given everywhere, so a blank row can be recomputed.")
-            if block.get("pressure_corrected"):
+                f"given everywhere, so a blank row can be recomputed"
+                + (f" as slope * ({block['value_col']} * {gas}_pt_factor) + "
+                   f"intercept."
+                   if block.get("pt_corrected") else
+                   f" as slope * {block['value_col']} + intercept."))
+            if block.get("pt_corrected"):
                 # Stated as its own sentence, not folded into the one above:
-                # it changes what the number IS, and the slope/intercept
-                # recipe just given does not reproduce it without this step.
+                # the correction happens BEFORE the calibration, so it changes
+                # the slope and intercept themselves, not just the answer.
+                terms, targets = [], []
+                if block.get("pressure_corrected"):
+                    terms.append(
+                        f"{D1_P_TARGET_MBARS:.0f}/{block.get('pressure_col', 'P')}"
+                        + (f" (a {block['pressure_smooth_s']} s CENTRED rolling "
+                           f"mean of that column, no time shift, over the whole "
+                           f"flight)" if block.get("pressure_smooth_s") else ""))
+                    targets.append(f"{D1_P_TARGET_MBARS:.0f} mbar")
+                if block.get("temperature_corrected"):
+                    terms.append(
+                        f"({block.get('temperature_col', 'T_gas')} + "
+                        f"{KELVIN_OFFSET})/{T_GAS_TARGET_K:.0f}")
+                    targets.append(f"{T_GAS_TARGET_K:.0f} K")
                 notes.append(
-                    f"{gas}: {_column_for(block)} is pressure-corrected -- "
-                    f"scaled by {D1_P_TARGET_MBARS:.0f}/"
-                    f"{block.get('pressure_col', 'P')} to normalise every "
-                    f"value to the detector's {D1_P_TARGET_MBARS:.0f} mbar "
-                    f"spec pressure. Applied after the calibration, so "
-                    f"slope*raw+intercept gives the UNcorrected value.")
+                    f"{gas}: the measurement was normalised to the detector "
+                    f"cell's spec conditions ({' and '.join(targets)}) BEFORE "
+                    f"the calibration, by multiplying {block['value_col']} by "
+                    f"{gas}_pt_factor = {' * '.join(terms)}. The cal-bottle "
+                    f"means, the drift model and slope/intercept are therefore "
+                    f"all on that corrected scale. Note the two ratios are the "
+                    f"other way up from each other: number density goes as P/T, "
+                    f"so a cell holding gas at high pressure reads high and is "
+                    f"scaled down, while a cell running hot holds less and is "
+                    f"scaled up. The temperature column is degrees C and the "
+                    f"correction is in kelvin, hence the {KELVIN_OFFSET}.")
         elif block.get("final_kind") == "filtered":
             notes.append(
                 f"{gas}: {_column_for(block)} is {block['value_col']} "
@@ -1421,6 +1599,13 @@ def export_companion_csv(path, datetimes, gas_blocks, source_path=None,
         if include_coefficients and block.get("slope") is not None:
             columns[f"{gas}_cal_slope"] = block["slope"]
             columns[f"{gas}_cal_intercept"] = block["intercept"]
+            # The P/T multiplier belongs beside them: since 2026-07-31 the
+            # correction is applied to the MEASUREMENT, so
+            # slope*raw+intercept no longer reproduces the calibrated column
+            # without it. Written only when a correction was applied, so a
+            # file with no correction gains no column.
+            if block.get("pt_factor") is not None:
+                columns[f"{gas}_pt_factor"] = block["pt_factor"]
         if include_masks:
             for name, mask in block.get("masks", {}).items():
                 if mask is None:

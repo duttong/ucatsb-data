@@ -40,13 +40,14 @@ from ucatsb_analysis import (
     shade_intervals, cal_mean_points, load_cal_roster, load_cal_assignment,
     select_cal_bottles,
     most_common_serial, mean_std_label, calibrate_series, post_cal_flush_mask,
-    cal_switch_mask, below_floor_mask, O3_VALID_MIN_PPB, H2O_VALID_MIN_PPM,
+    cal_switch_mask, below_floor_mask, smooth_pressure, pt_correction_factor,
+    O3_VALID_MIN_PPB, H2O_VALID_MIN_PPM,
     box_stats, calibration_uncertainty, linear_fit,
     plot_calibration_panels,
     export_companion_csv, export_icartt, icartt_filename, icartt_time_base,
     DEFAULT_ICARTT_META,
     CALS_YAML_PATH, CAL_DRIFT_MODELS, CAL_DEFAULT_SMOOTH_EVENTS,
-    CAL_MERGE_GAP_S, D1_P_TARGET_MBARS,
+    CAL_MERGE_GAP_S, D1_P_TARGET_MBARS, T_GAS_TARGET_K,
     merge_ranges, add_ranges, subtract_ranges, ranges_to_mask, ranges_row_count,
     # The shared palette. These used to be declared a second time here, with
     # identical values -- two homes for one decision, agreeing only by
@@ -240,6 +241,8 @@ DEFAULT_GAS_SETTINGS = {
     "require_pumps": False,
     "pressure_tol_mbar": 10.0,
     "pressure_correct": False,
+    "pressure_smooth_s": 0,
+    "temperature_correct": False,
     "flag_air_s": 0,
     "cal1_window_s": [-15, -1],
     "cal2_window_s": [-15, -1],
@@ -1812,25 +1815,30 @@ class UcatsbGui(QMainWindow):
         self.pressure_tol_spin.setMaximumWidth(70)
         self.pressure_tol_spin.valueChanged.connect(self.on_control_changed)
 
-        # The correction shares the tolerance's row because it shares its
-        # input -- both are about the detector pressure, and the reading that
-        # decides whether a row is masked is the one this scales by.
-        # Labelled with the arithmetic rather than "Correct": it says exactly
-        # what the box does to the number, and it fits. Every candidate label
-        # was measured against the panel -- "Correct" and "×140/P" both push
-        # this group box past the 312 px the panel has.
+        # Both corrections sit on a "Correct:" row of their own (2026-07-31).
+        # 140/P used to share the tolerance's row, which was right while it was
+        # the only one -- it shares that row's input. With T/315 beside it the
+        # pair belongs together more than either belongs to the tolerance, and
+        # the arithmetic settles it anyway: tolerance + unit + two checkboxes
+        # asks ~330 px against the ~300 the group box has, and a row too wide
+        # for the panel clips its own right-hand edge in silence.
+        #
+        # Labelled with the arithmetic rather than a word: it says exactly what
+        # each box does to the number, and both fit. Every candidate label was
+        # measured against the panel -- "×140/P" pushed the box past 312.
         self.pressure_correct_check = QCheckBox(f"{D1_P_TARGET_MBARS:.0f}/P")
         self.pressure_correct_check.setToolTip(
-            f"Scale the CALIBRATED mole fraction by "
-            f"{D1_P_TARGET_MBARS:.0f}/P, normalising every reading to the\n"
-            f"detector's {D1_P_TARGET_MBARS:.0f} mbar spec pressure. P is that "
-            f"gas's own detector pressure\n(d1 for CO2/N2O, d2 for CH4), so "
-            f"this only exists for the Aeris gases.\n\n"
-            f"Applied to the calibrated product only: the cal-bottle "
-            f"responses, the drift model\nand the slope/intercept are all left "
-            f"on the uncorrected measurement, so turning\nthis on cannot move "
-            f"the calibration itself. It reaches the calibrated trace, the\n"
-            f"Correlations tab and both exports.\n\n"
+            f"Scale the MEASUREMENT by {D1_P_TARGET_MBARS:.0f}/P before "
+            f"calibrating it, normalising every\nreading to the detector's "
+            f"{D1_P_TARGET_MBARS:.0f} mbar spec pressure. P is that gas's own "
+            f"detector\npressure (d1 for CO2/N2O, d2 for CH4), so this only "
+            f"exists for the Aeris gases.\n\n"
+            f"Applied to the whole flight, cal periods included -- so the "
+            f"cal-bottle means\nare corrected too, and this DOES move the "
+            f"calibration: slope, intercept,\nspan gain and the residuals all "
+            f"change when it is toggled. That is the point.\nA cal injection "
+            f"measured at 138 mbar is put on the same footing as ambient\nair "
+            f"measured at 140 before it becomes a calibration node.\n\n"
             f"Off by default, so an existing config's numbers do not change "
             f"until it is asked for."
         )
@@ -1854,8 +1862,84 @@ class UcatsbGui(QMainWindow):
         pressure_row.addWidget(self.pressure_tol_spin)
         pressure_row.addWidget(pressure_unit)
         pressure_row.addStretch(1)
-        pressure_row.addWidget(self.pressure_correct_check)
         mask_form.addRow(pressure_label, pressure_row)
+
+        # Its own row rather than joining the one above: that row already asks
+        # ~267 px of the ~300 the group box has, and a spin box asks ~85
+        # whatever it holds. A row too wide for the panel clips its own
+        # right-hand edge in silence.
+        self.pressure_smooth_spin = QSpinBox()
+        self.pressure_smooth_spin.setRange(0, 300)
+        self.pressure_smooth_spin.setSuffix(" s")
+        self.pressure_smooth_spin.setToolTip(
+            f"Smooth the detector cell pressure over this many seconds before\n"
+            f"the {D1_P_TARGET_MBARS:.0f}/P correction divides by it, so the "
+            f"pressure sensor's own\nnoise is not added to the mole fraction "
+            f"(~0.07 mbar of scatter on d1 is\n~0.2 ppm of CO2). The window is "
+            f"a CENTRED mean, so it introduces no\ntime shift, and it runs "
+            f"over the whole flight -- air and cal alike, since\nthe "
+            f"correction applies to both.\n\n"
+            f"Keep it short (10-30 s gets most of the noise reduction there is "
+            f"to get). A\nlong window reads between the two levels either side "
+            f"of a solenoid\ntransition, where the cell steps by ~2 mbar.\n\n"
+            f"The smoothed trace is drawn in red over the raw one whenever "
+            f"'Above:' is\nshowing Detector Pressure, so the window can be "
+            f"judged against the real\nexcursions it has to keep.\n\n"
+            f"0 disables it, so an existing config's numbers do not change "
+            f"until it is\nasked for."
+        )
+        self.pressure_smooth_spin.setMaximumWidth(70)
+        self.pressure_smooth_spin.valueChanged.connect(self.on_control_changed)
+        smooth_p_row = QHBoxLayout()
+        smooth_p_row.setSpacing(4)
+        smooth_p_row.addWidget(self.pressure_smooth_spin)
+        smooth_p_row.addStretch(1)
+        smooth_p_label = QLabel("Smooth P:")
+        smooth_p_label.setToolTip(self.pressure_smooth_spin.toolTip())
+        mask_form.addRow(smooth_p_label, smooth_p_row)
+
+        # The temperature companion to 140/P. Deliberately NOT smoothed, on the
+        # PI's instruction and because the reading does not need it: d1_T_gas
+        # moves 0.34 C across
+        # the whole Jul 2026 flight where the pressure carries 0.16 mbar of
+        # sample-to-sample noise. There is nothing to filter out, so there is
+        # no "Smooth T" beside it.
+        self.temperature_correct_check = QCheckBox(f"T/{T_GAS_TARGET_K:.0f}")
+        self.temperature_correct_check.setToolTip(
+            f"Scale the MEASUREMENT by T/{T_GAS_TARGET_K:.0f} before "
+            f"calibrating it, normalising every\nreading to the cell's "
+            f"{T_GAS_TARGET_K:.0f} K spec temperature. T is that gas's own "
+            f"detector cell\ntemperature (d1_T_gas for CO2/N2O, d2_T_gas for "
+            f"CH4).\n\n"
+            f"Note the ratio is the other way up from 140/P -- it divides by "
+            f"the TARGET,\nnot by the reading. Number density goes as P/T, so "
+            f"a cell running hot holds\nless gas and the measurement is scaled "
+            f"up, where a cell running at high\npressure holds more and is "
+            f"scaled down.\n\n"
+            f"The arithmetic is in KELVIN: the column is degrees C, so "
+            f"273.15 is added\nfirst. A row with no reading gets no "
+            f"value, like 140/P.\n\n"
+            f"Like 140/P it is applied to the whole flight before the "
+            f"calibration, so it\nmoves the cal means and the calibration with "
+            f"them. The two multiply when\nboth are on, and reach the "
+            f"calibrated trace, the Correlations tab and both\nexports.\n\n"
+            f"Off by default, so an existing config's numbers do not change "
+            f"until it is\nasked for."
+        )
+        self.temperature_correct_check.toggled.connect(self.on_control_changed)
+
+        correct_row = QHBoxLayout()
+        correct_row.setSpacing(6)
+        correct_row.addWidget(self.pressure_correct_check)
+        correct_row.addWidget(self.temperature_correct_check)
+        correct_row.addStretch(1)
+        correct_label = QLabel("Correct:")
+        correct_label.setToolTip(
+            "Normalise the calibrated mole fraction to the detector cell's\n"
+            "spec conditions. Both are post-multipliers on the calibrated\n"
+            "product and neither can move the calibration itself."
+        )
+        mask_form.addRow(correct_label, correct_row)
 
         # Unlike the two masks above, this one does not touch the cal means
         # (the flush window is ambient by definition, never inside a cal
@@ -2615,6 +2699,9 @@ class UcatsbGui(QMainWindow):
         self.pressure_tol_spin.setValue(settings["pressure_tol_mbar"])
         self.pressure_correct_check.setChecked(
             bool(settings.get("pressure_correct", False)))
+        self.pressure_smooth_spin.setValue(settings.get("pressure_smooth_s", 0))
+        self.temperature_correct_check.setChecked(
+            bool(settings.get("temperature_correct", False)))
         self.flag_air_spin.setValue(settings["flag_air_s"])
         self.cal1_start_spin.setValue(settings["cal1_window_s"][0])
         self.cal1_end_spin.setValue(settings["cal1_window_s"][1])
@@ -2637,6 +2724,8 @@ class UcatsbGui(QMainWindow):
             "require_pumps": self.pumps_check.isChecked(),
             "pressure_tol_mbar": self.pressure_tol_spin.value(),
             "pressure_correct": self.pressure_correct_check.isChecked(),
+            "pressure_smooth_s": self.pressure_smooth_spin.value(),
+            "temperature_correct": self.temperature_correct_check.isChecked(),
             "flag_air_s": self.flag_air_spin.value(),
             "cal1_window_s": [self.cal1_start_spin.value(), self.cal1_end_spin.value()],
             "cal2_window_s": [self.cal2_start_spin.value(), self.cal2_end_spin.value()],
@@ -2666,8 +2755,17 @@ class UcatsbGui(QMainWindow):
         # 2026 file's d2 is a different instrument from the Feb 2025 one), so
         # it is checked per gas rather than once at load like `Pumps on`.
         # Set after mask_box's setEnabled, which Qt would otherwise override.
-        self.pressure_correct_check.setEnabled(
-            has_masking and self._pressure_column(gas) is not None)
+        # Same condition for the smoothing window: it exists to feed that
+        # correction (and to draw the trace it divides by), so a gas with no
+        # detector of its own has nothing for it to smooth.
+        has_detector = self._pressure_column(gas) is not None
+        self.pressure_correct_check.setEnabled(has_masking and has_detector)
+        self.pressure_smooth_spin.setEnabled(has_masking and has_detector)
+        # Checked separately: a flight's schema can carry one of the two
+        # columns and not the other, and the Feb 2025 d2 is a different
+        # instrument from the Jul 2026 one.
+        self.temperature_correct_check.setEnabled(
+            has_masking and self._temperature_column(gas) is not None)
         if has_masking:
             self._apply_settings_to_controls(self.config[gas])
         self._update_flag_readout()
@@ -2992,7 +3090,9 @@ class UcatsbGui(QMainWindow):
     # left out -- they are a judgement about that gas's cal record (how noisy
     # its injections are), not a description of the flight.
     COPIED_SETTING_KEYS = ("warmup_min", "end_flight_min", "require_pumps",
-                           "pressure_tol_mbar", "pressure_correct", "flag_air_s",
+                           "pressure_tol_mbar", "pressure_correct",
+                           "pressure_smooth_s", "temperature_correct",
+                           "flag_air_s",
                            "cal1_window_s", "cal2_window_s")
     COPY_SETTINGS_LABEL = "Copy settings to all gases"
 
@@ -3565,9 +3665,26 @@ class UcatsbGui(QMainWindow):
                 # A property of the delivered numbers, so both writers can say
                 # so -- a column of mole fractions normalised to 140 mbar is
                 # not the same quantity as one that is not.
-                block["pressure_corrected"] = (
-                    result.get("pressure_factor") is not None)
+                block["pressure_corrected"] = analysis["pressure_corrected"]
                 block["pressure_col"] = analysis["pressure_col"]
+                # Only when the correction is actually applied: with 140/P off
+                # the smoothing touches nothing in either delivered file, and a
+                # note describing a divisor nothing divided by would be worse
+                # than no note.
+                block["pressure_smooth_s"] = (
+                    analysis["pressure_smooth_s"]
+                    if block["pressure_corrected"] else 0)
+                block["temperature_corrected"] = analysis["temperature_corrected"]
+                block["temperature_col"] = analysis["temperature_col"]
+                # The factor goes in the CSV as its own column, because since
+                # the correction moved ahead of the calibration
+                # slope*raw+intercept no longer reproduces <gas>_cal without
+                # it -- and that recompute-a-blanked-row promise is the reason
+                # the coefficients are exported at all.
+                block["pt_corrected"] = result.get("correction_factor") is not None
+                block["pt_factor"] = (
+                    None if result.get("correction_factor") is None
+                    else self._to_raw_rows(result["correction_factor"]))
                 block["sigma"] = self._to_raw_rows(sigma)
                 block["slope"] = self._to_raw_rows(result["slope"])
                 block["intercept"] = self._to_raw_rows(result["intercept"])
@@ -3615,9 +3732,18 @@ class UcatsbGui(QMainWindow):
             gas = block["gas"]
             if block.get("final_kind") == "calibrated":
                 n = int(block["final"].notna().sum())
+                smooth_s = block.get("pressure_smooth_s") or 0
+                corrections = []
+                if block.get("pressure_corrected"):
+                    corrections.append(
+                        f"P to {D1_P_TARGET_MBARS:.0f} mbar"
+                        + (f" [{smooth_s} s mean]" if smooth_s else ""))
+                if block.get("temperature_corrected"):
+                    corrections.append(f"T to {T_GAS_TARGET_K:.0f} K")
                 lines.append(f"{gas:<6} calibrated      {n:>7,} good ambient rows"
-                             + (f"   (P-corrected to {D1_P_TARGET_MBARS:.0f} mbar)"
-                                if block.get("pressure_corrected") else ""))
+                             + (f"   (normalised before calibrating: "
+                                f"{', '.join(corrections)})"
+                                if corrections else ""))
             elif block.get("final_kind") == "filtered":
                 n = int(block["final"].notna().sum())
                 removed = int(block["masks"]["below_floor"].sum())
@@ -3934,8 +4060,49 @@ class UcatsbGui(QMainWindow):
         # The column the pressure correction will divide by, or None when it
         # is switched off (or the gas has no detector of its own). Resolved
         # here so every view can name it without re-deriving the rule.
-        pressure_col = (self._pressure_column(gas_key)
+        detector_col = self._pressure_column(gas_key)
+        pressure_col = (detector_col
                         if settings.get("pressure_correct", False) else None)
+
+        # The smoothed cell pressure, over the WHOLE flight -- air and cal
+        # alike (2026-07-31). Computed whenever a window is set and this gas
+        # has a detector, NOT only when the correction is on: the aux panel
+        # draws it over the raw trace, which is how the window gets chosen in
+        # the first place. See smooth_pressure for why the air/cal split went.
+        smooth_s = settings.get("pressure_smooth_s", 0)
+        pressure_smoothed = None
+        if detector_col is not None and smooth_s:
+            pressure_smoothed = smooth_pressure(
+                df["datetime"], df[detector_col], smooth_s)
+        # What the correction actually divides by: smoothed when there is a
+        # window, the raw column when there is not, None when the correction
+        # is off. One key, so no call site has to re-derive that choice.
+        pressure_series = None
+        if pressure_col is not None:
+            pressure_series = (df[pressure_col] if pressure_smoothed is None
+                               else pressure_smoothed)
+
+        # The temperature correction's column, or None when it is off. Not
+        # smoothed: the cell temperature is already smooth (see the checkbox's
+        # tooltip), so the raw column is what T/315 is taken from.
+        temperature_col = (self._temperature_column(gas_key)
+                           if settings.get("temperature_correct", False)
+                           else None)
+
+        # THE CORRECTION IS APPLIED TO THE MEASUREMENT, before anything else
+        # (2026-07-31). `corrected` is what the cal means are averaged from and
+        # what gets calibrated, so the bottle responses, the drift nodes,
+        # slope/intercept and span_gain are all on the corrected scale -- the
+        # correction now moves the calibration, deliberately. Built once, here,
+        # and handed to both cal_mean_points and calibrate_series so the two
+        # cannot end up on different scales.
+        correction = pt_correction_factor(
+            pressure=pressure_series,
+            temperature_c=(None if temperature_col is None else df[temperature_col]),
+        )
+        value_col = gas["value_col"]
+        corrected = (df[value_col] if correction is None
+                     else df[value_col] * correction)
 
         warmup_end = df["datetime"].iloc[0] + pd.Timedelta(minutes=warmup_minutes)
         warmup = df["datetime"] < warmup_end
@@ -3986,15 +4153,16 @@ class UcatsbGui(QMainWindow):
             post_cal_flush = post_cal_flush_mask(
                 df["datetime"], cal_intervals, flag_air_s, cal_mask=not_air
             )
-            # Cal means are estimated from the raw data with these masks
-            # applied -- a cal point can be dropped entirely if its window
-            # has no valid data.
+            # Cal means are estimated with these masks applied -- a cal point
+            # can be dropped entirely if its window has no valid data -- and
+            # from the P/T-CORRECTED measurement, which is what makes the
+            # correction reach the calibration itself.
             cal_points = cal_mean_points(
-                df, cal_intervals, gas["value_col"],
+                df, cal_intervals, value_col,
                 tuple(settings["cal1_window_s"]),
                 tuple(settings["cal2_window_s"]),
                 cal_bottles=self.cal_bottles, gas_key=gas_key,
-                exclude_mask=exclude_mask,
+                exclude_mask=exclude_mask, values=corrected,
             )
 
         self._analysis[gas_key] = {
@@ -4018,6 +4186,18 @@ class UcatsbGui(QMainWindow):
             # the column has to exist for this gas on this flight.
             "pressure_corrected": pressure_col is not None,
             "pressure_col": pressure_col,
+            "detector_col": detector_col,
+            "pressure_smooth_s": smooth_s if pressure_smoothed is not None else 0,
+            "pressure_smoothed": pressure_smoothed,
+            "pressure_series": pressure_series,
+            "temperature_corrected": temperature_col is not None,
+            "temperature_col": temperature_col,
+            # The multiplier and the corrected measurement it produced. Both
+            # travel in the analysis so the calibration, the exports and the
+            # notes all read the identical numbers rather than each rebuilding
+            # them from the settings.
+            "correction_factor": correction,
+            "corrected": corrected,
             "flag_air_s": flag_air_s,
         }
         return self._analysis[gas_key]
@@ -4264,11 +4444,47 @@ class UcatsbGui(QMainWindow):
             # record itself, which is what both exports ship, so the figure
             # would otherwise show a raw trace with no hint that the product
             # behind it has been rescaled.
-            if analysis["pressure_corrected"]:
+            # One line for both corrections, since they are one operation on
+            # the number as far as this figure is concerned -- and because a
+            # line each would push the note block up over the data.
+            if analysis["pressure_corrected"] or analysis["temperature_corrected"]:
+                scaled_to, terms = [], []
+                if analysis["pressure_corrected"]:
+                    # The smoothing is named here rather than in a line of its
+                    # own: it is a property of the P this scales by, and off
+                    # the Detector Pressure panel it has no other visible
+                    # effect.
+                    smooth_s = analysis["pressure_smooth_s"]
+                    scaled_to.append(f"{D1_P_TARGET_MBARS:.0f} mbar")
+                    terms.append(
+                        f"{D1_P_TARGET_MBARS:.0f}/{analysis['pressure_col']}"
+                        # Just "[30 s mean]": with both corrections on, this
+                        # line is already the widest thing on the figure, and
+                        # the tooltip and the export notes carry the full
+                        # "centred, whole flight" description.
+                        + (f" [{smooth_s} s mean]" if smooth_s else ""))
+                if analysis["temperature_corrected"]:
+                    scaled_to.append(f"{T_GAS_TARGET_K:.0f} K")
+                    terms.append(
+                        f"{analysis['temperature_col']}(K)/{T_GAS_TARGET_K:.0f}")
+                # "measurement ... before calibrating", not "calibrated values
+                # scaled": since 2026-07-31 the correction lands on the input,
+                # so it moves the cal means and the calibration with them. The
+                # cal-mean dots on this figure are the corrected values, drawn
+                # over the raw trace -- said out loud, because they no longer
+                # sit exactly on it.
+                #
+                # TWO lines: with both corrections and a smoothing window this
+                # runs to ~150 characters, and a note wider than the Axes runs
+                # off the right-hand edge (it is in_layout=False, so nothing
+                # makes room for it). The widest other line here is ~85.
                 notes.append(
-                    f"calibrated values scaled to {D1_P_TARGET_MBARS:.0f} mbar "
-                    f"(×{D1_P_TARGET_MBARS:.0f}/{analysis['pressure_col']}); "
-                    f"raw trace unchanged"
+                    f"measurement normalised to {' and '.join(scaled_to)} "
+                    f"before calibrating; raw trace unchanged"
+                )
+                notes.append(
+                    f"  ×{' ×'.join(terms)}; cal means shown are the "
+                    f"corrected ones"
                 )
         # Outside the has_masking gate on purpose: Ozone has no masking
         # settings at all, and this is the one thing removing data from its
@@ -4360,7 +4576,14 @@ class UcatsbGui(QMainWindow):
                                        ax_aux, df["datetime"], df[aux_col], aux_unit)
 
             aux_data = df[["datetime", aux_col]].dropna()
-            aux_line, = ax_aux.plot(aux_data["datetime"], aux_data[aux_col], color=LINE_COLOR, linewidth=1.0)
+            # Faded only when the smoothed trace is drawn over it, the same
+            # rule the calibrated overlay follows: the two are told apart by
+            # hue, and a lone raw trace is not dimmed for nothing.
+            smoothed_p = (analysis["pressure_smoothed"]
+                          if aux_col == analysis["detector_col"] else None)
+            aux_line, = ax_aux.plot(
+                aux_data["datetime"], aux_data[aux_col], color=LINE_COLOR,
+                linewidth=1.0, alpha=0.55 if smoothed_p is not None else 1.0)
 
             ax_aux.set_ylabel(aux_ylabel, color=TEXT_COLOR, fontsize=9)
             aux_title = self.other_column if self.aux_selection == "Other" else self.aux_selection
@@ -4372,6 +4595,21 @@ class UcatsbGui(QMainWindow):
 
             aux_handles = [aux_line]
             aux_labels = [aux_col]
+            # On the same axis, deliberately: the point of drawing it is to
+            # see how the mean sits against the reading it replaces, which a
+            # second scale would make impossible to judge.
+            if smoothed_p is not None:
+                self._register_stats_trace(
+                    "aux:smoothed", f"{aux_col} smoothed (above, left)",
+                    ax_aux, df["datetime"], smoothed_p, aux_unit)
+                smooth_data = pd.DataFrame(
+                    {"datetime": df["datetime"], "p": smoothed_p}).dropna()
+                smooth_line, = ax_aux.plot(
+                    smooth_data["datetime"], smooth_data["p"],
+                    color=CALIBRATED_COLOR, linewidth=1.0)
+                aux_handles.append(smooth_line)
+                aux_labels.append(
+                    f"{analysis['pressure_smooth_s']} s centred mean")
             if has_right_axis:
                 ax_aux2 = ax_aux.twinx()
                 self._register_stats_trace(
@@ -4388,7 +4626,10 @@ class UcatsbGui(QMainWindow):
                 aux_handles.append(right_line)
                 aux_labels.append(self.right_axis_column)
 
-            if has_right_axis:
+            # Drawn whenever there is more than one trace up there to tell
+            # apart, which the right-hand axis is no longer the only way to
+            # get: the smoothed pressure is a second line on the same axis.
+            if len(aux_handles) > 1:
                 ax_aux.legend(aux_handles, aux_labels, loc="upper right",
                               fontsize=8, framealpha=0.9).set_in_layout(False)
 
@@ -4473,11 +4714,13 @@ class UcatsbGui(QMainWindow):
             # same mask separately fed cal_mean_points above, which is what
             # affects the calibration; this use cannot.
             exclude_mask=analysis["exclude_mask"],
-            # Likewise output-only: scaling the calibrated value by 140/P.
-            # None when the box is unchecked, which is also what makes the
-            # setting invisible in every number the Calibration tab shows.
-            pressure=(None if analysis["pressure_col"] is None
-                      else self.df[analysis["pressure_col"]]),
+            # The P/T-corrected measurement, and the factor that produced it.
+            # The SAME series fed cal_mean_points above, so the nodes and the
+            # record being calibrated are on one scale by construction. The
+            # factor is only described and used for blanking here -- it has
+            # already been applied.
+            values=analysis["corrected"],
+            correction_factor=analysis["correction_factor"],
         )
         return self._calibration[gas_key]
 
@@ -4495,6 +4738,23 @@ class UcatsbGui(QMainWindow):
         if detector is None or self.df is None:
             return None
         col = f"{detector}_P_mbars"
+        return col if col in self.df.columns else None
+
+    def _temperature_column(self, gas_key):
+        """The detector cell temperature column this gas's T/315 correction is
+        taken from, or None when the gas has no detector or the file has no
+        such column. Per gas for the same reason as _pressure_column: CH4 comes
+        off the second Aeris head, and its cell runs at a different temperature
+        (40.8 C against d1's 42.3 C on the Jul 2026 flight).
+
+        The column is in degrees CELSIUS; the correction is in kelvin. That
+        conversion lives in calibrate_series, so this returns the column name
+        and nothing else.
+        """
+        detector = GASES[gas_key].get("detector")
+        if detector is None or self.df is None:
+            return None
+        col = f"{detector}_T_gas"
         return col if col in self.df.columns else None
 
     def _uncertainty_for(self, gas_key):
@@ -4817,12 +5077,15 @@ class UcatsbGui(QMainWindow):
         # One line for both axes when they agree, since the usual case is the
         # correction being on everywhere. `has_masking` first, like every
         # other note here that assumes a calibration exists.
-        corrected = [gas for gas in dict.fromkeys((x_gas, y_gas))
-                     if GASES[gas].get("has_masking", True)
-                     and self._analysis_for(gas)["pressure_corrected"]]
-        if corrected:
-            notes.append(f"{', '.join(corrected)} scaled to "
-                         f"{D1_P_TARGET_MBARS:.0f} mbar (pressure correction)")
+        for key, target, what in (
+                ("pressure_corrected", f"{D1_P_TARGET_MBARS:.0f} mbar", "pressure"),
+                ("temperature_corrected", f"{T_GAS_TARGET_K:.0f} K", "temperature")):
+            corrected = [gas for gas in dict.fromkeys((x_gas, y_gas))
+                         if GASES[gas].get("has_masking", True)
+                         and self._analysis_for(gas)[key]]
+            if corrected:
+                notes.append(f"{', '.join(corrected)} normalised to {target} "
+                             f"before calibrating ({what} correction)")
         # The fit summary rides in this block rather than in a legend: a
         # legend has to sit somewhere, and on a scatter that fills one corner
         # it lands either on the data or on this text.
