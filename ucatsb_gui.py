@@ -1447,12 +1447,95 @@ class UcatsbGui(QMainWindow):
         corr_flag_form.addLayout(corr_flag_buttons)
         vbox.addWidget(self.corr_flag_box)
 
+        self.corr_cal_box = QGroupBox("Calibration Settings")
+        corr_cal_form = QFormLayout(self.corr_cal_box)
+        corr_cal_form.setContentsMargins(6, 6, 6, 6)
+        corr_cal_form.setSpacing(4)
+        corr_cal_form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+
+        self.corr_cal_target = QComboBox()
+        self.corr_cal_target.setToolTip(
+            "Which correlation-axis tracer these calibration settings edit.\n"
+            "They are the same per-gas settings used on the Calibration tab."
+        )
+        self.corr_cal_target.currentIndexChanged.connect(
+            self.on_corr_cal_target_changed)
+        corr_cal_form.addRow("Tracer:", self.corr_cal_target)
+
+        self.corr_pressure_correct_check = QCheckBox(f"{D1_P_TARGET_MBARS:.0f}/P")
+        self.corr_pressure_correct_check.setToolTip(self.pressure_correct_check.toolTip())
+        self.corr_pressure_correct_check.toggled.connect(self.on_corr_cal_control_changed)
+        self.corr_temperature_correct_check = QCheckBox(f"T/{T_GAS_TARGET_K:.0f}")
+        self.corr_temperature_correct_check.setToolTip(
+            self.temperature_correct_check.toolTip())
+        self.corr_temperature_correct_check.toggled.connect(
+            self.on_corr_cal_control_changed)
+        corr_correct_row = QHBoxLayout()
+        corr_correct_row.setSpacing(6)
+        corr_correct_row.addWidget(self.corr_pressure_correct_check)
+        corr_correct_row.addWidget(self.corr_temperature_correct_check)
+        corr_correct_row.addStretch(1)
+        corr_correct_label = QLabel("Correct:")
+        corr_correct_label.setToolTip(self.pressure_correct_check.toolTip())
+        corr_cal_form.addRow(corr_correct_label, corr_correct_row)
+
+        self.corr_pressure_smooth_spin = QSpinBox()
+        self.corr_pressure_smooth_spin.setRange(0, 300)
+        self.corr_pressure_smooth_spin.setSuffix(" s")
+        self.corr_pressure_smooth_spin.setMaximumWidth(70)
+        self.corr_pressure_smooth_spin.setToolTip(self.pressure_smooth_spin.toolTip())
+        self.corr_pressure_smooth_spin.valueChanged.connect(
+            self.on_corr_cal_control_changed)
+        corr_smooth_p_row = QHBoxLayout()
+        corr_smooth_p_row.setSpacing(4)
+        corr_smooth_p_row.addWidget(self.corr_pressure_smooth_spin)
+        corr_smooth_p_row.addStretch(1)
+        corr_smooth_p_label = QLabel("Smooth P:")
+        corr_smooth_p_label.setToolTip(self.pressure_smooth_spin.toolTip())
+        corr_cal_form.addRow(corr_smooth_p_label, corr_smooth_p_row)
+
+        corr_drift_row = QHBoxLayout()
+        corr_drift_row.setSpacing(4)
+        corr_drift_label = QLabel("Model:")
+        corr_drift_label.setToolTip(self.drift_combo.toolTip())
+        corr_drift_row.addWidget(corr_drift_label)
+        self.corr_drift_combo = QComboBox()
+        self.corr_drift_combo.addItems(CAL_DRIFT_MODELS)
+        self.corr_drift_combo.setToolTip(self.drift_combo.toolTip())
+        self.corr_drift_combo.currentTextChanged.connect(
+            self.on_corr_cal_control_changed)
+        corr_drift_row.addWidget(self.corr_drift_combo, 1)
+
+        self.corr_smooth_spin = QSpinBox()
+        self.corr_smooth_spin.setRange(2, 21)
+        self.corr_smooth_spin.setSuffix(" ev")
+        self.corr_smooth_spin.setMaximumWidth(72)
+        self.corr_smooth_spin.setToolTip(self.smooth_spin.toolTip())
+        self.corr_smooth_spin.valueChanged.connect(self.on_corr_cal_control_changed)
+        corr_drift_row.addWidget(self.corr_smooth_spin)
+
+        self.corr_fixed_slope_spin = QDoubleSpinBox()
+        self.corr_fixed_slope_spin.setRange(0.0, 10.0)
+        self.corr_fixed_slope_spin.setDecimals(4)
+        self.corr_fixed_slope_spin.setSingleStep(0.001)
+        self.corr_fixed_slope_spin.setSpecialValueText("auto")
+        self.corr_fixed_slope_spin.setMaximumWidth(88)
+        self.corr_fixed_slope_spin.setToolTip(self.fixed_slope_spin.toolTip())
+        self.corr_fixed_slope_spin.valueChanged.connect(
+            self.on_corr_cal_control_changed)
+        self.corr_fixed_slope_spin.setVisible(False)
+        corr_drift_row.addWidget(self.corr_fixed_slope_spin)
+        corr_cal_form.addRow(corr_drift_row)
+
+        vbox.addWidget(self.corr_cal_box)
+
         self.corr_note = QLabel(
             "Calibrated data wherever there is a calibration. A point needs a "
             "value in <i>both</i> tracers, so each gas's own masking, cal "
             "periods and post-cal flush all remove points. Ozone has no cal "
             "bottles, so it is plotted as recorded (<tt>oz_o3best</tt>) and "
-            "gets no error bars. Settings for each gas stay on the other tabs."
+            "gets no error bars. The calibration settings here edit whichever "
+            "axis tracer is selected."
         )
         self.corr_note.setWordWrap(True)
         self.corr_note.setStyleSheet(f"color: {MUTED_COLOR};")
@@ -1506,6 +1589,7 @@ class UcatsbGui(QMainWindow):
                 combo.setCurrentText(current)
             combo.blockSignals(False)
         self._populate_corr_flag_target()
+        self._populate_corr_cal_target()
 
     def _rebuild_cal_bottles(self):
         """The two tanks matching is allowed to consider, from the current
@@ -1687,6 +1771,7 @@ class UcatsbGui(QMainWindow):
             return
         self._load_flight_config(self.csv_path)
         self._select_gas(self.current_gas)
+        self._sync_corr_cal_controls()
         self._update_tank_readout()
         self.refresh()
 
@@ -2079,16 +2164,18 @@ class UcatsbGui(QMainWindow):
         # four decimals. At "Drift model:" the row asked 305 of the 312 the
         # panel has and the spin silently rendered 1.0367 as "1.036". The stored
         # key is still `drift_model`, so no saved config is disturbed.
-        drift_label = QLabel("Model:")
-        drift_label.setToolTip(
+        drift_tip = (
             "How the per-injection cal means become a calibration.\n\n"
             "linear / smooth / constant shape each bottle's response in time\n"
             "and solve the two-point line at every sample. 'fixed slope' pins\n"
             "the gain instead and fits only the intercept to the tanks."
         )
+        drift_label = QLabel("Model:")
+        drift_label.setToolTip(drift_tip)
         drift_row.addWidget(drift_label)
         self.drift_combo = QComboBox()
         self.drift_combo.addItems(CAL_DRIFT_MODELS)
+        self.drift_combo.setToolTip(drift_tip)
         self.drift_combo.currentTextChanged.connect(self.on_control_changed)
         drift_row.addWidget(self.drift_combo, 1)
 
@@ -2906,10 +2993,12 @@ class UcatsbGui(QMainWindow):
         self.drift_smooth_events = settings["drift_smooth_events"]
         self.fixed_slope = settings["fixed_slope"]
         self._show_drift_extra(self.drift_model)
+        if hasattr(self, "corr_cal_target") and self._corr_cal_gas() == self.current_gas:
+            self._sync_corr_cal_controls()
         self._mark_dirty()
         self.refresh(preserve_view=True)
 
-    def _seed_fixed_slope(self):
+    def _seed_fixed_slope(self, gas_key=None, spin=None):
         """Put the constant model's slope in the box when "fixed slope" is
         first chosen, so the user starts from the flight's own gain instead of
         an empty field.
@@ -2925,13 +3014,15 @@ class UcatsbGui(QMainWindow):
         Leaves the box at "auto" when there is no usable span (one bottle, or
         no calibration at all); calibrate_series falls back the same way.
         """
-        result = self._calibration_for(self.current_gas) or {}
+        gas_key = gas_key or self.current_gas
+        spin = spin or self.fixed_slope_spin
+        result = self._calibration_for(gas_key) or {}
         span_gain = result.get("span_gain") if result.get("ok") else None
         if not span_gain:
             return
-        self.fixed_slope_spin.blockSignals(True)
-        self.fixed_slope_spin.setValue(1.0 / span_gain)
-        self.fixed_slope_spin.blockSignals(False)
+        spin.blockSignals(True)
+        spin.setValue(1.0 / span_gain)
+        spin.blockSignals(False)
 
     def _current_state(self):
         """Everything a config file holds, as comparable plain data."""
@@ -3177,6 +3268,7 @@ class UcatsbGui(QMainWindow):
             return
         self._apply_config_file(Path(path_str))
         self._select_gas(self.current_gas)
+        self._sync_corr_cal_controls()
         self._update_tank_readout()
         self.refresh()
 
@@ -3283,10 +3375,116 @@ class UcatsbGui(QMainWindow):
         else:
             self.corr_y_gas = gas_key
         self._populate_corr_flag_target()
+        self._populate_corr_cal_target()
         # A different tracer is a different set of numbers on that axis, so
         # the old limits mean nothing -- rescale, as a gas change does on the
         # timeseries.
         self._refresh_corr(preserve_view=False)
+
+    def _populate_corr_cal_target(self):
+        """Rebuild the settings target from the current X/Y tracers.
+
+        These controls edit saved per-gas calibration settings, so there is no
+        "both" entry: a drift model or P/T correction belongs to one tracer's
+        calibration at a time.
+        """
+        if not hasattr(self, "corr_cal_target"):
+            return
+        previous = self.corr_cal_target.currentData()
+        entries = []
+        if self.corr_y_gas:
+            entries.append(("y", f"{self.corr_y_gas}  (Y axis)"))
+        if self.corr_x_gas and self.corr_x_gas != self.corr_y_gas:
+            entries.append(("x", f"{self.corr_x_gas}  (X axis)"))
+        loading = self._loading
+        self._loading = True
+        self.corr_cal_target.clear()
+        for role, label in entries:
+            self.corr_cal_target.addItem(label, role)
+        index = self.corr_cal_target.findData(previous)
+        self.corr_cal_target.setCurrentIndex(index if index >= 0 else 0)
+        self._loading = loading
+        self._sync_corr_cal_controls()
+
+    def _corr_cal_gas(self):
+        role = self.corr_cal_target.currentData() or "y"
+        return self.corr_x_gas if role == "x" else self.corr_y_gas
+
+    def on_corr_cal_target_changed(self, _index):
+        if self._loading or self._initializing:
+            return
+        self._sync_corr_cal_controls()
+
+    def _sync_corr_cal_controls(self):
+        gas = self._corr_cal_gas()
+        has_settings = bool(gas and GASES[gas].get("has_masking", True))
+        self.corr_cal_box.setEnabled(True)
+        if not has_settings:
+            for widget in (
+                    self.corr_pressure_correct_check,
+                    self.corr_pressure_smooth_spin,
+                    self.corr_temperature_correct_check,
+                    self.corr_drift_combo,
+                    self.corr_smooth_spin,
+                    self.corr_fixed_slope_spin):
+                widget.setEnabled(False)
+            return
+        settings = self.config.get(gas, DEFAULT_GAS_SETTINGS)
+        loading = self._loading
+        self._loading = True
+        self.corr_pressure_correct_check.setChecked(
+            bool(settings.get("pressure_correct", False)))
+        self.corr_pressure_smooth_spin.setValue(settings.get("pressure_smooth_s", 0))
+        self.corr_temperature_correct_check.setChecked(
+            bool(settings.get("temperature_correct", False)))
+        self.corr_drift_combo.setCurrentText(settings["drift_model"])
+        self.corr_smooth_spin.setValue(settings["drift_smooth_events"])
+        self.corr_fixed_slope_spin.setValue(settings.get("fixed_slope", 0.0))
+        self._show_corr_drift_extra(settings["drift_model"])
+        self._loading = loading
+        self._update_corr_cal_enabled(gas)
+
+    def _update_corr_cal_enabled(self, gas):
+        has_detector = self._pressure_column(gas) is not None
+        self.corr_pressure_correct_check.setEnabled(has_detector)
+        self.corr_pressure_smooth_spin.setEnabled(has_detector)
+        self.corr_temperature_correct_check.setEnabled(
+            self._temperature_column(gas) is not None)
+        self.corr_drift_combo.setEnabled(True)
+        self._show_corr_drift_extra(self.corr_drift_combo.currentText())
+
+    def _show_corr_drift_extra(self, model):
+        pinned = model == "fixed slope"
+        self.corr_fixed_slope_spin.setVisible(pinned)
+        self.corr_fixed_slope_spin.setEnabled(pinned)
+        self.corr_smooth_spin.setVisible(not pinned)
+        self.corr_smooth_spin.setEnabled(model == "smooth")
+
+    def on_corr_cal_control_changed(self):
+        if self._loading or self._initializing:
+            return
+        gas = self._corr_cal_gas()
+        if not gas or not GASES[gas].get("has_masking", True):
+            return
+        if (self.corr_drift_combo.currentText() == "fixed slope"
+                and self.config[gas].get("drift_model") != "fixed slope"
+                and not self.corr_fixed_slope_spin.value()):
+            self._seed_fixed_slope(gas_key=gas, spin=self.corr_fixed_slope_spin)
+        settings = copy.deepcopy(self.config[gas])
+        settings.update({
+            "pressure_correct": self.corr_pressure_correct_check.isChecked(),
+            "pressure_smooth_s": self.corr_pressure_smooth_spin.value(),
+            "temperature_correct": self.corr_temperature_correct_check.isChecked(),
+            "drift_model": self.corr_drift_combo.currentText(),
+            "drift_smooth_events": self.corr_smooth_spin.value(),
+            "fixed_slope": self.corr_fixed_slope_spin.value(),
+        })
+        self.config[gas] = settings
+        self._show_corr_drift_extra(settings["drift_model"])
+        if gas == self.current_gas:
+            self._apply_settings_to_controls(settings)
+        self._mark_dirty()
+        self.refresh(preserve_view=True)
 
     def _populate_corr_flag_target(self):
         """Rebuild the "Flag applies to" choices for the current pair.
@@ -3495,6 +3693,7 @@ class UcatsbGui(QMainWindow):
         # -- swapping the axes should not silently retarget the flag tool from
         # the tracer you were working on to the other one.
         self._populate_corr_flag_target()
+        self._populate_corr_cal_target()
         self._refresh_corr(preserve_view=False)
 
     def on_corr_color_changed(self):
@@ -4105,6 +4304,8 @@ class UcatsbGui(QMainWindow):
         # Correlations tab, the per-gas panel for everything else.
         self.controls_stack.setCurrentIndex(
             1 if self.tabs.currentWidget() is self.corr_pane else 0)
+        if self.tabs.currentWidget() is self.corr_pane:
+            self._sync_corr_cal_controls()
         if self._initializing:
             return
         self._draw_current_tab()
