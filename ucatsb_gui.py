@@ -240,7 +240,7 @@ DEFAULT_GAS_SETTINGS = {
     "warmup_min": 30,
     "end_flight_min": 0,
     "require_pumps": False,
-    "pressure_tol_mbar": 10.0,
+    "pressure_tol_mbar": 0.4,
     "pressure_correct": False,
     "pressure_smooth_s": 0,
     "temperature_correct": False,
