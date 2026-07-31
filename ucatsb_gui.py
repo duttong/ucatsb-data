@@ -248,6 +248,10 @@ DEFAULT_GAS_SETTINGS = {
     "cal2_window_s": [-15, -1],
     "drift_model": CAL_DRIFT_MODELS[0],
     "drift_smooth_events": CAL_DEFAULT_SMOOTH_EVENTS,
+    # 0 = "use the slope the constant model gives" (= 1/span_gain). Read only
+    # under the "fixed slope" model, so the default is inert for every config
+    # that predates it.
+    "fixed_slope": 0.0,
 }
 
 
@@ -971,6 +975,7 @@ class UcatsbGui(QMainWindow):
         self._stats_traces = {}
         self.drift_model = DEFAULT_GAS_SETTINGS["drift_model"]
         self.drift_smooth_events = DEFAULT_GAS_SETTINGS["drift_smooth_events"]
+        self.fixed_slope = DEFAULT_GAS_SETTINGS["fixed_slope"]
         self.show_calibrated = False
         # "export" joins the plot panes so the tab's readiness summary is
         # invalidated by refresh() like everything else -- the masking
@@ -2066,7 +2071,22 @@ class UcatsbGui(QMainWindow):
         # combo's stretch -- the label silently vanished.
         drift_row = QHBoxLayout()
         drift_row.setSpacing(4)
-        drift_row.addWidget(QLabel("Drift model:"))
+        # "Model:" rather than "Drift model:" since "fixed slope" joined the
+        # list: that entry says nothing about the drift nodes, it pins the gain,
+        # and inside a box already titled "Calibration" the one word is enough.
+        # The 46 px it gives back is not decoration either -- "fixed slope" is
+        # 83 px of text plus a dropdown arrow, and the slope spin needs room for
+        # four decimals. At "Drift model:" the row asked 305 of the 312 the
+        # panel has and the spin silently rendered 1.0367 as "1.036". The stored
+        # key is still `drift_model`, so no saved config is disturbed.
+        drift_label = QLabel("Model:")
+        drift_label.setToolTip(
+            "How the per-injection cal means become a calibration.\n\n"
+            "linear / smooth / constant shape each bottle's response in time\n"
+            "and solve the two-point line at every sample. 'fixed slope' pins\n"
+            "the gain instead and fits only the intercept to the tanks."
+        )
+        drift_row.addWidget(drift_label)
         self.drift_combo = QComboBox()
         self.drift_combo.addItems(CAL_DRIFT_MODELS)
         self.drift_combo.currentTextChanged.connect(self.on_control_changed)
@@ -2085,6 +2105,39 @@ class UcatsbGui(QMainWindow):
         self.smooth_spin.valueChanged.connect(self.on_control_changed)
         self.smooth_spin.setMaximumWidth(72)
         drift_row.addWidget(self.smooth_spin)
+
+        # Shares the smoothing window's slot rather than taking one of its own:
+        # each model needs at most one number, and the label + combo + TWO spin
+        # boxes do not fit the 300 px panel. Exactly one is visible at a time
+        # (_show_drift_extra), so the row never grows.
+        self.fixed_slope_spin = QDoubleSpinBox()
+        self.fixed_slope_spin.setRange(0.0, 10.0)
+        self.fixed_slope_spin.setDecimals(4)
+        self.fixed_slope_spin.setSingleStep(0.001)
+        # 0 reads "auto" rather than as a slope of zero, which would calibrate
+        # every reading to a constant. It is the value that means "whatever the
+        # constant model gives", and typing it is how you get back there after
+        # nudging the number.
+        self.fixed_slope_spin.setSpecialValueText("auto")
+        self.fixed_slope_spin.setToolTip(
+            'The gain held fixed by the "fixed slope" model, with the\n'
+            "intercept then fitted to the cal tanks at every point in time.\n\n"
+            "Seeded from the slope the constant model gives (= 1/span gain)\n"
+            "when you pick the model, and editable from there. 0 shows as\n"
+            '"auto" and means exactly that seed, recomputed per flight.\n\n'
+            "With two tanks the intercept cannot satisfy both unless this\n"
+            "matches their own span, so it splits the difference -- the\n"
+            "leftover shows up in the residuals panel, which is where to\n"
+            "judge the number you have chosen."
+        )
+        self.fixed_slope_spin.valueChanged.connect(self.on_control_changed)
+        # 88, not the 72 the smoothing spin uses: four decimals plus the step
+        # arrows need it, and at 72 the box rendered 1.0367 as "1.036" -- the
+        # exact silent-truncation failure the panel-width note warns about.
+        # Measured against the rendered widget, not guessed.
+        self.fixed_slope_spin.setMaximumWidth(88)
+        self.fixed_slope_spin.setVisible(False)
+        drift_row.addWidget(self.fixed_slope_spin)
         cal_grid.addLayout(drift_row, 3, 0, 1, 3)
 
         # "Show calibrated" is NOT here any more -- it is a checkable action on
@@ -2734,9 +2787,11 @@ class UcatsbGui(QMainWindow):
         self.cal2_end_spin.setValue(settings["cal2_window_s"][1])
         self.drift_combo.setCurrentText(settings["drift_model"])
         self.smooth_spin.setValue(settings["drift_smooth_events"])
+        self.fixed_slope_spin.setValue(settings.get("fixed_slope", 0.0))
         self.drift_model = settings["drift_model"]
         self.drift_smooth_events = settings["drift_smooth_events"]
-        self.smooth_spin.setEnabled(settings["drift_model"] == "smooth")
+        self.fixed_slope = settings.get("fixed_slope", 0.0)
+        self._show_drift_extra(settings["drift_model"])
         self._loading = False
 
     def _controls_to_settings(self) -> dict:
@@ -2756,7 +2811,22 @@ class UcatsbGui(QMainWindow):
             "cal2_window_s": [self.cal2_start_spin.value(), self.cal2_end_spin.value()],
             "drift_model": self.drift_combo.currentText(),
             "drift_smooth_events": self.smooth_spin.value(),
+            "fixed_slope": self.fixed_slope_spin.value(),
         }
+
+    def _show_drift_extra(self, model: str):
+        """Show whichever number the chosen drift model needs, and only that.
+
+        The two spin boxes share one slot in the row (see where they are
+        built), so this is what keeps exactly one of them on screen. `smooth`
+        stays visible-but-disabled for the models that need no number at all,
+        rather than leaving the slot empty and letting the combo stretch into
+        it on every model change.
+        """
+        pinned = model == "fixed slope"
+        self.fixed_slope_spin.setVisible(pinned)
+        self.smooth_spin.setVisible(not pinned)
+        self.smooth_spin.setEnabled(model == "smooth")
 
     def _select_gas(self, gas: str):
         """Sync gas-dependent controls (masking/cal boxes, per-gas
@@ -2822,13 +2892,46 @@ class UcatsbGui(QMainWindow):
     def on_control_changed(self):
         if self._loading or self._initializing or self.current_gas is None:
             return
+        # Seeding runs BEFORE the settings are read back, so the value it puts
+        # in the box is the one that gets stored. It only fires on the switch
+        # into "fixed slope" with the box still on "auto", so a saved config's
+        # own number is never overwritten and neither is a hand-typed one.
+        if (self.drift_combo.currentText() == "fixed slope"
+                and self.drift_model != "fixed slope"
+                and not self.fixed_slope_spin.value()):
+            self._seed_fixed_slope()
         settings = self._controls_to_settings()
         self.config[self.current_gas] = settings
         self.drift_model = settings["drift_model"]
         self.drift_smooth_events = settings["drift_smooth_events"]
-        self.smooth_spin.setEnabled(self.drift_model == "smooth")
+        self.fixed_slope = settings["fixed_slope"]
+        self._show_drift_extra(self.drift_model)
         self._mark_dirty()
         self.refresh(preserve_view=True)
+
+    def _seed_fixed_slope(self):
+        """Put the constant model's slope in the box when "fixed slope" is
+        first chosen, so the user starts from the flight's own gain instead of
+        an empty field.
+
+        That slope is exactly `1 / span_gain`: the constant model replaces each
+        bottle's nodes with its flight mean, so its gain is
+        `(A_hi - A_lo) / (mean_hi - mean_lo)`. Taking it from `span_gain` rather
+        than recomputing means it comes from the calibration the user is
+        looking at -- and `span_gain` is a property of the cal-point means
+        alone, so the currently cached result gives the same answer whatever
+        model produced it.
+
+        Leaves the box at "auto" when there is no usable span (one bottle, or
+        no calibration at all); calibrate_series falls back the same way.
+        """
+        result = self._calibration_for(self.current_gas) or {}
+        span_gain = result.get("span_gain") if result.get("ok") else None
+        if not span_gain:
+            return
+        self.fixed_slope_spin.blockSignals(True)
+        self.fixed_slope_spin.setValue(1.0 / span_gain)
+        self.fixed_slope_spin.blockSignals(False)
 
     def _current_state(self):
         """Everything a config file holds, as comparable plain data."""
@@ -3127,9 +3230,12 @@ class UcatsbGui(QMainWindow):
     SAVE_LABEL = "Save…"
 
     # What the button copies: the masking values and both cal mean windows.
-    # The drift model and its smoothing window are the only per-gas settings
-    # left out -- they are a judgement about that gas's cal record (how noisy
-    # its injections are), not a description of the flight.
+    # The drift model and its two numbers -- the smoothing window and the fixed
+    # slope -- are the per-gas settings left out. They are a judgement about
+    # that gas's cal record (how noisy its injections are, what gain its tanks
+    # ask for), not a description of the flight, and the fixed slope is in the
+    # gas's own units besides: copying CO2's 1.0367 onto CH4 would be
+    # meaningless.
     COPIED_SETTING_KEYS = ("warmup_min", "end_flight_min", "require_pumps",
                            "pressure_tol_mbar", "pressure_correct",
                            "pressure_smooth_s", "temperature_correct",
@@ -4758,6 +4864,10 @@ class UcatsbGui(QMainWindow):
             self.cal_bottles, gas_key,
             model=settings["drift_model"],
             smooth_window=settings["drift_smooth_events"],
+            # Only read under model="fixed slope"; 0 there means "use the
+            # constant model's slope", which is what the spin box shows as
+            # "auto" and what the seeding puts a number to.
+            fixed_slope=settings.get("fixed_slope") or None,
             roster=self.cal_roster, flush_mask=analysis["post_cal_flush"],
             cal_mask=analysis["not_air"],
             # Blanks warm-up/bad-pressure rows from the *output* only. The
@@ -4827,7 +4937,11 @@ class UcatsbGui(QMainWindow):
         # Only the response/coefficient/residual y-ranges are worth holding,
         # and only while they still mean the same thing -- a different gas or
         # drift model changes that entirely, so let those re-autoscale.
-        cal_key = (self.current_gas, self.drift_model, self.drift_smooth_events)
+        # fixed_slope belongs in this key like the smoothing window does: it
+        # changes every panel on the tab, so leaving it out would hold the old
+        # y-limits against a calibration that had moved under them.
+        cal_key = (self.current_gas, self.drift_model, self.drift_smooth_events,
+                   self.fixed_slope)
         old_ylims = None
         if (preserve_view and self._cal_ax and self._last_cal_key == cal_key):
             old_ylims = [ax.get_ylim() for ax in self._cal_ax]

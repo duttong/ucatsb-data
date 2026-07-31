@@ -681,7 +681,7 @@ def cal_mean_points(df, cal_intervals, value_col, cal0_window, cal1_window,
 # the measured span error is several percent, so gain must be corrected too.
 # --------------------------------------------------------------------------
 
-CAL_DRIFT_MODELS = ("linear", "smooth", "constant")
+CAL_DRIFT_MODELS = ("linear", "smooth", "constant", "fixed slope")
 CAL_DEFAULT_SMOOTH_EVENTS = 3
 CAL_GAP_FACTOR = 3.0        # node gap > this x median spacing => extrapolated
 CAL_SLOPE_SANE_RANGE = (0.5, 2.0)
@@ -740,6 +740,13 @@ def drift_nodes(times, values, model="linear", window=CAL_DEFAULT_SMOOTH_EVENTS)
                     preserving slow drift.
       "constant" -- the flight mean, emitted at the first and last node times
                     so all three models flow through one evaluation path.
+
+    "fixed slope" is a fourth entry in CAL_DRIFT_MODELS but says nothing about
+    the nodes -- it pins the calibration's gain and lets the intercept follow
+    the cals (see calibrate_series), and its nodes are the "linear" ones. It
+    lands on the fall-through below rather than in a branch of its own, which
+    is stated here because a silent fall-through is how a real model gets
+    mis-handled later.
     """
     times, values = list(times), list(values)
     if not times:
@@ -915,7 +922,8 @@ def cal_mismatch_notes(bottles, gas_key, roster, rel_threshold=0.01):
 def calibrate_series(df, value_col, cal_points, cal_bottles, gas_key,
                      model="linear", smooth_window=CAL_DEFAULT_SMOOTH_EVENTS,
                      roster=None, flush_mask=None, cal_mask=None,
-                     exclude_mask=None, values=None, correction_factor=None):
+                     exclude_mask=None, values=None, correction_factor=None,
+                     fixed_slope=None):
     """Build a time-varying two-point calibration from the per-injection cal
     means and apply it to every row of df[value_col].
 
@@ -975,6 +983,23 @@ def calibrate_series(df, value_col, cal_points, cal_bottles, gas_key,
     what was done, and blanking. A row with no usable pressure or temperature is
     already NaN in `values`; joining `blanked` is what makes the trace break
     over it instead of the row being dropped and drawn across.
+
+    `model="fixed slope"` pins the gain and lets only the intercept move
+    (`mode="fixed-slope"`). `fixed_slope` is that gain; None or 0 means "use the
+    slope the constant model would have given", which is exactly `1/span_gain`
+    -- the constant model replaces each bottle's nodes with its flight mean, so
+    its slope is `(A_hi - A_lo) / (mean_hi - mean_lo)` and never varies. The
+    effective value is returned as `fixed_slope` so a caller can show it.
+
+    With two bottles the intercept cannot satisfy both at once unless the fixed
+    slope happens to equal the tanks' own span, so it takes the MEAN of the two
+    solutions -- `mean_b(A_b - S*R_b(t))` -- splitting the disagreement rather
+    than honouring one tank and letting the other drift off. The leftover shows
+    up honestly as a non-zero closure residual of +-half the mismatch, which
+    under `linear` would be a bug signal and here is the model working: the
+    residuals panel is where you see what the chosen slope costs. It also feeds
+    the reported 1 sigma through `response_sigma`'s closure term, which is what
+    that term is for.
     """
     import statistics
 
@@ -987,7 +1012,7 @@ def calibrate_series(df, value_col, cal_points, cal_bottles, gas_key,
             "ok": False, "reason": reason, "mode": None, "bottles": {},
             "low_state": None, "high_state": None,
             "slope": nan_series, "intercept": nan_series, "calibrated": nan_series,
-            "correction_factor": None,
+            "correction_factor": None, "fixed_slope": None,
             "extrapolated": false_series, "flushed": false_series,
             "in_cal": false_series, "excluded": false_series,
             "non_ambient": false_series, "blanked": false_series,
@@ -1031,38 +1056,70 @@ def calibrate_series(df, value_col, cal_points, cal_bottles, gas_key,
     # refusing outright, but says so loudly.
     distinct = {bottles[s]["assigned"] for s in usable}
     two_point = len(usable) >= 2 and len(distinct) >= 2
+    pin_slope = model == "fixed slope"
     if two_point:
         low_state = min(usable, key=lambda s: bottles[s]["assigned"])
         high_state = max(usable, key=lambda s: bottles[s]["assigned"])
         a_lo, a_hi = bottles[low_state]["assigned"], bottles[high_state]["assigned"]
         r_lo = interp_hold(*bottles[low_state]["nodes"], times)
         r_hi = interp_hold(*bottles[high_state]["nodes"], times)
-
-        d_r = r_hi - r_lo
-        # Relative degeneracy test -- a ppb gas has a different natural scale
-        # than a ppm one, so an absolute epsilon would be wrong for one of them.
-        scale = pd.concat([r_hi.abs(), r_lo.abs()], axis=1).max(axis=1).clip(lower=1.0)
-        slope = (a_hi - a_lo) / d_r.where(d_r.abs() >= 1e-6 * scale)
-        intercept = a_lo - slope * r_lo
         span_states = [low_state, high_state]
         mean_lo = statistics.mean(bottles[low_state]["values"])
         mean_hi = statistics.mean(bottles[high_state]["values"])
         span_gain = (mean_hi - mean_lo) / (a_hi - a_lo) if a_hi != a_lo else None
-        mode = "two-point"
+
+        if pin_slope:
+            # Default to the slope the constant model would have produced --
+            # its nodes are each bottle's flight mean, so its gain is exactly
+            # this and never varies. Derived here rather than taken from
+            # span_gain so a degenerate span (identical assigned values) is
+            # caught by the same guard as the two-point branch's.
+            d_mean = mean_hi - mean_lo
+            constant_slope = ((a_hi - a_lo) / d_mean
+                              if d_mean and abs(d_mean) >= 1e-6 else None)
+            fixed_slope = fixed_slope or constant_slope or 1.0
+            slope = pd.Series(float(fixed_slope), index=df.index)
+            # Both tanks pull on the one free parameter; the mean splits the
+            # difference. See the docstring for why the leftover is left
+            # visible in the closure residual rather than absorbed.
+            intercept = ((a_lo - slope * r_lo) + (a_hi - slope * r_hi)) / 2.0
+            mode = "fixed-slope"
+        else:
+            d_r = r_hi - r_lo
+            # Relative degeneracy test -- a ppb gas has a different natural
+            # scale than a ppm one, so an absolute epsilon would be wrong for
+            # one of them.
+            scale = pd.concat([r_hi.abs(), r_lo.abs()], axis=1).max(axis=1).clip(lower=1.0)
+            slope = (a_hi - a_lo) / d_r.where(d_r.abs() >= 1e-6 * scale)
+            intercept = a_lo - slope * r_lo
+            mode = "two-point"
     else:
         state = usable[0]
         low_state = high_state = state
         r_lo = interp_hold(*bottles[state]["nodes"], times)
-        slope = pd.Series(1.0, index=df.index)
-        intercept = bottles[state]["assigned"] - r_lo
         span_states = [state]
         span_gain = None
-        mode = "offset"
-        warnings.append(
-            "Only one usable cal bottle -- applying an offset-only correction "
-            "(no gain/span term). Results are less reliable away from that "
-            "bottle's concentration."
-        )
+        # One bottle gives no span, so there is no constant-model slope to
+        # inherit: a fixed slope has to be stated outright or this degrades to
+        # the offset correction, which is the same arithmetic with S = 1.
+        if pin_slope and fixed_slope:
+            slope = pd.Series(float(fixed_slope), index=df.index)
+            mode = "fixed-slope"
+            warnings.append(
+                f"Only one usable cal bottle -- holding the slope at the "
+                f"{float(fixed_slope):.4f} given and fitting the intercept to "
+                f"that bottle. Nothing here measures the span."
+            )
+        else:
+            fixed_slope = None
+            slope = pd.Series(1.0, index=df.index)
+            mode = "offset"
+            warnings.append(
+                "Only one usable cal bottle -- applying an offset-only "
+                "correction (no gain/span term). Results are less reliable "
+                "away from that bottle's concentration."
+            )
+        intercept = bottles[state]["assigned"] - slope * r_lo
 
     # `measured` is already P/T-corrected when the caller asked for it, and the
     # nodes above came off the same series -- so slope/intercept are on that
@@ -1143,6 +1200,10 @@ def calibrate_series(df, value_col, cal_points, cal_bottles, gas_key,
         "low_state": low_state, "high_state": high_state,
         "slope": slope, "intercept": intercept, "calibrated": calibrated,
         "correction_factor": correction_factor,
+        # The gain actually used under "fixed slope" -- the value passed in, or
+        # the constant-model slope it defaulted to. None under every other
+        # model, so a caller can tell "pinned at 1.0412" from "not pinned".
+        "fixed_slope": float(fixed_slope) if mode == "fixed-slope" else None,
         "extrapolated": extrapolated, "flushed": flushed,
         "in_cal": in_cal, "excluded": excluded,
         "non_ambient": non_ambient, "blanked": blanked,
@@ -1265,12 +1326,22 @@ def calibration_uncertainty(result):
         "response_sigma": {s: response_sigma(s) for s in {low, high}},
     }
 
-    if result["mode"] == "offset":
-        # c = m + (A - R(t)): no gain term, so the two uncertainties simply
-        # add in quadrature and the result is the same for every row.
-        s_a = bottles[low].get("assigned_unc") or 0.0
-        s_r = response_sigma(low)
-        sigma = pd.Series((s_a * s_a + s_r * s_r) ** 0.5, index=calibrated.index)
+    if result["mode"] in ("offset", "fixed-slope"):
+        # Both hold the gain fixed and fit only the intercept, so they are one
+        # formula: c = S*m + mean_b(A_b - S*R_b), giving dc/dA_b = 1/n and
+        # dc/dR_b = -S/n. `offset` is the n = 1, S = 1 case of it.
+        #
+        # No `f` lever, so the answer does NOT grow as the air moves away from
+        # the tanks -- unlike the two-point mode, where that is the dominant
+        # term. The 1-sigma panel's flat line under these modes is real, not a
+        # plotting failure: with the gain pinned, extrapolating away from the
+        # bottles costs nothing the calibration knows about. What it does cost
+        # rides in the closure residual instead (see response_sigma).
+        states = sorted({low, high})
+        n = len(states)
+        var_a = sum((bottles[s].get("assigned_unc") or 0.0) ** 2 for s in states) / (n * n)
+        var_r = sum(response_sigma(s) ** 2 for s in states) / (n * n)
+        sigma = (var_a + slope * slope * var_r) ** 0.5
         return sigma.mask(calibrated.isna()), components
 
     a_lo, a_hi = bottles[low]["assigned"], bottles[high]["assigned"]
@@ -2055,9 +2126,24 @@ def plot_calibration_panels(fig, result, gas_key, ylabel, datetimes, unit=""):
         slope_med = 1.0
     span = (a_hi - a_lo) if (a_lo is not None and a_hi is not None) else 0
 
+    pinned = result.get("mode") == "fixed-slope"
+
     def _sigma_at(c):
         """1 sigma at mixing ratio `c` -- the propagation of
         calibration_uncertainty with slope held at its median."""
+        if pinned:
+            # Gain pinned, only the intercept fitted: no `f` lever, so the
+            # answer is the same everywhere. Drawn as the flat line that
+            # implies rather than hidden, so the panel keeps a stable meaning
+            # across models -- and so the drop from the two-point curve's
+            # extrapolated wings is visible for what it is. The cost of a
+            # wrong slope is in the closure residual, not here.
+            states = sorted({low, high})
+            n = len(states)
+            return ((sum((s_a.get(s) or 0.0) ** 2 for s in states) / (n * n)
+                     + slope_med ** 2
+                     * sum((s_r.get(s) or 0.0) ** 2 for s in states) / (n * n))
+                    ** 0.5)
         if not span:
             # Offset-only: no gain term, so the answer does not depend on c.
             return (((s_a.get(low) or 0.0) ** 2
@@ -2153,6 +2239,11 @@ def plot_calibration_panels(fig, result, gas_key, ylabel, datetimes, unit=""):
     # a width measured in a different size is wrapping to the wrong width.
     head_size = 8
     head = [f"{gas_key}  |  mode: {result['mode']}"]
+    if result.get("fixed_slope") is not None:
+        # Beside the span gain on purpose: 1/span_gain is the slope the tanks
+        # themselves ask for, so the two numbers together say how far the
+        # pinned gain is from what this flight measured.
+        head[0] += f" at {result['fixed_slope']:.4f}"
     if result.get("span_gain") is not None:
         head[0] += f"  |  span gain: {result['span_gain']:.4f}"
     head[0] += f"  |  extrapolated: {100 * extrap.mean():.0f}% of record"

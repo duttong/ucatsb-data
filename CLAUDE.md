@@ -341,6 +341,9 @@ Non-obvious properties, each of which has bitten a plausible implementation:
   cancels genuine slow drift (both neighbours share it). The plain closure
   residual is still computed and plotted, but as a self-consistency check
   that should read ~0 under `linear`; a non-zero value there is a bug signal.
+  **Under `constant` and `fixed slope` it is expected to be non-zero** and is
+  the point of the panel — it is what the model costs by not passing through
+  the nodes, and it feeds the reported 1σ through `response_sigma`.
 - **The leave-one-out is PAIRED: the companion bottle carries the drift**
   (`paired_loo_residuals`, 2026-07-30). Hiding one injection also hides
   whatever the instrument did between its neighbours — but the other tank was
@@ -380,6 +383,50 @@ Non-obvious properties, each of which has bitten a plausible implementation:
 - **numpy is deliberately not used.** The full interpolation is ~9 ms, next to
   ~100 ms of rendering. The pandas path handles the datetime index, duplicate
   labels and the edge-hold policy declaratively.
+
+**"fixed slope" is a fourth `CAL_DRIFT_MODELS` entry that is not about drift**
+(`fixed_slope`, 2026-07-31). It pins the gain and fits only the intercept, so
+the calibration follows the tanks in time without the two-point line's gain
+wandering with them — on 2026-07-30 CO2's `linear` slope ranges 0.969–1.075
+where this holds 1.0367 and puts all the movement in the intercept (a 3.3 ppm
+range). Its nodes are the `linear` ones; it hits `drift_nodes`' fall-through
+rather than a branch of its own, which is stated in that docstring because a
+silent fall-through is how a real model gets mishandled later. `mode` comes back
+as `"fixed-slope"` and the effective gain as `fixed_slope`.
+
+- **The default is the constant model's slope, which is exactly `1/span_gain`.**
+  `constant` replaces each bottle's nodes with its flight mean, so its gain is
+  `(A_hi − A_lo)/(mean_hi − mean_lo)` and never varies — the reciprocal of the
+  span gain by definition. `_seed_fixed_slope` therefore reads `span_gain` off
+  whatever calibration is already cached rather than recomputing: `span_gain`
+  is a property of the cal-point means alone, so every model gives the same
+  answer for it. `0` in the spin box (shown as `auto`) means that seed, and
+  `calibrate_series` falls back the same way, so a config that predates the
+  setting behaves identically to one that was seeded.
+- **The seeding fires once, on the switch into the model with the box still on
+  `auto`.** It runs at the top of `on_control_changed`, *before* the settings
+  are read back, so the seeded number is what gets stored — and it never
+  overwrites a saved config's value or a hand-typed one.
+- **With two tanks the intercept splits their disagreement**,
+  `mean_b(A_b − S·R_b(t))`, since one free parameter cannot satisfy both unless
+  the pinned gain happens to equal the tanks' own span. The leftover is left
+  visible as a closure residual of ±half the mismatch rather than absorbed: it
+  is how you judge the slope you chose, and it feeds the 1σ. Verified — moving
+  CO2's slope from the 1.0367 seed to 0.95 takes the closure RMS 0.21 → 0.92
+  and the median 1σ 0.40 → 0.70 ppm.
+- **The 1σ is flat in mixing ratio under a pinned gain, and that is real.**
+  There is no `f` lever, so the propagation does not grow away from the tanks —
+  the dominant term in two-point mode simply is not there (0.40 ppm flat against
+  0.75 median and a 0.39 spread under `linear`). The panel draws the flat line
+  rather than hiding it, as it already does for `offset`. What a wrong gain
+  costs rides in the closure term instead.
+- **`offset` and `fixed-slope` share one uncertainty branch.** Both hold the
+  gain and fit only the intercept, so `c = S·m + mean_b(A_b − S·R_b)` covers
+  both; `offset` is the n = 1, S = 1 case. Checked against the closed form for
+  each, and offset's answer is unchanged from before the branch was merged.
+- **One bottle plus a stated slope is allowed**, and warns that nothing there
+  measures the span. One bottle with `auto` has no span to inherit, so it
+  degrades to `offset` — the same arithmetic with S = 1.
 
 `cal_mismatch_notes` is **advisory only and must never auto-substitute a
 tank.** `cals.yaml` describes the *current* run, so applying it to an older
@@ -676,7 +723,7 @@ Two failure modes to know, because neither announces itself:
 
 Group boxes are the expensive thing to add: each costs ~41 px of title and
 margin before it holds anything, which is why Gas and the aux pickers share
-"Traces", and the two cal-window boxes plus the drift model share
+"Traces", and the two cal-window boxes plus the cal model share
 "Calibration". Layouts here run 6 px margins / 4 px spacing rather than Qt's
 9/6 default for the same reason.
 
@@ -685,7 +732,7 @@ spinbox drag doesn't render a pane nobody is looking at. The `_preserve`
 latch matters: a requested full rescale must survive until it is actually
 honoured, or changing gas and then nudging a spinbox would leave the
 never-drawn pane stuck at a stale scale when first opened. The cal tab's own
-"same content" key is `(gas, drift_model, smooth_events)`; the correlation
+"same content" key is `(gas, drift_model, smooth_events, fixed_slope)`; the correlation
 tab's is `(x_gas, y_gas)`.
 
 Correlation-only controls call **`_refresh_corr`, not `refresh()`**: marker
@@ -697,7 +744,7 @@ two gases' analyses and redraw the timeseries.
 ### Config persistence: explicit save only
 
 Settings live in one block per gas (`warmup_min`, `pressure_tol_mbar`,
-`flag_air_s`, `cal1_window_s`, `cal2_window_s`, `drift_model`,
+`flag_air_s`, `cal1_window_s`, `cal2_window_s`, `drift_model`, `fixed_slope`,
 `drift_smooth_events`) plus the flight's `cals:` pairing, in a YAML file
 beside the CSV. **Nothing is written without `on_save_clicked`.** The
 requirement driving this: open a saved analysis, experiment, quit — and the
@@ -820,9 +867,11 @@ fourth.)
 `flag_air_s`, `cal1_window_s`, `cal2_window_s` — from the live controls into every *other*
 gas block. A new persisted control has to be added to that tuple too (or
 consciously left out), or the button will silently leave it behind on the
-other gases. Only `drift_model`/`drift_smooth_events` are excluded: those are
-a judgement about one gas's cal-record noise rather than a description of the
-flight. Ozone drops out by construction rather than by name — it has no entry
+other gases. Only `drift_model`, `drift_smooth_events` and `fixed_slope` are excluded:
+those are a judgement about one gas's cal record rather than a description of
+the flight, and the fixed slope is in that gas's own units besides — copying
+CO2's 1.0367 onto CH4 would be meaningless. Ozone drops out by construction
+rather than by name — it has no entry
 in `self.config` at all — so "every gas in the config" stays the right set if
 a gas is ever added.
 
