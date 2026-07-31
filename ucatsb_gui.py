@@ -4773,7 +4773,7 @@ class UcatsbGui(QMainWindow):
         flagged = self._flag_mask(gas_key)
         exclude_mask = bad_pressure | trimmed | pumps_off | flagged
 
-        cal_intervals, cal_points = [], []
+        cal_intervals, cal_points, display_cal_points = [], [], []
         post_cal_flush = pd.Series(False, index=df.index)
         if has_masking:
             cal_intervals = merge_close_intervals(
@@ -4797,6 +4797,16 @@ class UcatsbGui(QMainWindow):
                 cal_bottles=self.cal_bottles, gas_key=gas_key,
                 exclude_mask=exclude_mask, values=corrected,
             )
+            # Timeseries cal markers stay in the instrument's recorded units.
+            # The calibration itself uses `cal_points` above, which may be
+            # P/T-corrected; these points are only for visual reference.
+            display_cal_points = cal_mean_points(
+                df, cal_intervals, value_col,
+                tuple(settings["cal1_window_s"]),
+                tuple(settings["cal2_window_s"]),
+                cal_bottles=self.cal_bottles, gas_key=gas_key,
+                exclude_mask=exclude_mask,
+            )
 
         self._analysis[gas_key] = {
             "cal": cal, "cal_switch": cal_switch, "not_air": not_air,
@@ -4806,6 +4816,7 @@ class UcatsbGui(QMainWindow):
             "flagged": flagged,
             "exclude_mask": exclude_mask,
             "cal_intervals": cal_intervals, "cal_points": cal_points,
+            "display_cal_points": display_cal_points,
             "post_cal_flush": post_cal_flush,
             "has_masking": has_masking,
             "warmup_minutes": warmup_minutes,
@@ -4901,6 +4912,7 @@ class UcatsbGui(QMainWindow):
         end_flight_minutes = analysis["end_flight_minutes"]
         bad_pressure = analysis["bad_pressure"]
         cal_points = analysis["cal_points"]
+        display_cal_points = analysis["display_cal_points"]
         post_cal_flush = analysis["post_cal_flush"]
 
         if has_masking:
@@ -4971,6 +4983,7 @@ class UcatsbGui(QMainWindow):
                 marker="x", s=28, linewidths=1.1, color=FLAGGED_COLOR, zorder=6)
 
         cal_line = None
+        cal_mean_scatter = None
         if show_cal:
             # The calibrated trace is the *good air* record: cal periods, the
             # flush behind them, and the warm-up/bad-pressure masks are all
@@ -4990,12 +5003,18 @@ class UcatsbGui(QMainWindow):
             for start, end in find_intervals(df["datetime"], calibration["extrapolated"]):
                 ax.axvspan(start, end, facecolor="none", edgecolor=CAL_SHADE_COLOR,
                            hatch="///", alpha=0.30, linewidth=0)
+            calibrated_cal_points = self._calibrated_cal_points(calibration)
+            if calibrated_cal_points:
+                xs, ys, _ = zip(*calibrated_cal_points)
+                cal_mean_scatter = ax.scatter(
+                    xs, ys, facecolors="none", edgecolors=CALIBRATED_COLOR,
+                    s=52, linewidths=1.2, zorder=5)
 
-        # cal0_pts/cal1_pts are guaranteed empty when has_masking is False
-        # (cal_points == []), so cal0_label/cal1_label are never read below
+        # cal0_pts/cal1_pts are guaranteed empty when has_masking is False, so
+        # cal0_label/cal1_label are never read below
         # without having been set here first.
-        cal0_pts = [(t, v) for t, v, state, serial in cal_points if state == 0]
-        cal1_pts = [(t, v) for t, v, state, serial in cal_points if state == 1]
+        cal0_pts = [(t, v) for t, v, state, serial in display_cal_points if state == 0]
+        cal1_pts = [(t, v) for t, v, state, serial in display_cal_points if state == 1]
         if has_masking:
             cal0_label = most_common_serial(cal_points, 0) or "Cal 1"
             cal1_label = most_common_serial(cal_points, 1) or "Cal 2"
@@ -5013,6 +5032,9 @@ class UcatsbGui(QMainWindow):
         if cal_line is not None:
             handles.append(cal_line)
             labels.append(f"calibrated ({calibration['mode']})")
+        if cal_mean_scatter is not None:
+            handles.append(cal_mean_scatter)
+            labels.append("cal means (calibrated)")
         if cal0_pts:
             xs, ys = zip(*cal0_pts)
             handles.append(ax.scatter(xs, ys, color=CAL0_COLOR, s=40, zorder=5, edgecolors="none"))
@@ -5086,6 +5108,8 @@ class UcatsbGui(QMainWindow):
                 notes.append("red = calibrated, blue = raw; calibrated shows "
                              "good air only (cal periods, flush and masked "
                              "spans blanked)")
+                if cal_mean_scatter is not None:
+                    notes.append("open red circles = cal means on the calibrated scale")
             # Said whether or not the overlay is on: it changes the calibrated
             # record itself, which is what both exports ship, so the figure
             # would otherwise show a raw trace with no hint that the product
@@ -5325,6 +5349,22 @@ class UcatsbGui(QMainWindow):
         self.main_pane.attach_stats_selectors([ax, ax_aux])
 
         self.canvas.draw()
+
+    def _calibrated_cal_points(self, calibration):
+        """Cal-mean points on the calibrated scale for the timeseries overlay.
+
+        The exported calibrated record remains good ambient air only. These
+        points are just a visual check of how the selected calibration maps the
+        cal injections.
+        """
+        points = []
+        bottles = calibration.get("bottles") or {}
+        for t, state, closure, _ in calibration.get("residuals", []):
+            assigned = (bottles.get(state) or {}).get("assigned")
+            if assigned is None or pd.isna(closure):
+                continue
+            points.append((t, assigned + closure, state))
+        return points
 
     def _register_stats_trace(self, key, label, axes, x, y, unit):
         """Record a plotted trace so the box-stats combo can offer it."""
