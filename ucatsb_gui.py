@@ -952,6 +952,12 @@ class UcatsbGui(QMainWindow):
         self.aux_selection = "No Figure"
         self.other_column = None
         self.right_axis_column = None
+        # Session-only view state, like the calibrated overlay: on at startup,
+        # never saved. `_notes_artist` is the Text the toggle reaches for, and
+        # is rebuilt (or set to None) by every redraw -- a stale one would hold
+        # a destroyed Axes, the same trap the stats selector has.
+        self.show_plot_notes = True
+        self._notes_artist = None
         self._loading = False
         self._initializing = True
         # Per-gas caches: the Correlations tab needs two gases' calibrations
@@ -1748,6 +1754,25 @@ class UcatsbGui(QMainWindow):
         self.right_axis_combo.setEnabled(False)
         self.right_axis_combo.currentTextChanged.connect(self.on_right_axis_changed)
         traces_form.addRow("Right axis:", self.right_axis_combo)
+
+        # The note block's on/off switch, in this box because it is one more
+        # answer to "what is drawn" -- and session-only, like the calibrated
+        # overlay and Correlations' "Hide flagged points": it is a view toggle,
+        # so it is not in DEFAULT_GAS_SETTINGS, not in _controls_to_settings(),
+        # and does not dirty the config. Spanning row: a two-column form row
+        # would put a label beside a control that already reads as a sentence.
+        self.show_notes_check = QCheckBox("Info notes")
+        self.show_notes_check.setChecked(True)
+        self.show_notes_check.setToolTip(
+            "Show the grey key at the bottom of the Timeseries figure -- what\n"
+            "each shaded band means, how many readings were removed and why.\n\n"
+            "Turn it off for a clean figure to save or hand on. The trace\n"
+            "legend above it is not affected.\n\n"
+            "Session only: it is not saved with the flight's settings, and it\n"
+            "changes nothing about the data."
+        )
+        self.show_notes_check.toggled.connect(self.on_show_notes_toggled)
+        traces_form.addRow(self.show_notes_check)
 
         vbox.addWidget(traces_box)
 
@@ -2777,6 +2802,22 @@ class UcatsbGui(QMainWindow):
         if self._initializing:
             return
         self.refresh()
+
+    def on_show_notes_toggled(self, checked):
+        """Show or hide the Timeseries figure's grey note block.
+
+        Sets the artist's visibility and redraws the canvas, nothing more --
+        deliberately not a refresh(). Nothing about the data, the masks or the
+        calibration changes, the user is typically zoomed in on something, and
+        recomputing five gases' analyses to hide a caption would be absurd.
+        The same reasoning as Correlations' "Hide flagged points".
+        """
+        self.show_plot_notes = checked
+        if self._initializing:
+            return
+        if self._notes_artist is not None:
+            self._notes_artist.set_visible(checked)
+            self.canvas.draw_idle()
 
     def on_control_changed(self):
         if self._loading or self._initializing or self.current_gas is None:
@@ -4525,6 +4566,15 @@ class UcatsbGui(QMainWindow):
                 # block in redraw_corr for what happens when it is left in.
                 in_layout=False,
             )
+            # Set BEFORE _text_height_frac below, deliberately: an invisible
+            # Text reports a unit bbox, so hiding the notes also hands the
+            # legend back the bottom of the axes. (Toggling at runtime does not
+            # move the legend -- that waits for the next redraw, which is the
+            # right trade for a toggle that must not rescale the view.)
+            notes_text.set_visible(self.show_plot_notes)
+        # Rebuilt on every draw, like the stats selectors: figure.clear() above
+        # destroyed the previous one.
+        self._notes_artist = notes_text
 
         # Placed after the notes, and confined to the axes *above* them.
         # `loc="best"` searches for a gap in the DATA only -- a Text artist is

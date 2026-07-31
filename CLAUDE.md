@@ -581,6 +581,27 @@ making one tab depend on state invisible from another); Correlations is the
 exception because it is inherently about *two* gases, so a per-gas panel
 beside it would be actively misleading about what is plotted.
 
+**The Timeseries note block has an off switch** — "Info notes", the last row of
+the Traces box (2026-07-31). Session-only, like the calibrated overlay and
+Correlations' "Hide flagged points", and for the same reasons: it is a view
+toggle, so it is absent from `DEFAULT_GAS_SETTINGS` and
+`_controls_to_settings()`, does not dirty the config, and **never replots** —
+`on_show_notes_toggled` sets the `Text`'s visibility and calls `draw_idle()`.
+Recomputing five gases' analyses to hide a caption would be absurd, and the
+user is usually zoomed in on something. Two consequences:
+
+- `_notes_artist` is rebuilt by **every** `redraw()` (or set to None when there
+  are no notes), because `figure.clear()` destroys the previous one — the same
+  trap the stats selector documents.
+- Visibility is set *before* `_text_height_frac`, so on a redraw with the notes
+  off the legend gets the bottom of the Axes back (an invisible `Text` reports a
+  unit bbox). Toggling at runtime therefore does not move the legend; that waits
+  for the next redraw, which is the right trade for a toggle that must not
+  disturb the view.
+
+It hides the grey key only. The trace legend — which carries the cal-bottle
+means — stays, deliberately: it is data, not annotation.
+
 **Every note block drawn inside an Axes is created with `in_layout=False`.**
 The panes' Figures use `constrained_layout`, and a `Text` is unclipped by
 default, so the layout engine counts the note in the Axes' tight bbox and
