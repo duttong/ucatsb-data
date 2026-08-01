@@ -6,13 +6,6 @@ deliberately **Qt-free** -- it needs pandas and (for the calibration figure)
 matplotlib, nothing more -- so a batch script or notebook can reuse
 `calibrate_series`, `calibration_uncertainty` or `export_icartt` without
 pulling in a GUI toolkit.
-
-It was once `plot_co2_timeseries.py`, named for a standalone CO2-only figure
-CLI that lived at the bottom. That CLI was removed when the GUI superseded it:
-it hardcoded CO2 and one set of masking settings, and it read the cal pairing
-from `cals.yaml`'s `cals:` block, which describes the tanks plumbed in *now*
-and so mislabels the tanks on any earlier flight -- with no way to correct it.
-Everything here is gas-agnostic.
 """
 from pathlib import Path
 
@@ -104,18 +97,10 @@ def merge_close_intervals(intervals, gap):
     return merged
 
 
-# Ozone readings below this are instrument faults, not measurements (the Feb
-# 2025 flight has 7 of them, down to -2292 ppb). The floor is deliberately
-# well below zero rather than at zero: a real near-zero ozone measurement
-# scatters negative, and 168 readings in -15..0 ppb on that flight are the
-# sensor's noise about a small true value -- throwing those away would bias
-# the low end upward and hide how noisy the instrument actually is.
+# Ozone readings below this are instrument faults
 O3_VALID_MIN_PPB = -15.0
 
-# Same idea for the water vapour instrument. Precautionary rather than
-# demonstrated: the Jul 2026 flight has no w_H2Obest reading below -5 ppm at
-# all (its minimum is +14), so this removes nothing today and exists to catch
-# the fault mode when it appears.
+# Same idea for the water vapour instrument.
 H2O_VALID_MIN_PPM = -5.0
 
 
