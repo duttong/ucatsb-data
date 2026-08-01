@@ -19,6 +19,9 @@ __pycache__/
 # travel with the flight, not with the repository.
 *_conf.yaml
 
+# One-off local repair helper for the 2026-08-01 clock jump cleanup.
+fix_clock_shift.py
+
 # Claude Code's per-machine settings: a Bash permission allowlist that suits
 # one person's workflow, not a property of the project. Committing it would
 # grant those permissions to everyone who clones.

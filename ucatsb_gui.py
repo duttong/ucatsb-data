@@ -1030,6 +1030,7 @@ class UcatsbGui(QMainWindow):
         # real structure in it describes almost none of that structure.
         self.corr_fit = False
         self.corr_tooltip_popup = None
+        self._corr_tooltip_drag_offset = None
         self._corr_ax = None
         self._last_corr_key = None
 
@@ -3682,10 +3683,12 @@ class UcatsbGui(QMainWindow):
         self._close_corr_tooltip_popup()
 
         popup = QWidget(self, Qt.Tool | Qt.FramelessWindowHint)
+        popup.setObjectName("corrTooltip")
         popup.setAttribute(Qt.WA_DeleteOnClose)
         popup.setStyleSheet(
-            "QWidget { background: #ffffff; color: #222222; "
+            "QWidget#corrTooltip { background: #ffffff; color: #222222; "
             "border: 1px solid #8a8a8a; }"
+            "QWidget#corrTooltip QWidget { border: none; }"
             "QPushButton { border: none; padding: 1px 6px; font-weight: bold; }"
             "QPushButton:hover { background: #e8e8e8; }"
         )
@@ -3693,14 +3696,17 @@ class UcatsbGui(QMainWindow):
         layout.setContentsMargins(8, 4, 8, 8)
         layout.setSpacing(4)
 
-        top = QHBoxLayout()
+        title_bar = QWidget(popup)
+        title_bar.setCursor(Qt.SizeAllCursor)
+        title_bar.setToolTip("Drag to move")
+        top = QHBoxLayout(title_bar)
         top.setContentsMargins(0, 0, 0, 0)
         top.addStretch(1)
         close_button = QPushButton("x")
         close_button.setFixedSize(20, 20)
         close_button.setToolTip("Close")
         top.addWidget(close_button)
-        layout.addLayout(top)
+        layout.addWidget(title_bar)
 
         label = QLabel(text)
         label.setTextFormat(Qt.PlainText)
@@ -3709,6 +3715,10 @@ class UcatsbGui(QMainWindow):
         layout.addWidget(label)
 
         close_button.clicked.connect(self._close_corr_tooltip_popup)
+        title_bar.mousePressEvent = (
+            lambda e, p=popup: self._start_corr_tooltip_drag(p, e))
+        title_bar.mouseMoveEvent = self._move_corr_tooltip_drag
+        title_bar.mouseReleaseEvent = self._stop_corr_tooltip_drag
         popup.destroyed.connect(
             lambda _=None, p=popup: setattr(
                 self, "corr_tooltip_popup", None
@@ -3722,12 +3732,40 @@ class UcatsbGui(QMainWindow):
         else:
             pos = self.corr_pane.canvas.mapToGlobal(
                 self.corr_pane.canvas.rect().center())
-        popup.move(pos.x() + 12, pos.y() + 12)
+        self._move_corr_tooltip_popup_onscreen(popup, pos.x() + 12, pos.y() + 12)
         popup.show()
+
+    def _move_corr_tooltip_popup_onscreen(self, popup, x, y):
+        """Place the tooltip without hiding the close button off-screen."""
+        desktop = QApplication.desktop()
+        screen = desktop.availableGeometry(popup)
+        width, height = popup.width(), popup.height()
+        x = max(screen.left(), min(x, screen.right() - width))
+        y = max(screen.top(), min(y, screen.bottom() - height))
+        popup.move(x, y)
+
+    def _start_corr_tooltip_drag(self, popup, event):
+        if event.button() == Qt.LeftButton:
+            self._corr_tooltip_drag_offset = (
+                event.globalPos() - popup.frameGeometry().topLeft())
+            event.accept()
+
+    def _move_corr_tooltip_drag(self, event):
+        if (self.corr_tooltip_popup is not None
+                and self._corr_tooltip_drag_offset is not None
+                and event.buttons() & Qt.LeftButton):
+            self.corr_tooltip_popup.move(
+                event.globalPos() - self._corr_tooltip_drag_offset)
+            event.accept()
+
+    def _stop_corr_tooltip_drag(self, event):
+        self._corr_tooltip_drag_offset = None
+        event.accept()
 
     def _close_corr_tooltip_popup(self):
         popup = self.corr_tooltip_popup
         self.corr_tooltip_popup = None
+        self._corr_tooltip_drag_offset = None
         if popup is not None:
             popup.close()
 
@@ -3755,6 +3793,8 @@ class UcatsbGui(QMainWindow):
 
         row = x_vals.index[nearest_pos]
         lines = [f"row {row + self.presync_dropped}   {self.df['datetime'].loc[row]}"]
+        if "oz_p" in self.df.columns:
+            lines.append(f"Ozone Pressure: {self._fmt_value(self.df['oz_p'].loc[row])}")
         for axis, gas_key, values, sigma, unit in (
                 ("X", plotted["x_gas"], plotted["x"], plotted["x_sigma"], plotted["x_unit"]),
                 ("Y", plotted["y_gas"], plotted["y"], plotted["y_sigma"], plotted["y_unit"])):
