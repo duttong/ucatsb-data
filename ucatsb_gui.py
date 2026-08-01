@@ -3364,18 +3364,15 @@ class UcatsbGui(QMainWindow):
 
     SAVE_LABEL = "Save…"
 
-    # What the button copies: the masking values and both cal mean windows.
-    # The drift model and its two numbers -- the smoothing window and the fixed
-    # slope -- are the per-gas settings left out. They are a judgement about
-    # that gas's cal record (how noisy its injections are, what gain its tanks
-    # ask for), not a description of the flight, and the fixed slope is in the
-    # gas's own units besides: copying CO2's 1.0367 onto CH4 would be
-    # meaningless.
+    # What the button copies: the masking values, both cal mean windows, and the
+    # calibration method controls. A fixed-slope value is gas-specific, so copied
+    # fixed-slope settings start the other gases at a neutral slope of 1.0000.
     COPIED_SETTING_KEYS = ("warmup_min", "end_flight_min", "require_pumps",
                            "pressure_tol_mbar", "pressure_correct",
                            "pressure_smooth_s", "temperature_correct",
                            "flag_air_s",
-                           "cal1_window_s", "cal2_window_s")
+                           "cal1_window_s", "cal2_window_s",
+                           "drift_model", "drift_smooth_events", "fixed_slope")
     COPY_SETTINGS_LABEL = "Copy settings to all gases"
 
     def on_copy_masking_to_all(self):
@@ -3401,8 +3398,10 @@ class UcatsbGui(QMainWindow):
             # object makes yaml.safe_dump emit anchors (&id001/*id001) into
             # the conf file, and makes a later in-place edit of one gas's
             # window silently change the others.
-            self.config[gas].update(
-                {key: copy.deepcopy(live[key]) for key in self.COPIED_SETTING_KEYS})
+            copied = {key: copy.deepcopy(live[key]) for key in self.COPIED_SETTING_KEYS}
+            if copied["drift_model"] == "fixed slope":
+                copied["fixed_slope"] = 1.0
+            self.config[gas].update(copied)
         self._mark_dirty()
         # No refresh: the current gas's own settings are unchanged, so the
         # plots are still correct. The other gases redraw when selected.
