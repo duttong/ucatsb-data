@@ -1024,6 +1024,8 @@ class UcatsbGui(QMainWindow):
         self.corr_marker_size = 4
         self.corr_error_bars = False
         self.corr_show_cals = False
+        self.corr_show_plot_notes = True
+        self._corr_notes_artist = None
         # None = single-color points; otherwise a key into CORR_COLOR_BY.
         self.corr_color_by = None
         # Off by default: a straight line through a tracer-tracer plot with
@@ -1336,7 +1338,7 @@ class UcatsbGui(QMainWindow):
         axes_form.addRow(swap_button)
         vbox.addWidget(axes_box)
 
-        style_box = QGroupBox("Points")
+        style_box = QGroupBox("Figure Control")
         style_form = QFormLayout(style_box)
         style_form.setContentsMargins(6, 6, 6, 6)
         style_form.setSpacing(4)
@@ -1362,7 +1364,6 @@ class UcatsbGui(QMainWindow):
             "than scattering them."
         )
         self.corr_error_check.toggled.connect(self.on_corr_style_changed)
-        style_form.addRow(self.corr_error_check)
 
         self.corr_cals_check = QCheckBox("Display cals")
         self.corr_cals_check.setToolTip(
@@ -1371,7 +1372,6 @@ class UcatsbGui(QMainWindow):
             "tooltip search, or exported air data."
         )
         self.corr_cals_check.toggled.connect(self.on_corr_cals_changed)
-        style_form.addRow(self.corr_cals_check)
 
         self.corr_fit_check = QCheckBox("Linear fit (OLS)")
         self.corr_fit_check.setChecked(self.corr_fit)
@@ -1383,7 +1383,26 @@ class UcatsbGui(QMainWindow):
             "about how the flight was sampled than about the tracers."
         )
         self.corr_fit_check.toggled.connect(self.on_corr_style_changed)
-        style_form.addRow(self.corr_fit_check)
+
+        self.corr_notes_check = QCheckBox("Info notes")
+        self.corr_notes_check.setChecked(self.corr_show_plot_notes)
+        self.corr_notes_check.setToolTip(
+            "Show the grey text block on the Correlations figure -- point\n"
+            "counts, correction notes, fit notes and masking warnings.\n\n"
+            "Turn it off for a clean figure to save or hand on. Session only:\n"
+            "it changes nothing about the data."
+        )
+        self.corr_notes_check.toggled.connect(self.on_corr_notes_toggled)
+
+        toggle_grid = QGridLayout()
+        toggle_grid.setContentsMargins(0, 0, 0, 0)
+        toggle_grid.setHorizontalSpacing(10)
+        toggle_grid.setVerticalSpacing(2)
+        toggle_grid.addWidget(self.corr_error_check, 0, 0)
+        toggle_grid.addWidget(self.corr_cals_check, 0, 1)
+        toggle_grid.addWidget(self.corr_fit_check, 1, 0)
+        toggle_grid.addWidget(self.corr_notes_check, 1, 1)
+        style_form.addRow(toggle_grid)
 
         # Checkbox + combo on one spanning row (see the drift-model row: in
         # the two-column form the label gets squeezed to nothing by a
@@ -3980,6 +3999,15 @@ class UcatsbGui(QMainWindow):
         self.corr_fit = self.corr_fit_check.isChecked()
         self._refresh_corr(preserve_view=True)
 
+    def on_corr_notes_toggled(self, checked):
+        """Show or hide the Correlations figure's note block."""
+        self.corr_show_plot_notes = checked
+        if self._initializing:
+            return
+        if self._corr_notes_artist is not None:
+            self._corr_notes_artist.set_visible(checked)
+            self.corr_pane.canvas.draw_idle()
+
     def on_corr_cals_changed(self):
         if self._loading or self._initializing:
             return
@@ -5276,18 +5304,23 @@ class UcatsbGui(QMainWindow):
         # (x, y, width, HEIGHT) -- the height is what is left above the notes,
         # not the full axes, or the anchor box overhangs the top and the
         # legend is placed outside the plot.
-        # Frame the default view on the FILTERED data. A single -2292 ppb
-        # fault otherwise sets the y-range and squashes the whole real ozone
-        # record into the top fifth of the axes -- which would make masking
-        # the fault pointless on the one figure it most needed to help. The
-        # raw trace is still drawn and simply runs off-scale; the note says
-        # how many readings that is, and zooming out still reaches them.
-        # Skipped when a view is being preserved, which reapplies its own
-        # limits below.
-        if show_filtered and old_main_view is None:
-            lo, hi = filtered.min(), filtered.max()
-            if pd.notna(lo) and pd.notna(hi) and hi > lo:
-                pad = 0.05 * (hi - lo)
+        # Frame the default view on the response data that is still considered
+        # usable. A manually flagged startup spike should stay visible as an
+        # off-scale x when the user zooms out, but it should not define the
+        # automatic y-range or where Home goes. For floor-filtered gases this is
+        # the existing filtered series; for cal-bottle gases it is the raw trace
+        # with manual flags removed, plus the calibrated overlay when visible.
+        scale_series = [filtered if show_filtered else df[value_col].mask(flagged)]
+        if show_cal:
+            scale_series.append(calibrated)
+        scale_values = pd.concat([
+            pd.to_numeric(series, errors="coerce") for series in scale_series
+        ]).dropna()
+        if not scale_values.empty:
+            lo, hi = scale_values.min(), scale_values.max()
+            if pd.notna(lo) and pd.notna(hi):
+                span = hi - lo
+                pad = 0.05 * span if span > 0 else max(abs(float(lo)) * 0.05, 1.0)
                 ax.set_ylim(lo - pad, hi + pad)
 
         reserved = self._text_height_frac(ax, notes_text)
@@ -5962,9 +5995,11 @@ class UcatsbGui(QMainWindow):
         # on any of the figures -- the Ozone line naming oz_o3best, its floor
         # and its hand-flagged count is ~1000 px on its own -- but the same
         # feedback is latent in every note block, so they all set it.
-        ax.text(0.01, 0.99, "\n".join(notes), transform=ax.transAxes,
-                ha="left", va="top", color=MUTED_COLOR, fontsize=9,
-                in_layout=False)
+        self._corr_notes_artist = ax.text(
+            0.01, 0.99, "\n".join(notes), transform=ax.transAxes,
+            ha="left", va="top", color=MUTED_COLOR, fontsize=9,
+            in_layout=False)
+        self._corr_notes_artist.set_visible(self.corr_show_plot_notes)
 
         self._update_corr_stats(fit, x, y, x_gas, y_gas, x_unit, y_unit)
 
