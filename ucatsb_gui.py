@@ -1509,6 +1509,21 @@ class UcatsbGui(QMainWindow):
         corr_smooth_p_label.setToolTip(self.pressure_smooth_spin.toolTip())
         corr_cal_form.addRow(corr_smooth_p_label, corr_smooth_p_row)
 
+        self.corr_flag_air_spin = QSpinBox()
+        self.corr_flag_air_spin.setRange(0, 90)
+        self.corr_flag_air_spin.setSuffix(" s")
+        self.corr_flag_air_spin.setMaximumWidth(62)
+        self.corr_flag_air_spin.setToolTip(self.flag_air_spin.toolTip())
+        self.corr_flag_air_spin.valueChanged.connect(
+            self.on_corr_cal_control_changed)
+        corr_flag_air_row = QHBoxLayout()
+        corr_flag_air_row.setSpacing(4)
+        corr_flag_air_row.addWidget(self.corr_flag_air_spin)
+        corr_flag_air_row.addStretch(1)
+        corr_flag_air_label = QLabel("Flag Air:")
+        corr_flag_air_label.setToolTip(self.flag_air_spin.toolTip())
+        corr_cal_form.addRow(corr_flag_air_label, corr_flag_air_row)
+
         corr_drift_row = QHBoxLayout()
         corr_drift_row.setSpacing(4)
         corr_drift_label = QLabel("Model:")
@@ -2127,10 +2142,10 @@ class UcatsbGui(QMainWindow):
         # window boxes below too, which the label and tooltip have to say.
         self.copy_mask_button = QPushButton(self.COPY_SETTINGS_LABEL)
         self.copy_mask_button.setToolTip(
-            "Copy warm-up, pressure tolerance and correction, Flag Air and\n"
+            "Copy warm-up, pressure tolerance, pressure smoothing, Flag Air and\n"
             "both cal mean windows from the current gas to every other\n"
-            "calibrated gas (CO2/N2O/CH4). The drift model and smoothing\n"
-            "window are left alone."
+            "calibrated gas (CO2/N2O/CH4). P/T correction choices and\n"
+            "calibration methods are left alone."
         )
         self.copy_mask_button.clicked.connect(self.on_copy_masking_to_all)
         mask_form.addRow(self.copy_mask_button)
@@ -3365,15 +3380,13 @@ class UcatsbGui(QMainWindow):
 
     SAVE_LABEL = "Save…"
 
-    # What the button copies: the masking values, both cal mean windows, and the
-    # calibration method controls. A fixed-slope value is gas-specific, so copied
-    # fixed-slope settings start the other gases at a neutral slope of 1.0000.
+    # What the button copies: only flight-level masking values and both cal mean
+    # windows. P/T correction choices and calibration methods are gas-specific
+    # analysis decisions, so they stay with each gas.
     COPIED_SETTING_KEYS = ("warmup_min", "end_flight_min", "require_pumps",
-                           "pressure_tol_mbar", "pressure_correct",
-                           "pressure_smooth_s", "temperature_correct",
+                           "pressure_tol_mbar", "pressure_smooth_s",
                            "flag_air_s",
-                           "cal1_window_s", "cal2_window_s",
-                           "drift_model", "drift_smooth_events", "fixed_slope")
+                           "cal1_window_s", "cal2_window_s")
     COPY_SETTINGS_LABEL = "Copy settings to all gases"
 
     def on_copy_masking_to_all(self):
@@ -3399,10 +3412,8 @@ class UcatsbGui(QMainWindow):
             # object makes yaml.safe_dump emit anchors (&id001/*id001) into
             # the conf file, and makes a later in-place edit of one gas's
             # window silently change the others.
-            copied = {key: copy.deepcopy(live[key]) for key in self.COPIED_SETTING_KEYS}
-            if copied["drift_model"] == "fixed slope":
-                copied["fixed_slope"] = 1.0
-            self.config[gas].update(copied)
+            self.config[gas].update(
+                {key: copy.deepcopy(live[key]) for key in self.COPIED_SETTING_KEYS})
         self._mark_dirty()
         # No refresh: the current gas's own settings are unchanged, so the
         # plots are still correct. The other gases redraw when selected.
@@ -3467,6 +3478,7 @@ class UcatsbGui(QMainWindow):
                     self.corr_pressure_correct_check,
                     self.corr_pressure_smooth_spin,
                     self.corr_temperature_correct_check,
+                    self.corr_flag_air_spin,
                     self.corr_drift_combo,
                     self.corr_smooth_spin,
                     self.corr_fixed_slope_spin,
@@ -3481,6 +3493,7 @@ class UcatsbGui(QMainWindow):
         self.corr_pressure_smooth_spin.setValue(settings.get("pressure_smooth_s", 0))
         self.corr_temperature_correct_check.setChecked(
             bool(settings.get("temperature_correct", False)))
+        self.corr_flag_air_spin.setValue(settings.get("flag_air_s", 0))
         self.corr_drift_combo.setCurrentText(settings["drift_model"])
         self.corr_smooth_spin.setValue(settings["drift_smooth_events"])
         self.corr_fixed_slope_spin.setValue(settings.get("fixed_slope", 0.0))
@@ -3494,6 +3507,7 @@ class UcatsbGui(QMainWindow):
         self.corr_pressure_smooth_spin.setEnabled(has_detector)
         self.corr_temperature_correct_check.setEnabled(
             self._temperature_column(gas) is not None)
+        self.corr_flag_air_spin.setEnabled(True)
         self.corr_drift_combo.setEnabled(True)
         self._show_corr_drift_extra(self.corr_drift_combo.currentText())
 
@@ -3537,6 +3551,7 @@ class UcatsbGui(QMainWindow):
             "pressure_correct": self.corr_pressure_correct_check.isChecked(),
             "pressure_smooth_s": self.corr_pressure_smooth_spin.value(),
             "temperature_correct": self.corr_temperature_correct_check.isChecked(),
+            "flag_air_s": self.corr_flag_air_spin.value(),
             "drift_model": self.corr_drift_combo.currentText(),
             "drift_smooth_events": self.corr_smooth_spin.value(),
             "fixed_slope": self.corr_fixed_slope_spin.value(),
