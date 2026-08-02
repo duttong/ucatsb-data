@@ -1485,15 +1485,6 @@ class UcatsbGui(QMainWindow):
             self.temperature_correct_check.toolTip())
         self.corr_temperature_correct_check.toggled.connect(
             self.on_corr_cal_control_changed)
-        corr_correct_row = QHBoxLayout()
-        corr_correct_row.setSpacing(6)
-        corr_correct_row.addWidget(self.corr_pressure_correct_check)
-        corr_correct_row.addWidget(self.corr_temperature_correct_check)
-        corr_correct_row.addStretch(1)
-        corr_correct_label = QLabel("Correct:")
-        corr_correct_label.setToolTip(self.pressure_correct_check.toolTip())
-        corr_cal_form.addRow(corr_correct_label, corr_correct_row)
-
         self.corr_pressure_smooth_spin = QSpinBox()
         self.corr_pressure_smooth_spin.setRange(0, 300)
         self.corr_pressure_smooth_spin.setSuffix(" s")
@@ -1501,13 +1492,18 @@ class UcatsbGui(QMainWindow):
         self.corr_pressure_smooth_spin.setToolTip(self.pressure_smooth_spin.toolTip())
         self.corr_pressure_smooth_spin.valueChanged.connect(
             self.on_corr_cal_control_changed)
-        corr_smooth_p_row = QHBoxLayout()
-        corr_smooth_p_row.setSpacing(4)
-        corr_smooth_p_row.addWidget(self.corr_pressure_smooth_spin)
-        corr_smooth_p_row.addStretch(1)
-        corr_smooth_p_label = QLabel("Smooth P:")
-        corr_smooth_p_label.setToolTip(self.pressure_smooth_spin.toolTip())
-        corr_cal_form.addRow(corr_smooth_p_label, corr_smooth_p_row)
+        self.corr_smooth_p_label = QLabel("Smooth P:")
+        self.corr_smooth_p_label.setToolTip(self.pressure_smooth_spin.toolTip())
+        corr_correct_row = QHBoxLayout()
+        corr_correct_row.setSpacing(6)
+        corr_correct_row.addWidget(self.corr_pressure_correct_check)
+        corr_correct_row.addWidget(self.corr_smooth_p_label)
+        corr_correct_row.addWidget(self.corr_pressure_smooth_spin)
+        corr_correct_row.addWidget(self.corr_temperature_correct_check)
+        corr_correct_row.addStretch(1)
+        corr_correct_label = QLabel("Apply:")
+        corr_correct_label.setToolTip(self.pressure_correct_check.toolTip())
+        corr_cal_form.addRow(corr_correct_label, corr_correct_row)
 
         self.corr_flag_air_spin = QSpinBox()
         self.corr_flag_air_spin.setRange(0, 90)
@@ -3476,6 +3472,7 @@ class UcatsbGui(QMainWindow):
         if not has_settings:
             for widget in (
                     self.corr_pressure_correct_check,
+                    self.corr_smooth_p_label,
                     self.corr_pressure_smooth_spin,
                     self.corr_temperature_correct_check,
                     self.corr_flag_air_spin,
@@ -3504,7 +3501,9 @@ class UcatsbGui(QMainWindow):
     def _update_corr_cal_enabled(self, gas):
         has_detector = self._pressure_column(gas) is not None
         self.corr_pressure_correct_check.setEnabled(has_detector)
-        self.corr_pressure_smooth_spin.setEnabled(has_detector)
+        smooth_enabled = has_detector and self.corr_pressure_correct_check.isChecked()
+        self.corr_smooth_p_label.setEnabled(smooth_enabled)
+        self.corr_pressure_smooth_spin.setEnabled(smooth_enabled)
         self.corr_temperature_correct_check.setEnabled(
             self._temperature_column(gas) is not None)
         self.corr_flag_air_spin.setEnabled(True)
@@ -3557,6 +3556,7 @@ class UcatsbGui(QMainWindow):
             "fixed_slope": self.corr_fixed_slope_spin.value(),
         })
         self.config[gas] = settings
+        self._update_corr_cal_enabled(gas)
         self._show_corr_drift_extra(settings["drift_model"])
         if gas == self.current_gas:
             self._apply_settings_to_controls(settings)
