@@ -141,6 +141,10 @@ REQUIRED_COLUMNS = [
     "j_sol_cals", "j_sol_aircal", "j_pumps",
 ] + [g["value_col"] for g in GASES.values()]
 
+ACQUISITION_METADATA_COLUMNS = {
+    "sample_id", "monotonic_ns", "clock_epoch", "clock_jump_s",
+}
+
 # Columns already exposed via a specific named control (gas traces, the
 # named aux radio options) -- excluded from the "Other" catch-all combo box
 # since picking them there would be redundant. This is a narrower set than
@@ -151,7 +155,7 @@ REQUIRED_COLUMNS = [
 # any other raw column (the Ozone *gas* trace is oz_o3best, which is named).
 NAMED_TRACE_COLUMNS = {
     "d1_P_mbars", "d2_P_mbars", "d1_T_gas", "d2_T_gas",
-} | {g["value_col"] for g in GASES.values()}
+} | ACQUISITION_METADATA_COLUMNS | {g["value_col"] for g in GASES.values()}
 
 AUX_OPTIONS = ["No Figure", "Detector Pressure", "T_gas", "Other"]
 

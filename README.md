@@ -772,10 +772,16 @@ gas without a floor is drawn as a single trace at full opacity.
 ## Data assumptions
 
 Expects a UCATS-B CSV with `datetime`, `j_sol_cals`, `j_sol_aircal`, and
-whichever of `d1_CO2_ppm`, `d1_N2O_ppb`, `d2_CH4_ppb` (plus matching
-`d?_P_mbars`/`d?_T_gas`) and `oz_o3`/`oz_p`/`oz_t` are present — a missing
-gas column just removes that gas from the selector rather than failing to
-load, but a file with none of the three gas columns will raise an error.
+whichever of `d1_CO2_ppm`, `d1_N2O_ppb`, `d2_CH4_ppb`, `oz_o3best`, and
+`w_H2Obest` are present, plus the matching detector/support columns such as
+`d?_P_mbars`, `d?_T_gas`, `oz_p`, `oz_t`, and `w_*`. A missing gas column just
+removes that gas from the selector rather than failing to load, but a file with
+none of the expected gas columns will raise an error.
+
+Current raw files may also include acquisition-clock metadata:
+`sample_id`, `monotonic_ns`, `clock_epoch`, and `clock_jump_s`. Those fields
+are preserved by the load and export paths but are treated as row metadata, not
+as selectable auxiliary traces.
 
 On load, `drop_presync_rows` discards any leading rows recorded before the
 datalogger's clock synced (a burst of rows with a too-late timestamp,
