@@ -528,23 +528,63 @@ missing from a given file's schema.
 Data is plotted **uncalibrated** (`d1_CO2_ppm`, `d1_N2O_ppb`, `d2_CH4_ppb`),
 not the `*c_ppm`/`*c_ppb` calibrated columns — this was a deliberate switch;
 don't revert to the calibrated columns without being asked. The **Calibrated**
-toolbar toggle does **not** change this: it overlays the
-result of *this repo's* `calibrate_series` in red (`CALIBRATED_COLOR`),
-keeping the raw trace in its usual blue `LINE_COLOR` underneath at
-`alpha=0.55`. The two traces are distinguished by **hue, not by which one is
-faded** — recoloring the raw trace when the overlay came on read as the raw
-data having changed. It is session-only and defaults off, precisely so
-the app never starts up showing calibrated data without the user asking.
+toolbar combo does **not** change this: it overlays the
+result of *this repo's* `calibrate_series`, keeping the raw trace in its
+usual blue `LINE_COLOR` underneath at `alpha=0.55`. Its "Solid" entry draws
+that overlay in plain red (`CALIBRATED_COLOR`); the two traces there are
+distinguished by **hue, not by which one is faded** — recoloring the raw
+trace when the overlay came on read as the raw data having changed. It is
+session-only and defaults to "Off", precisely so the app never starts up
+showing calibrated data without the user asking.
 
-It lives on the Timeseries **toolbar** (`PlotPane.calibrated_action`), not in
-the controls panel where it used to be a checkbox (moved 2026-07-30): it
-changes what the figure draws and nothing else, which is what everything else
-on that toolbar does, and sitting among the per-gas settings made a
-session-only view toggle look like something that gets saved. Two consequences
-worth keeping: it is hidden on the Calibration and Correlations panes, which
-have no raw trace to overlay; and because it no longer sits inside `cal_box`
-it does not grey out with it, so `_select_gas` disables it explicitly for a
-gas with `has_masking=False`.
+It lives on the Timeseries **toolbar** (`PlotPane.calibrated_action`, now
+wrapping a label+combo container rather than a checkable action), not in the
+controls panel where it used to be a checkbox (moved 2026-07-30): it changes
+what the figure draws and nothing else, which is what everything else on
+that toolbar does, and sitting among the per-gas settings made a
+session-only view toggle look like something that gets saved. Two
+consequences worth keeping: it is hidden on the Calibration and Correlations
+panes, which have no raw trace to overlay; and because it no longer sits
+inside `cal_box` it does not grey out with it, so it is disabled explicitly
+for a gas with `has_masking=False`, through `_update_calibrated_action`.
+`_select_gas` calls it rather than setting `setEnabled` inline, so a new
+call site can't forget the condition.
+
+**It is one combo, not the checkable toggle plus a separate "Color by"
+checkbox+combo it used to sit beside in the controls panel** (merged
+2026-08-06). Two controls answering one question — what the overlay looks
+like — could disagree in a way that read as a bug: picking a colour with the
+toggle off still forced the overlay on (`z_vals is not None` used to be
+OR-ed into the old toggle's own condition), so the toolbar could say "off"
+while a coloured overlay was on screen. `currentData()` is `"off"` (no
+overlay), `"none"` (the internal key behind the "Solid" label — chosen before
+the label was, and not worth an item-list migration to rename), or a key into
+`COLOR_BY_OPTIONS`; `on_calibrated_combo_changed` sets `self.show_calibrated`
+and `self.color_by` together from it, which is what makes `self.color_by`
+truthy **only** when `self.show_calibrated` is already `True` — an invariant
+`redraw()` now relies on instead of re-deriving it with an `or`.
+`_calibrated_combo_key()` is the inverse, for restoring the combo's
+selection after `_populate_color_combos` rebuilds its item list per file (a
+stale colour key is dropped there, same as the Correlations combo, but
+Off/Solid is left alone since it has nothing to do with which z-variables a
+file happens to offer). A pure view toggle throughout, so every transition —
+including Off/Solid, which as a separate toolbar action used to go through the
+full `refresh()` — goes through `_refresh_main`.
+
+**`PlotPane._add_toolbar_combo(label, tooltip)` builds a label+combo pair as
+one toolbar widget** and is what both this combo and the Correlations tab's
+own Color by combo (below) are built from — same manner, same
+"label + combo, one `addWidget`" toolbar slot, because the two are visually
+one design even though what they mean differs. It returns `(combo, action)`;
+the `action` is what the owner shows, hides or enables to affect the label
+and combo as a unit, the same pattern `stats_action`/`flag_action` already
+use. Every `PlotPane` instance gets **both** combos built — `calibrated_combo`
+*and* `color_combo` — and the owner shows only the one(s) a given pane needs:
+Timeseries shows Calibrated and hides Color by (its colouring is already
+folded into Calibrated), Correlations does the reverse (no raw trace to gate
+an overlay around, but its scatter always needs a colour choice), and
+Calibration hides both. Neither combo is connected or populated by
+`_add_toolbar_combo` itself — the owner does both, per file.
 
 ### GUI view-preservation (`ucatsb_gui.py` `redraw()`)
 
@@ -629,10 +669,11 @@ exception because it is inherently about *two* gases, so a per-gas panel
 beside it would be actively misleading about what is plotted.
 
 **The Timeseries note block has an off switch** — "Info notes", the last row of
-the Traces box (2026-07-31). Session-only, like the calibrated overlay and
-Correlations' "Hide flagged points", and for the same reasons: it is a view
-toggle, so it is absent from `DEFAULT_GAS_SETTINGS` and
-`_controls_to_settings()`, does not dirty the config, and **never replots** —
+the Traces box (2026-07-31; **off by default since 2026-08-06**, was on).
+Session-only, like the calibrated overlay and Correlations' "Hide flagged
+points", and for the same reasons: it is a view toggle, so it is absent from
+`DEFAULT_GAS_SETTINGS` and `_controls_to_settings()`, does not dirty the
+config, and **never replots** —
 `on_show_notes_toggled` sets the `Text`'s visibility and calls `draw_idle()`.
 Recomputing five gases' analyses to hide a caption would be absurd, and the
 user is usually zoomed in on something. Two consequences:
@@ -648,6 +689,141 @@ user is usually zoomed in on something. Two consequences:
 
 It hides the grey key only. The trace legend — which carries the cal-bottle
 means — stays, deliberately: it is data, not annotation.
+
+### "Color by" on the Timeseries tab
+
+Not a separate control any more — folded into the toolbar's Calibrated combo
+(2026-08-06; see that section above for the merge itself and the state it
+sets). Picking anything past "Off"/"Solid" **draws the calibrated overlay as
+points coloured by a third variable** — the same encodings, colormap and
+values (`_z_values`) the Correlations tab uses, so a feature picked out on
+the scatter can be found in time and the other way round.
+
+**Everything else on the figure stays**: the raw trace, the cal dives, both
+sets of cal-mean dots, the masking bands, the aux panel's bands. That is the
+point rather than an omission — the coloured record is meant to be read against
+the injections the calibration was built from, and stripping the figure down to
+the calibrated points (which is how this first shipped) took exactly that away.
+The only change is to the overlay itself: a `scatter` in place of the `Line2D`,
+because the colour is per row and a line carries one.
+
+- **Blanked rows are DROPPED rather than kept as NaN**, the opposite of the
+  line branch two lines above it. A line needs them to break over its gaps; a
+  scatter has no segments to draw across, and dropping them also normalises the
+  colour scale — and so the colorbar — over the points actually drawn.
+- **A gas with no usable calibration says so in the note block** rather than
+  the control appearing dead — on Ozone the figure is identical whichever
+  colouring is selected, which without the note reads as a bug.
+- **The colorbar is given BOTH axes** when the aux panel is up. Hung off the
+  main Axes alone it takes the width out of that one only, and the two panels —
+  which share a time axis — end up a colorbar's width out of alignment.
+- **The legend handle is enlarged to 25 pt².** A legend copies the artist's
+  marker size, and `CAL_MARKER_SIZE` is ~1.6 pt: legible as a trace across a
+  whole flight, invisible as a single key entry. Fixed rather than a control,
+  since a timeseries' density does not vary the way a tracer pair's does.
+
+Session-only, like the rest of the combo and Info notes: `self.color_by` is
+absent from `DEFAULT_GAS_SETTINGS` and `_controls_to_settings()`, does not
+dirty the config. It goes through **`_refresh_main`, not `refresh()`** — no
+mask, calibration or setting moves, so clearing the shared caches would make a
+view toggle recompute five gases and dirty every pane — and preserves the
+view, since the overlay lands on the same axes as the raw trace it is drawn
+over. Verified: `cal_points`, `span_gain`, `loo_rms` and the calibrated sum
+are identical across CO2, N2O and CH4 across every combo transition.
+
+### The Calibrated combo works on Ozone/H2O too
+
+Extended 2026-08-06 (same session as the Correlations combo below), on the
+observation that Ozone and H2O *are* calibrated products — just by their own
+instruments (the 2B ozone monitor, the water vapour sensor), not by this
+repo's cal-bottle two-point calibration. `has_masking=False` was never a
+reason to disable the Calibrated combo for them; it was only ever a reason
+`calibrate_series` has nothing to do for them.
+
+**Their presentable "calibrated" series is `df[value_col].mask(removed)`** —
+the same floor-filtered, hand-flag-filtered series `_corr_axis` already
+builds for these gases (`removed = _rejected_mask(gas) | flagged`) and the
+same one `show_filtered`'s red trace has always drawn. Nothing new was
+computed; what changed is when it is shown and how:
+
+- **`show_filtered` is no longer purely a function of `removed.any()`.** It
+  was, and still is, when the combo is "Off" — a real sensor fault must never
+  be hidden behind a control that defaults to "Off" at startup, which is why
+  this half of the condition is untouched. But it is now ALSO true whenever
+  `self.show_calibrated` is set, regardless of whether anything was removed
+  — `show_filtered = not has_masking and (bool(removed.any()) or
+  self.show_calibrated)`. This is what makes the combo reachable (and
+  colourable) on a floor gas with a clean flight, where `removed` is all-False
+  and the old condition would never have drawn anything to colour.
+- **`filtered_color = show_filtered and z_vals is not None`** is this gas
+  kind's half of `color_cal` — the two can never both be True (`has_masking`
+  makes the branches mutually exclusive) — and drives the same line→scatter
+  swap the cal-bottle branch uses, with the same reasoning (colour is per row,
+  a `Line2D` carries one).
+- **`colored_line = cal_line if color_cal else filtered_line if
+  filtered_color else None`** unifies the two branches for everything
+  downstream that used to check `color_cal` alone and reach for `cal_line`
+  specifically: the legend's marker-size enlarge, and `_add_colorbar`. Both
+  now branch on `colored_line is not None`.
+- **The "colour by X not applied" note is now unreachable for a floor gas.**
+  `self.color_by` is only ever truthy alongside `self.show_calibrated` (the
+  combo sets both together), and for `not has_masking` that already implies
+  `show_filtered`, which already implies `filtered_color` whenever `z_vals`
+  is set — so the note's guard tightened to `not color_cal and not
+  filtered_color` and its "this gas has no calibrated record to colour"
+  branch (the only one that fired for a floor gas) was deleted as dead code,
+  not left in as a false safety net.
+- **The floor-gas note line got the same conditional prefix** the cal-bottle
+  one already had: `f"colour = {z_label} on the filtered points, "` in place
+  of `"red = filtered, "` when `filtered_color`. It can now read "0 readings
+  … removed" — reachable only when the combo forced the branch open on a
+  clean flight — which is accurate, not a bug: it's confirming there was
+  nothing to remove, not claiming there was.
+- **`_update_calibrated_action` no longer gates on `has_masking`** — every
+  gas now has something for the combo to show, so it unconditionally enables
+  the action. Left as a method (rather than enabling once at construction)
+  so a future gas kind that genuinely has nothing to overlay has somewhere to
+  put the gate back.
+
+Verified: turning the combo on for CO2/N2O/CH4 (has_masking gases) is
+bit-identical to before this change (`cal_points`, `span_gain`, the calibrated
+sum), since none of the above touches their branch. On Ozone with real sensor
+faults, "Off" and "Solid" are visually identical to the pre-2026-08-06 figure
+— the mandatory display was never gated by the combo and still isn't; only
+picking an actual colour changes anything.
+
+### "Color by" on the Correlations toolbar
+
+Also not a separate controls-panel control any more (2026-08-06, the same
+change that merged the Timeseries one) — moved to the Correlations pane's
+own toolbar, in the same slot and built the same way
+(`PlotPane._add_toolbar_combo`) as the Timeseries tab's Calibrated combo,
+because the request that prompted the move was literally "present it the
+same way, same location." It replaced a checkbox + combo that sat in the
+Style group box of the Correlations controls panel.
+
+**It is simpler than Calibrated, on purpose, not just a smaller copy of it.**
+Correlations' scatter is always drawn — there is no raw-trace-versus-overlay
+distinction to gate an on/off toggle around — so the combo needs only two
+kinds of entry: `"off"` (plain single-colour points, `LINE_COLOR`) and a key
+into `COLOR_BY_OPTIONS`. There is no "Solid" entry the way Calibrated has
+"Off"/"Solid": "Off" already means "no colouring" here, not "nothing drawn",
+so a third state would be redundant. `on_corr_color_changed` reads
+`currentData()` straight into `self.corr_color_by` (`None` for `"off"`) —
+no `_calibrated_combo_key()`-style helper needed, since there is only one
+piece of state to reconstruct the selection from, not two.
+
+`_populate_color_combos` fills this combo from the same `available` list
+(and the same per-file fallback: a stale colour key is dropped, but "Off"
+survives a reload same as it always did) it uses for the Timeseries one —
+one method, both toolbar combos, for the reason the docstring there gives.
+
+The pane-visibility split lives in `_build_tabs`: `main_pane.color_action`
+and `cal_pane.color_action` are hidden (Timeseries already has colouring
+inside its own Calibrated combo; Calibration has no scatter to colour),
+while `corr_pane.calibrated_action` is hidden and `corr_pane.color_action`
+is left visible — the exact mirror image of how the three panes already
+split Calibrated visibility.
 
 **Every note block drawn inside an Axes is created with `in_layout=False`.**
 The panes' Figures use `constrained_layout`, and a `Text` is unclipped by
@@ -923,6 +1099,38 @@ that simply hangs.
 
 ### Correlations tab and `calibration_uncertainty`
 
+**The Timeseries gas and the Correlations X axis are the same selection**
+(2026-08-06): changing one changes the other. They are the two places in the
+app that ask "which tracer" in a way that means the same thing — the
+Timeseries panel plots it, the X axis is what everything else on that figure
+is measured against — and letting them drift apart over a session (pick CH4
+on one tab, forget it, wonder why the other tab is showing N2O) was worse
+than linking them. Y is independent; it is the second tracer, not another
+name for the same one.
+
+- `on_gas_changed` → `_sync_corr_x_gas`; `on_corr_gas_changed`(`axis="x"`) and
+  `on_corr_swap_axes` → `_sync_main_gas`. Neither direction calls the other's
+  handler — each updates state and pokes the other side's combo directly with
+  its signals blocked — which is what stops the pair from bouncing forever;
+  both helpers are no-ops once the two already agree, for the same reason.
+- **A real gas change on either tab goes through that tab's full gas-change
+  path**, not the lighter one its own handler would otherwise use.
+  `_sync_main_gas` returns whether anything changed so its callers can tell:
+  `on_corr_gas_changed`'s X branch calls `self.refresh(preserve_view=False)`
+  instead of `_refresh_corr`, and `on_corr_swap_axes` does the same rather
+  than always assuming a swap moved X onto a new gas. Both fall back to the
+  ordinary partial refresh when `_sync_main_gas` reports no change (a Y-axis
+  edit, or a swap where X already held that gas) — invalidating every per-gas
+  cache for a Y-only edit would be pure waste.
+- **Swapping axes moves the linked one.** `on_corr_swap_axes` always changes
+  which gas is on X, even when the user only meant to see the plot flipped,
+  so it goes through `_sync_main_gas` like any other X-axis change rather than
+  being treated as a special case that leaves the Timeseries tab alone.
+- At load, `_populate_corr_combos` seeds `corr_x_gas` from the same
+  `list(self.available_gases)[0]` that seeds `current_gas` — already in step
+  with no sync call needed, which is why neither `__init__` nor `load_csv`
+  calls `_sync_corr_x_gas` on the initial gas.
+
 A tracer-tracer scatter, calibrated wherever a calibration exists — and that
 is the point rather than a convenience: a slope from uncalibrated counts
 carries that detector's gain error into the slope, which is the number the
@@ -1018,17 +1226,24 @@ where slope moves by a couple of percent — and in `offset` mode it degrades to
 the flat line that mode implies rather than being hidden, so the returned axes
 list keeps a stable length (the GUI restores y-limits by zipping over it).
 
-**The z-axis coloring** (`CORR_COLOR_BY`, `CORR_COLORMAP`) maps each entry to
+**The z-axis coloring** (`COLOR_BY_OPTIONS`, `Z_COLORMAP`) maps each entry to
 `(label, column, colorbar label)`, with `column=None` meaning the time axis —
 which is not a plottable column and needs `mdates.date2num` going in and a
-`DateFormatter` on the colorbar coming out. Three rules:
+`DateFormatter` on the colorbar coming out. **Shared with the Timeseries tab's
+"Color by" coloured overlay** through `_z_values` and `_add_colorbar`, which is why
+neither name says `CORR` any more: reading the two figures against each other
+only works if a key means the same variable, with the same removals and the
+same colormap, on both. Three rules:
 
 - **The z variable joins the pairing rule.** A point with no value for it is
   dropped, not drawn: matplotlib would paint it in the colormap's "bad" color
-  (transparent), leaving it in the fit but invisible on the plot.
+  (transparent), leaving it in the fit but invisible on the plot. Both callers
+  intersect their own `keep` with `z_vals.notna()`; `_z_values` does not do it
+  for them, since only the caller knows what else it is dropping.
 - **Only encodings the loaded CSV can supply are offered** — the schema
-  differs between flights, so `oz_p` may not exist. `_populate_corr_color_combo`
-  also clears a selection the new file cannot honour.
+  differs between flights, so `oz_p` may not exist. `_populate_color_combos`
+  fills *both* panels' combos from one place and clears a selection the new
+  file cannot honour on either.
 - **`turbo`, not `jet`/`rainbow`.** Same rainbow ordering, monotonic
   luminance, so it doesn't manufacture bands of false structure. A colorbar is
   always drawn with it; a continuous color encoding with no scale is
@@ -1099,9 +1314,14 @@ should be tuning per flight. The H2O floor is precautionary: the Jul 2026
 flight's minimum `w_H2Obest` is +14 ppm, so it currently removes nothing.
 
 The two floor gases are also the two with `has_masking=False` — no cal
-bottles, so no warm-up/pressure/cal-window machinery and no calibration.
-Anything iterating gases must not assume a cal-bottle gas: check
-`has_masking` (see the Correlations tab's `_corr_axis`).
+bottles, so no warm-up/pressure/cal-window machinery and no
+`calibrate_series` output. They are not uncalibrated data, though — both
+come off an instrument that calibrates its own reading, just not through
+this repo's two-point machinery — which is why the Timeseries toolbar's
+Calibrated combo works on them too (see that section) using the floor-
+filtered series in place of a `calibrate_series` result. Anything iterating
+gases must not assume a cal-bottle gas: check `has_masking` (see the
+Correlations tab's `_corr_axis`).
 
 - **The floor is well below zero deliberately.** Real near-zero ozone scatters
   negative; the Feb 2025 flight has 168 readings in −15..0 ppb (noise about a
@@ -1183,7 +1403,8 @@ Non-obvious behaviours, each deliberate:
   displayed trace, so a flag names the same rows after any recalibration. The
   cost is that a box drawn tightly around the calibrated overlay (an intercept
   away — ~10 ppm on CO2) can catch nothing, which is why an empty box says so
-  rather than doing nothing visible.
+  rather than doing nothing visible. This holds under "Color by" as well: that
+  mode changes how the overlay is drawn, not which trace the tool reads.
 - **Unflagging ignores the y-bounds entirely** and clears the whole time span.
   Not leniency: the default y-range is framed on the *filtered* series
   precisely so one 3500 ppb spike does not squash the record, which puts the

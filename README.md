@@ -46,11 +46,11 @@ Left panel:
   file restores that flight's own settings as any other load does. Launching
   with no argument still starts empty — nothing is opened for you.
 - **Save…** — writes the current settings to a config file (see [Per-flight settings](#per-flight-settings-configs)). **Nothing is saved automatically**; a `•` on the button means there are unsaved changes.
-- **Gas** — switch the main plot between CO2 (`d1_CO2_ppm`), N2O (`d1_N2O_ppb`), CH4 (`d2_CH4_ppb`), O3 (`oz_o3best`) and H2O (`w_H2Obest`), all uncalibrated. Only gases whose column exists in the loaded CSV are offered. O3 and H2O come from their own instruments rather than an Aeris detector, so they have no cal bottles and no masking controls — each has a validity floor instead (see [Validity floors](#validity-floors)).
+- **Gas** — switch the main plot between CO2 (`d1_CO2_ppm`), N2O (`d1_N2O_ppb`), CH4 (`d2_CH4_ppb`), O3 (`oz_o3best`) and H2O (`w_H2Obest`), all uncalibrated. Only gases whose column exists in the loaded CSV are offered. O3 and H2O come from their own instruments rather than an Aeris detector, so they have no cal bottles and no masking controls — each has a validity floor instead (see [Validity floors](#validity-floors)). **Linked to the Correlations tab's X axis** — changing either one changes the other, so the two tabs always agree on which tracer they're showing (Y is independent). See [Correlations](#correlations).
 - **Trace Above** — optionally add a smaller panel above the main plot: Detector Pressure, T_gas, or "Other". Detector Pressure/T_gas pull from whichever detector the active gas comes from (`d1` for CO2/N2O, `d2` for CH4). "Other" opens a combo box listing every remaining column in the loaded CSV (`oz_o3`, `oz_p`, `oz_t`, `j_sol_cals`, …), so anything in the file can be plotted without a dedicated control. A second combo box overlays any of those columns on a right-hand axis. "No Figure" returns to the single full-size plot.
 - **Data Masking** — warm-up exclusion (minutes from the start of the record), **End-flight exclude** (minutes from the *end* of the record — the descent is the busiest, least representative part of a flight, so trimming the tail is as routine as trimming the warm-up; default 0, measured back from the last timestamp there is, and shaded and labelled orange together with the warm-up as one exclusion at each end) and detector pressure tolerance (±mbar around 140 mbar). These are applied to the raw data *before* cal means are computed, not just drawn as bands — a cal point can disappear entirely if its averaging window has no valid data left. **Pumps on** (default off) keeps only data recorded with the sample pumps running (`j_pumps = 1`) — air measured with the pumps off is not ambient air. It has to default to off: a lab test or bench calibration runs pumps-off from end to end (the 2026-07-26 file is 100% pumps-off), and enabling it there would leave nothing at all. A row with no `j_pumps` value counts as pumps-off, since an unknown pump state is not evidence the pumps were running; a file whose schema predates the column greys the toggle out. Like warm-up and pressure it feeds the cal means as well as the plot, and its spans are shaded violet. **Flag Air** (0–90 s, default 0 = off) additionally drops the air data immediately following each cal injection, while the detector cells are still clearing cal gas; unlike the other two it affects only the calibrated product, never the cal means or the raw trace. See [Post-cal flush](#post-cal-flush-flag-air). **Copy settings to all gases** applies these three values *and both cal mean windows* to every calibrated gas (CO2/N2O/CH4 — Ozone has no masking at all), since they describe the instrument on this flight rather than the species. Only the drift model and its smoothing window are left alone, being a judgement about how noisy that gas's own cal record is. Settings remain per-gas; the button is a shortcut, not a mode.
 - **Cal Mean Windows** — one box per cal bottle, titled dynamically from `cals.yaml`: e.g. "50% Cal (CB09960) 206.51 ppm", or just "Cal (CC470901) 402.037 ppm" for a tank with no `info` label. The mole fraction shown is that tank's assigned value for whichever gas is currently active. Each box has a start/end offset in seconds relative to the last point in that calibration period (`Cal_p`), e.g. `-10 s` to `2 s` = `[Cal_p-10s, Cal_p+2s]` (positive values are allowed, reaching past `Cal_p`). Settings are saved per-gas to the flight's own `<dataset>_conf.yaml` (see [Per-flight settings](#per-flight-settings-dataset_confyaml)) and reloaded whenever that dataset is opened again.
-- **Calibration** — drift model and smoothing window for the two-point calibration, and a toggle to overlay the calibrated series on the main plot. See [Calibration](#calibration) below. Writing files out is the [Export](#export) tab's job, not this panel's — both products cover every gas at once, while everything here is per gas.
+- **Calibration** — drift model and smoothing window for the two-point calibration. See [Calibration](#calibration) below, including the **Calibrated** toolbar combo that overlays the result on the main plot. Writing files out is the [Export](#export) tab's job, not this panel's — both products cover every gas at once, while everything here is per gas.
 
 The **Timeseries**, **Calibration**, **Cal Tanks** and **Export** tabs share
 this one control panel — every control affects all of them. The
@@ -166,7 +166,7 @@ apply to**, listing whatever is currently on the figure:
 | Entry | When it appears |
 |---|---|
 | `<gas> (raw)` | always |
-| `<gas> (calibrated)` | "Show calibrated on main plot" is on |
+| `<gas> (calibrated)` | the toolbar's **Calibrated** combo is not "Off" |
 | `<column> (above, left)` | a Trace Above panel is shown |
 | `<column> (above, right)` | a right-axis trace is selected |
 
@@ -379,8 +379,8 @@ It behaves differently from the warm-up and pressure masks, deliberately:
 - **The calibrated series drops it** — along with the cal periods themselves,
   since the calibrated series is the *ambient* record — and the calibrated
   line *breaks* over each gap rather than drawing across it. The flagged span
-  is shaded teal on the main plot whether or not "Show calibrated" is on, so
-  the rows are visible before the overlay is turned on.
+  is shaded teal on the main plot whether or not the Calibrated combo is on,
+  so the rows are visible before the overlay is turned on.
 - **The cal means are unaffected.** The flush window covers ambient data only,
   which is disjoint from the cal-mean windows, so no cal point can be lost to
   it and the calibration coefficients are identical with it on or off.
@@ -484,12 +484,34 @@ drawing across. Nothing is thrown away by this: `cal_slope` and
 `cal_intercept` are emitted for every row, so the calibrated value of a cal
 period can be recomputed if it is ever wanted.
 
-- **Show calibrated on main plot** overlays this calibration on the timeseries
-  tab, keeping the raw trace visible underneath at reduced opacity, with
-  extrapolated spans hatched. The cal dots stay raw — they are the
-  calibration's inputs. The toggle is session-only and defaults off, so the app
-  never starts up showing calibrated data without being asked. Note this is
-  *this repo's* calibration, not the CSV's own `*c_ppm`/`*c_ppb` columns.
+- **The Calibrated combo**, at the right-hand end of the Timeseries toolbar,
+  overlays this calibration on the timeseries tab — keeping the raw trace
+  visible underneath at reduced opacity, with extrapolated spans hatched — or
+  colours it by a third variable. Three kinds of entry:
+  - **Off** — no overlay (the default at startup, so the app never opens
+    showing calibrated data without being asked).
+  - **Solid** — the plain overlay, in red; the cal dots stay raw, since they
+    are the calibration's inputs.
+  - **Time / Ozone / Pressure (`oz_p`)**, whichever the loaded CSV can
+    supply — colours the overlay's points by that variable instead of a flat
+    red, using the same encoding, `turbo` colormap and colorbar the
+    [Correlations](#correlations) tab uses, so a feature found on one figure
+    can be found on the other.
+
+  **It works on Ozone and H2O too**, even though neither is run through this
+  repo's two-point calibration: both are already calibrated products of their
+  own instruments, and for them the combo overlays and colours their
+  *filtered* record instead (sensor faults and hand flags removed — see
+  [Validity floors](#validity-floors)) — the good, presentable version of the
+  raw record, built differently but meaning the same thing. On a flight with
+  faults to remove, "Off" and "Solid" look the same as the always-shown red
+  trace described there; picking "Solid" or a colour on a *clean* flight
+  additionally draws that otherwise-invisible good-data trace.
+
+  Session-only either way: nothing about the data, the masks or the
+  calibration changes, the zoom is preserved, and the selection is not saved
+  with the flight. Note this is *this repo's* calibration, not the CSV's own
+  `*c_ppm`/`*c_ppb` columns.
 
 Writing this calibration out to a file is the [Export](#export) tab's job.
 
@@ -647,8 +669,11 @@ the per-gas controls are replaced rather than left there to be misread.
 Masking, cal windows and drift model for each gas still live on the other
 tabs, and each gas is analysed with *its own* saved settings.
 
-- **X axis / Y axis** — any two gases in the file, Ozone included. **Swap
-  axes** flips them.
+- **X axis / Y axis** — any two gases in the file, Ozone included. **X axis is
+  linked to the Timeseries tab's Gas selector** — pick a gas on either tab and
+  the other follows, so they always agree on which tracer is "the" gas; Y is
+  the independent second tracer. **Swap axes** flips them, and moves the
+  linked gas along with X.
 - **Marker size** — marker diameter in points. A whole flight is tens of
   thousands of points; small markers show structure that large ones fill in.
 - **Color by** — a z-axis encoding: **Time** or **Pressure (`oz_p`)**, drawn
@@ -658,7 +683,9 @@ tabs, and each gas is analysed with *its own* saved settings.
   does not invent bands of false structure. Points with no value for the
   chosen variable are dropped rather than drawn invisibly, and the `n` note
   says so. Only encodings the loaded CSV can supply are offered — a flight
-  whose schema lacks `oz_p` gets Time alone.
+  whose schema lacks `oz_p` gets Time alone. The **Timeseries** tab's toolbar
+  Calibrated combo offers the same list, colormap and values for colouring
+  its overlay, so the two figures can be read against each other.
 - **Error bars (1σ)** — see below.
 - **Linear fit (OLS)** — off by default. These plots usually have real
   structure (branches, mixing lines, profiles) that a single straight line
@@ -757,7 +784,11 @@ The timeseries of a gas with a floor therefore shows **two traces, in the same c
 gases use**: raw in blue underneath (faded), filtered in red on top — the same
 "blue is everything recorded, red is the series you should read" convention as
 the calibrated overlay. The red line *breaks* over each removed reading rather
-than drawing across it, and the note block says how many were removed.
+than drawing across it, and the note block says how many were removed. This
+is automatic and unconditional — it is never hidden behind the Timeseries
+toolbar's Calibrated combo, which for these two gases instead lets you force
+this same trace on (and colour it) even on a flight with nothing removed. See
+that combo's description above.
 
 The default y-range is framed on the **filtered** data. One −2292 ppb fault
 would otherwise set the scale and squash the entire real ozone record into the

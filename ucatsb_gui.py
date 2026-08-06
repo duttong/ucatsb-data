@@ -226,12 +226,17 @@ DEFAULT_CONFIG_PATH = Path(__file__).parent / "ucatsb_gui_config.yaml"
 DEFAULT_STATE_PATH = Path(__file__).parent / ".ucatsb_gui_state.yaml"
 RECENT_FILES_MAX = 10
 
-# What the Correlations tab can color points by: {key: (label, column,
-# colorbar label)}. `column` of None means the time axis, which is not a
-# plottable column and needs its own numeric conversion and tick format.
-# A key whose column is missing from the loaded CSV is simply not offered --
-# the schema differs between flights.
-CORR_COLOR_BY = {
+# What a figure can color points by: {key: (label, column, colorbar label)}.
+# `column` of None means the time axis, which is not a plottable column and
+# needs its own numeric conversion and tick format. A key whose column is
+# missing from the loaded CSV is simply not offered -- the schema differs
+# between flights.
+#
+# Shared by the Correlations tab and the Timeseries tab's "Color by"
+# calibrated overlay, from one table on purpose: the point of colouring the timeseries is to
+# read it against the scatter, which only works if the same key means the same
+# variable on the same colormap in both places.
+COLOR_BY_OPTIONS = {
     "time": ("Time", None, "Time (UTC-ish)"),
     "ozone": ("Ozone", "oz_o3best", "Ozone (ppb)"),
     "oz_p": ("Pressure (oz_p)", "oz_p", "oz_p (mbar)"),
@@ -240,7 +245,15 @@ CORR_COLOR_BY = {
 # rebuilt with monotonic luminance, so it does not invent bands of false
 # structure where the older maps go light-dark-light. A colorbar is always
 # drawn with it -- a continuous color encoding with no scale is unreadable.
-CORR_COLORMAP = "turbo"
+Z_COLORMAP = "turbo"
+# Marker diameter in points for the calibrated overlay when the Timeseries
+# toolbar's Calibrated combo has a colouring selected. Fixed rather than a
+# control: a whole flight is tens of thousands of samples at 1 Hz, so this is
+# about the largest that still reads as a trace rather than a band, and one
+# more control in that toolbar costs more than the choice is worth (the
+# Correlations tab has one because a scatter's density varies with the tracer
+# pair, where a timeseries' does not).
+CAL_MARKER_SIZE = 1.6
 
 DEFAULT_GAS_SETTINGS = {
     "warmup_min": 30,
@@ -610,23 +623,60 @@ class PlotPane(QWidget):
         for action in (self.stats_action, self.flag_action):
             self._style_toggle(action)
 
-        # A view toggle, not a setting: it overlays this repo's calibrated
-        # series on the figure and changes nothing else, so it belongs beside
-        # the other things that decide what the figure shows rather than in the
-        # per-gas settings panel, where it was taking a row and reading like
-        # something that gets saved. Nothing connects it here -- the owner
-        # does, and hides it on the panes that have no raw trace to overlay.
+        # A view toggle, not a setting: it decides what the figure shows and
+        # nothing else, so it belongs on the toolbar beside the other things
+        # that do that rather than in the per-gas settings panel, where it
+        # was taking a row and reading like something that gets saved.
+        #
+        # Two such combos are built here, in the same "label + combo, one
+        # toolbar widget" manner (`_add_toolbar_combo`) -- Calibrated for the
+        # Timeseries tab, Color by for Correlations. Both are built on every
+        # pane and the owner shows only the one(s) a given pane needs
+        # (`calibrated_action`/`color_action`.setVisible), the same pattern
+        # `stats_action`/`flag_action` already use. Neither combo is
+        # connected or populated here -- the owner does, per file, since
+        # which z-variables are offered depends on the loaded CSV.
         self.toolbar.addSeparator()
-        self.calibrated_action = QAction("Calibrated", self.toolbar)
-        self.calibrated_action.setCheckable(True)
-        self.calibrated_action.setToolTip(
-            "Overlay the calibrated series (red) on the raw trace (blue).\n\n"
-            "The raw trace stays exactly as it is -- the two are told apart\n"
-            "by colour, not by which is faded. Session-only and off at\n"
-            "startup, so the app never opens showing calibrated data\n"
-            "without being asked."
+        # One combo, not the checkable action plus the separate "Color by"
+        # checkbox+combo this used to be paired with in the Timeseries
+        # controls panel (merged 2026-08-06): those were two controls
+        # answering one question -- what the overlay looks like -- and could
+        # disagree in a way that looked like a bug, since a colour chosen
+        # with the toggle off still forced the overlay on. "Off" / "Solid" /
+        # a z-variable are now one selection with no combination left to go
+        # wrong.
+        self.calibrated_combo, self.calibrated_action = self._add_toolbar_combo(
+            "Calibrated:",
+            "Overlay the calibrated series on the raw trace (blue).\n\n"
+            "Off -- no overlay. Solid -- plain red, the two traces told apart\n"
+            "by colour alone. Anything else colours the calibrated points by\n"
+            "that variable, using the same encoding the Correlations tab\n"
+            "uses, so a feature found on one figure can be found on the\n"
+            "other.\n\n"
+            "Ozone and H2O have no cal-bottle calibration of their own; for\n"
+            "them this overlays and colours their filtered record instead --\n"
+            "sensor faults and hand flags removed, the closest thing to a\n"
+            "calibrated record for an instrument this repo doesn't itself\n"
+            "calibrate.\n\n"
+            "Session-only and off at startup, so the app never opens showing\n"
+            "calibrated data without being asked."
         )
-        self.toolbar.addAction(self.calibrated_action)
+        # Same manner, same toolbar slot as Calibrated -- but its own widget,
+        # not a relabelling of it: Correlations has no raw trace to gate an
+        # on/off toggle around (the scatter is always drawn), so its only
+        # question is which variable colours the points, "Off" standing in
+        # for none rather than for "nothing drawn" (merged from a separate
+        # checkbox+combo in that tab's controls panel, 2026-08-06, same as
+        # Calibrated's own merge).
+        self.color_combo, self.color_action = self._add_toolbar_combo(
+            "Color by:",
+            "Color each point by a third variable, so the scatter shows\n"
+            "where in the flight -- or at what pressure -- each part of the\n"
+            "correlation came from. Points with no value for it are dropped.\n\n"
+            "The same encodings, colormap and values the Timeseries tab's\n"
+            "Calibrated combo uses, so a feature found on one figure can be\n"
+            "found on the other."
+        )
 
         readout = QHBoxLayout()
         self.stats_combo = QComboBox()
@@ -696,6 +746,27 @@ class PlotPane(QWidget):
             f" color: {TOOL_ON_FG}; }}"
             f"QToolButton:checked:hover {{ background-color: {TOOL_ON_BG_HOVER}; }}"
         )
+
+    def _add_toolbar_combo(self, label, tooltip):
+        """A label + combo box added to the toolbar as one widget.
+
+        Returns `(combo, action)`: `action` is the QAction the toolbar hands
+        back from `addWidget`, and is what the owner shows, hides or enables
+        to affect the label and combo together as a unit -- exactly as it
+        already does for the checkable `stats_action`/`flag_action`. Nothing
+        here connects a signal or adds items to the combo; the owner does
+        both, because what's on offer (which z-variables, whether a gas can
+        be calibrated) depends on the loaded file.
+        """
+        container = QWidget()
+        row = QHBoxLayout(container)
+        row.setContentsMargins(4, 0, 4, 0)
+        row.setSpacing(4)
+        row.addWidget(QLabel(label))
+        combo = QComboBox()
+        combo.setToolTip(tooltip)
+        row.addWidget(combo)
+        return combo, self.toolbar.addWidget(container)
 
     def reset_nav(self):
         """Point the toolbar's Home at the newly-built full-scale view; its
@@ -963,12 +1034,21 @@ class UcatsbGui(QMainWindow):
         self.aux_selection = "No Figure"
         self.other_column = None
         self.right_axis_column = None
-        # Session-only view state, like the calibrated overlay: on at startup,
-        # never saved. `_notes_artist` is the Text the toggle reaches for, and
-        # is rebuilt (or set to None) by every redraw -- a stale one would hold
-        # a destroyed Axes, the same trap the stats selector has.
-        self.show_plot_notes = True
+        # Session-only view state, like the calibrated overlay: never saved.
+        # `_notes_artist` is the Text the toggle reaches for, and is rebuilt
+        # (or set to None) by every redraw -- a stale one would hold a
+        # destroyed Axes, the same trap the stats selector has. Off at
+        # startup (2026-08-06, changed from on): a clean figure by default,
+        # opt into the key rather than opt out of it.
+        self.show_plot_notes = False
         self._notes_artist = None
+        # What the Calibrated overlay looks like: None (off, or plain red),
+        # or a key into COLOR_BY_OPTIONS. Session only for the same reason as
+        # the two above -- it decides what the figure draws and nothing about
+        # the data. Set together with `show_calibrated` below, always by the
+        # toolbar's Calibrated combo (see on_calibrated_combo_changed) --
+        # never truthy on its own.
+        self.color_by = None
         self._loading = False
         self._initializing = True
         # Per-gas caches: the Correlations tab needs two gases' calibrations
@@ -1030,7 +1110,7 @@ class UcatsbGui(QMainWindow):
         self.corr_show_cals = False
         self.corr_show_plot_notes = True
         self._corr_notes_artist = None
-        # None = single-color points; otherwise a key into CORR_COLOR_BY.
+        # None = single-color points; otherwise a key into COLOR_BY_OPTIONS.
         self.corr_color_by = None
         # Off by default: a straight line through a tracer-tracer plot with
         # real structure in it describes almost none of that structure.
@@ -1177,7 +1257,7 @@ class UcatsbGui(QMainWindow):
             self.pumps_check.setChecked(False)
 
         self._populate_corr_combos()
-        self._populate_corr_color_combo()
+        self._populate_color_combos()
 
         was_initializing = self._initializing
         self._initializing = True
@@ -1407,25 +1487,6 @@ class UcatsbGui(QMainWindow):
         toggle_grid.addWidget(self.corr_fit_check, 1, 0)
         toggle_grid.addWidget(self.corr_notes_check, 1, 1)
         style_form.addRow(toggle_grid)
-
-        # Checkbox + combo on one spanning row (see the drift-model row: in
-        # the two-column form the label gets squeezed to nothing by a
-        # stretching field).
-        color_row = QHBoxLayout()
-        color_row.setSpacing(4)
-        self.corr_color_check = QCheckBox("Color by")
-        self.corr_color_check.setToolTip(
-            "Color each point by a third variable, so the scatter shows\n"
-            "where in the flight — or at what pressure — each part of the\n"
-            "correlation came from. Points with no value for it are dropped."
-        )
-        self.corr_color_check.toggled.connect(self.on_corr_color_changed)
-        color_row.addWidget(self.corr_color_check)
-        self.corr_color_combo = QComboBox()
-        self.corr_color_combo.setEnabled(False)
-        self.corr_color_combo.currentIndexChanged.connect(self.on_corr_color_changed)
-        color_row.addWidget(self.corr_color_combo, 1)
-        style_form.addRow(color_row)
         vbox.addWidget(style_box)
 
         # Flagging from this figure needs one thing the timeseries does not:
@@ -1610,22 +1671,52 @@ class UcatsbGui(QMainWindow):
         vbox.addStretch(1)
         return panel
 
-    def _populate_corr_color_combo(self):
-        """Offer the z-axis encodings this file can actually supply. Time
-        always works; file columns such as Ozone and `oz_p` are offered only
-        when the loaded CSV has them."""
-        available = [(key, spec) for key, spec in CORR_COLOR_BY.items()
+    def _populate_color_combos(self):
+        """Offer the z-axis encodings this file can actually supply: as
+        entries (after "Off") in the Correlations toolbar's Color by combo,
+        and (after "Off"/"Solid") in the Timeseries toolbar's Calibrated
+        combo.
+
+        Time always works; file columns such as Ozone and `oz_p` are offered
+        only when the loaded CSV has them. Both combos are filled from one
+        place for the same reason the two menus in _rebuild_recent_menus are:
+        one file, one answer to what it can colour by.
+        """
+        available = [(key, spec) for key, spec in COLOR_BY_OPTIONS.items()
                      if spec[1] is None or spec[1] in self.df.columns]
-        combo = self.corr_color_combo
-        combo.blockSignals(True)
-        combo.clear()
-        for key, (label, _, _) in available:
-            combo.addItem(label, key)
-        combo.blockSignals(False)
+        keys = [key for key, _ in available]
+
         # A coloring whose column this file lacks cannot survive the reload.
-        if self.corr_color_by not in [key for key, _ in available]:
+        # "Off" -- whether Correlations is coloured at all -- is untouched,
+        # since that has nothing to do with which z-variables this file
+        # happens to offer.
+        if self.corr_color_by not in keys:
             self.corr_color_by = None
-            self.corr_color_check.setChecked(False)
+        corr_combo = self.corr_pane.color_combo
+        corr_combo.blockSignals(True)
+        corr_combo.clear()
+        corr_combo.addItem("Off", "off")
+        for key, (label, _, _) in available:
+            corr_combo.addItem(label, key)
+        corr_combo.setCurrentIndex(corr_combo.findData(self.corr_color_by or "off"))
+        corr_combo.blockSignals(False)
+
+        # Same fallback for the Timeseries combo: a stale colour key is
+        # dropped, but Off/Solid -- whether the overlay is drawn at all -- is
+        # untouched, since that half of the selection has nothing to do with
+        # which z-variables this file happens to offer.
+        if self.color_by not in keys:
+            self.color_by = None
+        cal_combo = self.main_pane.calibrated_combo
+        cal_combo.blockSignals(True)
+        cal_combo.clear()
+        cal_combo.addItem("Off", "off")
+        cal_combo.addItem("Solid", "none")
+        for key, (label, _, _) in available:
+            cal_combo.addItem(label, key)
+        cal_combo.setCurrentIndex(cal_combo.findData(self._calibrated_combo_key()))
+        cal_combo.blockSignals(False)
+        self._update_calibrated_action()
 
     def _populate_corr_combos(self):
         """Offer every gas in this file, Ozone included.
@@ -1637,6 +1728,10 @@ class UcatsbGui(QMainWindow):
         line up with no resampling. The axis label says which it is.
         """
         gases = list(self.available_gases)
+        # gases[0] here is `self.current_gas` (set from the same dict, same
+        # order, in load_csv) -- so X already agrees with the Timeseries gas
+        # without an explicit sync call. See _sync_corr_x_gas / _sync_main_gas
+        # for what keeps the two in step from here on.
         self.corr_x_gas = gases[0] if gases else None
         # Default to a genuine pair rather than a gas against itself, which
         # would draw a diagonal line and look like a bug.
@@ -1913,7 +2008,7 @@ class UcatsbGui(QMainWindow):
         # and does not dirty the config. Spanning row: a two-column form row
         # would put a label beside a control that already reads as a sentence.
         self.show_notes_check = QCheckBox("Info notes")
-        self.show_notes_check.setChecked(True)
+        self.show_notes_check.setChecked(self.show_plot_notes)
         self.show_notes_check.setToolTip(
             "Show the grey key at the bottom of the Timeseries figure -- what\n"
             "each shaded band means, how many readings were removed and why.\n\n"
@@ -2422,7 +2517,8 @@ class UcatsbGui(QMainWindow):
         self.cal_pane = PlotPane()
         self.main_pane.on_box = self.on_stats_box
         self.main_pane.on_flag_box = self.on_flag_box
-        self.main_pane.calibrated_action.toggled.connect(self.on_calibrated_toggled)
+        self.main_pane.calibrated_combo.currentIndexChanged.connect(
+            self.on_calibrated_combo_changed)
         # The Calibration tab's three panels each mean something different
         # (response deviation, coefficients, residuals), so a single box-stats
         # readout there would be ambiguous -- Timeseries only for now. Flagging
@@ -2435,6 +2531,11 @@ class UcatsbGui(QMainWindow):
         # quantities that are calibrated already or not calibrated at all, so
         # there is no raw trace there to lay a calibrated one over.
         self.cal_pane.calibrated_action.setVisible(False)
+        # Color by (Correlations' own) is likewise not this pane's: coloring
+        # the calibrated overlay is what the Calibrated combo above already
+        # does, and neither of these three panels is a tracer-tracer scatter.
+        self.main_pane.color_action.setVisible(False)
+        self.cal_pane.color_action.setVisible(False)
         # Keep the historical attribute names bound to the timeseries pane so
         # redraw()'s existing body needs no changes.
         self.figure = self.main_pane.figure
@@ -2450,7 +2551,12 @@ class UcatsbGui(QMainWindow):
         # timeseries. The ambiguity Stats could not resolve (a box names two
         # gases' rows) is settled by the explicit target combo instead.
         self.corr_pane.stats_action.setVisible(False)
+        # The reverse of the other two panes: Correlations has no raw trace
+        # to overlay a calibration on (Calibrated hides), but its scatter is
+        # always drawn and just needs a colour choice (Color by shows).
         self.corr_pane.calibrated_action.setVisible(False)
+        self.corr_pane.color_combo.currentIndexChanged.connect(
+            self.on_corr_color_changed)
         self.corr_pane.on_flag_box = self.on_corr_flag_box
         self.corr_pane.canvas.mpl_connect("button_press_event", self.on_corr_tooltip_press)
 
@@ -2989,12 +3095,11 @@ class UcatsbGui(QMainWindow):
         has_masking = GASES[gas].get("has_masking", True)
         self.mask_box.setEnabled(has_masking)
         self.cal_box.setEnabled(has_masking)
-        # The overlay toggle moved to the toolbar, so it no longer greys out
-        # with the box it used to sit in -- it has to be told. A gas with no
-        # cal bottles has nothing to overlay. Its checked state is left alone,
-        # exactly as a disabled checkbox's would be, so switching away and back
-        # returns it as it was.
-        self.main_pane.calibrated_action.setEnabled(has_masking)
+        # The overlay control lives on the toolbar, so it is not tied to a
+        # per-gas box's enabled state and has to be told separately -- though
+        # since 2026-08-06 every gas has something for it to overlay (see
+        # _update_calibrated_action).
+        self._update_calibrated_action()
         # flag_box is deliberately absent from that list -- see where it is
         # built. Its readout is per gas, so it does have to follow along.
         # The pressure correction needs THIS gas's detector pressure column,
@@ -3021,9 +3126,34 @@ class UcatsbGui(QMainWindow):
         if not new_gas:
             return
         self._select_gas(new_gas)
+        self._sync_corr_x_gas(new_gas)
         if self._initializing:
             return
         self.refresh()
+
+    def _sync_corr_x_gas(self, gas):
+        """Point the Correlations X axis at `gas`, mirroring a Timeseries gas
+        change so the two tabs describe the same tracer on the axis they
+        share. See `_sync_main_gas` for the reverse direction (a Correlations
+        X-axis change driving the Timeseries gas).
+
+        A no-op once the two already agree, which is what stops the pair
+        from bouncing back and forth between the two handlers -- neither
+        calls the other; both just update state and the other side's combo
+        directly, with its signals blocked.
+        """
+        if gas not in self.available_gases or gas == self.corr_x_gas:
+            return
+        self.corr_x_gas = gas
+        self.corr_x_combo.blockSignals(True)
+        self.corr_x_combo.setCurrentText(gas)
+        self.corr_x_combo.blockSignals(False)
+        self._populate_corr_flag_target()
+        self._populate_corr_cal_target()
+        # No redraw here: on_gas_changed's own refresh() call (skipped only
+        # while _initializing, when nothing has been drawn yet regardless)
+        # already invalidates every per-gas cache and marks the Correlations
+        # pane dirty, exactly as it does for the gas that changed.
 
     def on_show_notes_toggled(self, checked):
         """Show or hide the Timeseries figure's grey note block.
@@ -3040,6 +3170,17 @@ class UcatsbGui(QMainWindow):
         if self._notes_artist is not None:
             self._notes_artist.set_visible(checked)
             self.canvas.draw_idle()
+
+    def _update_calibrated_action(self):
+        """The Calibrated combo now has something to show for every gas
+        (2026-08-06): the calibrate_series result for a cal-bottle gas, or
+        the floor-filtered "kept" series for Ozone/H2O -- both are the
+        presentable, curated version of the raw record, just built
+        differently (see redraw()'s `show_filtered`/`filtered_color`). Left
+        as a method, called on every gas change, in case a future gas kind
+        needs the gate back rather than baking "always enabled" in at
+        __init__."""
+        self.main_pane.calibrated_action.setEnabled(True)
 
     def on_control_changed(self):
         if self._loading or self._initializing or self.current_gas is None:
@@ -3449,10 +3590,35 @@ class UcatsbGui(QMainWindow):
             self.corr_y_gas = gas_key
         self._populate_corr_flag_target()
         self._populate_corr_cal_target()
-        # A different tracer is a different set of numbers on that axis, so
-        # the old limits mean nothing -- rescale, as a gas change does on the
-        # timeseries.
-        self._refresh_corr(preserve_view=False)
+        # The X axis is the tracer this figure shares with the Timeseries
+        # tab (see _sync_corr_x_gas for that direction), so an X-axis change
+        # is also a gas change THERE -- the full refresh() a gas change
+        # always goes through, not the partial _refresh_corr, since every
+        # per-gas cache needs invalidating together, not just this axis'.
+        # Y is independent and always takes the partial path.
+        if axis == "x" and self._sync_main_gas(gas_key):
+            self.refresh(preserve_view=False)
+        else:
+            # A different tracer is a different set of numbers on that axis,
+            # so the old limits mean nothing -- rescale, as a gas change does
+            # on the timeseries.
+            self._refresh_corr(preserve_view=False)
+
+    def _sync_main_gas(self, gas):
+        """Point the Timeseries tab at `gas`, as a genuine gas change there.
+
+        Returns whether anything changed, so callers can tell a real switch
+        (which needs the full gas-change refresh) from a no-op (`gas` was
+        already current -- a Y-axis change, or a swap that leaves X where it
+        was). See `_sync_corr_x_gas` for the reverse direction.
+        """
+        if gas not in self.available_gases or gas == self.current_gas:
+            return False
+        self.gas_combo.blockSignals(True)
+        self.gas_combo.setCurrentText(gas)
+        self.gas_combo.blockSignals(False)
+        self._select_gas(gas)
+        return True
 
     def _populate_corr_cal_target(self):
         """Rebuild the settings target from the current X/Y tracers.
@@ -3983,15 +4149,26 @@ class UcatsbGui(QMainWindow):
         # the tracer you were working on to the other one.
         self._populate_corr_flag_target()
         self._populate_corr_cal_target()
-        self._refresh_corr(preserve_view=False)
+        # The new X gas follows onto the Timeseries tab, same as any other
+        # X-axis change (see on_corr_gas_changed) -- a swap moves X even
+        # though the user didn't touch that combo directly.
+        if self._sync_main_gas(self.corr_x_gas):
+            self.refresh(preserve_view=False)
+        else:
+            self._refresh_corr(preserve_view=False)
 
-    def on_corr_color_changed(self):
-        """z-axis coloring on/off, or a different variable to color by."""
+    def on_corr_color_changed(self, _index):
+        """The Correlations toolbar's Color by combo: "Off" (plain single
+        colour) or a key into COLOR_BY_OPTIONS. One combo, not the separate
+        checkbox+combo this used to be in the controls panel (merged
+        2026-08-06, same as the Timeseries tab's Calibrated combo) -- there
+        is no "Solid" entry the way Calibrated has "Off"/"Solid", because
+        Correlations' scatter is always drawn; "Off" already means "no
+        colouring" rather than "nothing shown"."""
         if self._loading or self._initializing:
             return
-        self.corr_color_combo.setEnabled(self.corr_color_check.isChecked())
-        self.corr_color_by = (self.corr_color_combo.currentData()
-                              if self.corr_color_check.isChecked() else None)
+        data = self.corr_pane.color_combo.currentData()
+        self.corr_color_by = data if data != "off" else None
         self._refresh_corr(preserve_view=True)
 
     def on_corr_style_changed(self):
@@ -4029,6 +4206,15 @@ class UcatsbGui(QMainWindow):
         self._dirty["corr"] = True
         if not preserve_view:
             self._preserve["corr"] = False
+        self._draw_current_tab()
+
+    def _refresh_main(self, preserve_view=True):
+        """Redraw the timeseries pane only -- the Calibrated combo's route,
+        for the same reason _refresh_corr exists: it changes what is drawn and
+        nothing that any pane's analysis depends on."""
+        self._dirty["main"] = True
+        if not preserve_view:
+            self._preserve["main"] = False
         self._draw_current_tab()
 
     def _flash_button(self, button, message, restore, msec=1600):
@@ -4243,11 +4429,36 @@ class UcatsbGui(QMainWindow):
             parts.append(f"({stats['n_clipped']} in span, outside box vertically)")
         self.main_pane.set_stats_text("   ".join(parts))
 
-    def on_calibrated_toggled(self, checked):
-        self.show_calibrated = checked
+    def on_calibrated_combo_changed(self, _index):
+        """The Calibrated combo: whether the overlay is drawn, and what it
+        looks like if so.
+
+        One combo where there used to be two controls -- the toolbar's
+        checkable Calibrated action and the controls panel's "Color by"
+        checkbox+combo (merged 2026-08-06). "Off" (no overlay) and "Solid"
+        (plain red, the old toggle's ON state) sit alongside the same
+        z-variables the Correlations tab offers; `currentData()` is "off",
+        "none" (the internal key behind "Solid" -- picked before the label
+        was, and not worth an item-list migration to rename), or a key into
+        COLOR_BY_OPTIONS.
+
+        A pure view toggle -- nothing about a mask, calibration or setting
+        moves -- so this goes through `_refresh_main` rather than `refresh()`
+        for every transition, including Off/Solid, which as a separate
+        toolbar action used to take the full `refresh()` unnecessarily.
+        """
         if self._loading or self._initializing:
             return
-        self.refresh(preserve_view=True)
+        data = self.main_pane.calibrated_combo.currentData()
+        self.show_calibrated = data != "off"
+        self.color_by = data if data not in ("off", "none") else None
+        self._refresh_main(preserve_view=True)
+
+    def _calibrated_combo_key(self):
+        """The Calibrated combo entry matching (show_calibrated, color_by)."""
+        if not self.show_calibrated:
+            return "off"
+        return self.color_by or "none"
 
     # ---------------------------------------------------------------- export
 
@@ -5005,6 +5216,19 @@ class UcatsbGui(QMainWindow):
         display_cal_points = analysis["display_cal_points"]
         post_cal_flush = analysis["post_cal_flush"]
 
+        # "Color by": the calibrated overlay drawn as points coloured by a
+        # third variable, on the ordinary figure -- everything else stays
+        # exactly where it was. The colours come from the same `_z_values` the
+        # Correlations scatter uses, so the two figures can be read against
+        # each other, and the cal dives, cal-mean dots and masking bands are
+        # still there to say which injections the calibration was built from.
+        #
+        # `self.color_by` can only be truthy when `self.show_calibrated` is
+        # already True -- the Calibrated combo sets both together (see
+        # on_calibrated_combo_changed) -- so there is no separate "colouring
+        # implies the overlay" case left to handle here.
+        z_vals, z_label, z_is_time = self._z_values(self.color_by)
+
         if has_masking:
             shade_intervals(ax, df["datetime"], not_air, CAL_SHADE_COLOR, alpha=0.3)
             shade_intervals(ax, df["datetime"], trimmed, WARMUP_EXCLUDE_COLOR, alpha=0.15)
@@ -5020,6 +5244,9 @@ class UcatsbGui(QMainWindow):
         # legible rather than silently swapped in.
         calibration = self._get_calibration() if self.show_calibrated else None
         show_cal = bool(calibration and calibration.get("ok"))
+        # A gas with no usable calibration has nothing to colour; the note
+        # says so rather than the control appearing to do nothing.
+        color_cal = show_cal and z_vals is not None
 
         # Registered as they are plotted rather than scraped back off the Axes
         # afterwards: the artists carry no units and no stable identity, and a
@@ -5030,7 +5257,7 @@ class UcatsbGui(QMainWindow):
             "main:raw", f"{self.current_gas} (raw)", ax, df["datetime"],
             df[value_col], unit)
 
-        # A gas with a physical floor (Ozone) gets the same two-trace
+        # A gas with a physical floor (Ozone, H2O) gets the same two-trace
         # treatment as a calibrated one -- raw blue underneath, the kept data
         # in red on top -- deliberately reusing LINE_COLOR/CALIBRATED_COLOR
         # rather than inventing a palette: on both figures red means "the
@@ -5042,7 +5269,19 @@ class UcatsbGui(QMainWindow):
         rejected = self._rejected_mask(self.current_gas)
         flagged = analysis["flagged"]
         removed = rejected | flagged
-        show_filtered = bool(removed.any()) and not has_masking
+        # Shown whenever something was removed -- a data-integrity default
+        # that predates the Calibrated combo and stays unconditional, so a
+        # sensor fault is never hidden behind a control defaulting to "Off"
+        # -- OR on request through that same combo, which is what makes this
+        # branch reachable (and colourable) even on a flight with nothing to
+        # remove. A floor gas has no calibrate_series output; this filtered
+        # series is its presentable analogue -- the instrument's own already-
+        # calibrated product, just not run through this repo's calibration.
+        show_filtered = not has_masking and (bool(removed.any()) or self.show_calibrated)
+        # This gas's half of `color_cal` below: exactly one of the two is
+        # ever True for a given gas (has_masking makes them mutually
+        # exclusive), and downstream legend/colorbar/note code checks both.
+        filtered_color = show_filtered and z_vals is not None
 
         plot_data = df[["datetime", value_col]].dropna()
         line, = ax.plot(plot_data["datetime"], plot_data[value_col], color=LINE_COLOR,
@@ -5057,9 +5296,19 @@ class UcatsbGui(QMainWindow):
             self._register_stats_trace(
                 "main:filtered", f"{self.current_gas} (filtered)", ax,
                 df["datetime"], filtered, unit)
-            keep = filtered.notna() | removed
-            filtered_line, = ax.plot(df["datetime"][keep], filtered[keep],
-                                     color=CALIBRATED_COLOR, linewidth=1.2)
+            if filtered_color:
+                # Same scatter-in-place-of-line swap as the calibrated branch
+                # below, and for the same reason: the colour is per row.
+                f_df = pd.DataFrame({"datetime": df["datetime"],
+                                     "v": filtered, "z": z_vals}).dropna()
+                filtered_line = ax.scatter(
+                    f_df["datetime"], f_df["v"], s=CAL_MARKER_SIZE ** 2,
+                    c=f_df["z"], cmap=Z_COLORMAP, alpha=0.9,
+                    edgecolors="none", zorder=4)
+            else:
+                keep = filtered.notna() | removed
+                filtered_line, = ax.plot(df["datetime"][keep], filtered[keep],
+                                         color=CALIBRATED_COLOR, linewidth=1.2)
 
         # Manually flagged points, struck out at their RAW values -- which is
         # also the basis the flag box matches against, so the marker sits
@@ -5085,11 +5334,25 @@ class UcatsbGui(QMainWindow):
             self._register_stats_trace(
                 "main:cal", f"{self.current_gas} (calibrated)", ax,
                 df["datetime"], calibrated, unit)
-            keep = calibrated.notna() | calibration["blanked"]
-            cal_df = pd.DataFrame({"datetime": df["datetime"][keep],
-                                   "v": calibrated[keep]})
-            cal_line, = ax.plot(cal_df["datetime"], cal_df["v"],
-                                color=CALIBRATED_COLOR, linewidth=1.2)
+            if color_cal:
+                # A point per sample rather than a line: the colour is per row
+                # and a Line2D carries one. Blanked rows are DROPPED here
+                # rather than kept as NaN -- a scatter has no segments to draw
+                # across a gap, so it needs none of the line's trick, and
+                # dropping them also keeps the colour scale (and so the
+                # colorbar) normalised over the points actually drawn.
+                cal_df = pd.DataFrame({"datetime": df["datetime"],
+                                       "v": calibrated, "z": z_vals}).dropna()
+                cal_line = ax.scatter(
+                    cal_df["datetime"], cal_df["v"], s=CAL_MARKER_SIZE ** 2,
+                    c=cal_df["z"], cmap=Z_COLORMAP, alpha=0.9,
+                    edgecolors="none", zorder=4)
+            else:
+                keep = calibrated.notna() | calibration["blanked"]
+                cal_df = pd.DataFrame({"datetime": df["datetime"][keep],
+                                       "v": calibrated[keep]})
+                cal_line, = ax.plot(cal_df["datetime"], cal_df["v"],
+                                    color=CALIBRATED_COLOR, linewidth=1.2)
             for start, end in find_intervals(df["datetime"], calibration["extrapolated"]):
                 ax.axvspan(start, end, facecolor="none", edgecolor=CAL_SHADE_COLOR,
                            hatch="///", alpha=0.30, linewidth=0)
@@ -5099,6 +5362,14 @@ class UcatsbGui(QMainWindow):
                 cal_mean_scatter = ax.scatter(
                     xs, ys, facecolors="none", edgecolors=CALIBRATED_COLOR,
                     s=52, linewidths=1.2, zorder=5)
+
+        # Whichever of the two overlays actually got coloured, if either --
+        # color_cal and filtered_color can never both be True (has_masking
+        # makes the branches mutually exclusive), so this is unambiguous.
+        # Feeds the legend-enlarge and the colorbar below, which don't care
+        # which kind of gas produced the coloured points.
+        colored_line = (cal_line if color_cal
+                        else filtered_line if filtered_color else None)
 
         # cal0_pts/cal1_pts are guaranteed empty when has_masking is False, so
         # cal0_label/cal1_label are never read below
@@ -5159,6 +5430,17 @@ class UcatsbGui(QMainWindow):
             label.set_horizontalalignment("right")
 
         notes = []
+        # Unreachable for a floor gas: filtered_color is True whenever
+        # color_by is (show_filtered follows self.show_calibrated there, and
+        # self.color_by is only ever truthy alongside it), so this is only
+        # the cal-bottle gas with no usable calibration.
+        if self.color_by is not None and not color_cal and not filtered_color:
+            # Asked for, and nothing to apply it to. Said out loud, since the
+            # control otherwise looks broken -- the figure is exactly what it
+            # was before this gas was picked from the combo.
+            reason = (calibration or {}).get("reason") or "no calibration"
+            notes.append(f"colour by {COLOR_BY_OPTIONS[self.color_by][0].lower()} "
+                         f"not applied — {reason}")
         if has_masking:
             if cal.any():
                 notes.append("gray = calibration/cal-air (j_sol_cals, j_sol_aircal"
@@ -5195,9 +5477,11 @@ class UcatsbGui(QMainWindow):
                     f"({analysis['flag_air_s']} s detector flush after each cal)"
                 )
             if show_cal:
-                notes.append("red = calibrated, blue = raw; calibrated shows "
-                             "good air only (cal periods, flush and masked "
-                             "spans blanked)")
+                notes.append(
+                    (f"colour = {z_label} on the calibrated points, "
+                     if color_cal else "red = calibrated, ")
+                    + "blue = raw; calibrated shows good air only "
+                      "(cal periods, flush and masked spans blanked)")
                 if cal_mean_scatter is not None:
                     notes.append("open red circles = cal means on the calibrated scale")
             # Said whether or not the overlay is on: it changes the calibrated
@@ -5249,14 +5533,17 @@ class UcatsbGui(QMainWindow):
                     f"  ×{' ×'.join(terms)}; cal means shown are the "
                     f"raw-window means"
                 )
-        # Outside the has_masking gate on purpose: Ozone has no masking
-        # settings at all, and this is the one thing removing data from its
-        # figure, so it is the only line that would explain the red trace.
+        # Outside the has_masking gate on purpose: Ozone/H2O have no masking
+        # settings at all, and this is the one thing removing data from their
+        # figure, so it is the only line that would explain the red trace (or,
+        # with a colour chosen, the coloured points in place of it).
         if show_filtered:
             floor = GASES[self.current_gas]["valid_min"]
             n_below = int(rejected.sum())
             notes.append(
-                f"red = filtered, blue = raw; {n_below} reading"
+                (f"colour = {z_label} on the filtered points, " if filtered_color
+                 else "red = filtered, ")
+                + f"blue = raw; {n_below} reading"
                 f"{'' if n_below == 1 else 's'} below {floor:g} {unit} "
                 f"removed (sensor fault, not a measurement)"
             )
@@ -5334,9 +5621,15 @@ class UcatsbGui(QMainWindow):
         # bbox, so a legend wider than the panel demands room the panel cannot
         # give -- which on a narrow window ends in "axes sizes collapsed to
         # zero" rather than in a legend that merely looks cramped.
-        ax.legend(handles, labels, loc="best", fontsize=9, framealpha=0.9,
-                  bbox_to_anchor=anchor,
-                  bbox_transform=ax.transAxes).set_in_layout(False)
+        legend = ax.legend(handles, labels, loc="best", fontsize=9,
+                           framealpha=0.9, bbox_to_anchor=anchor,
+                           bbox_transform=ax.transAxes)
+        legend.set_in_layout(False)
+        # A legend copies the artist's marker size, and the coloured overlay's
+        # is deliberately ~1.6 pt -- legible as a trace over a whole flight,
+        # invisible as a single key entry. Enlarged in the key only.
+        if colored_line is not None:
+            legend.legend_handles[handles.index(colored_line)].set_sizes([25])
 
         ax_aux2 = None
         if ax_aux is not None:
@@ -5414,6 +5707,16 @@ class UcatsbGui(QMainWindow):
             if len(aux_handles) > 1:
                 ax_aux.legend(aux_handles, aux_labels, loc="upper right",
                               fontsize=8, framealpha=0.9).set_in_layout(False)
+
+        # After the aux panel is built, and given BOTH axes: the colorbar takes
+        # its width out of whatever it is attached to, so hanging it off the
+        # main Axes alone would leave the two panels misaligned by that width
+        # -- with a shared time axis, the same instant sitting at two different
+        # x positions.
+        if colored_line is not None:
+            self._add_colorbar(self.figure, colored_line,
+                               [a for a in (ax_aux, ax) if a is not None],
+                               z_label, z_is_time)
 
         # The new Axes were just built and auto-scaled to the full data
         # range -- reset the toolbar's view stack so Home returns to *this*
@@ -5602,6 +5905,55 @@ class UcatsbGui(QMainWindow):
         self._cal_ax = axes
         self._last_cal_key = cal_key
         self.cal_pane.canvas.draw()
+
+    def _z_values(self, key):
+        """The z variable named by `key`, as (values, colorbar label, is_time).
+
+        Shared by both figures that color points by a third variable -- the
+        Correlations scatter and the Timeseries "Color by" overlay -- so a
+        given key cannot come to mean one thing on one plot and something else
+        on the other, which is exactly what reading the two together requires.
+
+        `(None, None, False)` for no coloring, or for a key whose column this
+        file lacks. Otherwise the caller must intersect its own `keep` with
+        `values.notna()`: a point with no z has no color, and matplotlib would
+        draw it in the colormap's "bad" color (transparent) -- still in the
+        fit, still in the statistics, but invisible on the plot.
+        """
+        if key not in COLOR_BY_OPTIONS:
+            return None, None, False
+        _, z_col, z_label = COLOR_BY_OPTIONS[key]
+        if z_col is None:
+            # Dates are not numbers; convert once, and hand `is_time` back so
+            # the colorbar ticks can be formatted as clock time again.
+            return (pd.Series(mdates.date2num(self.df["datetime"]),
+                              index=self.df.index), z_label, True)
+        if z_col not in self.df.columns:
+            return None, None, False
+        values = pd.to_numeric(self.df[z_col], errors="coerce")
+        if key == "ozone":
+            # The floor faults and hand-flagged spikes are not ozone
+            # measurements, and one -2292 ppb reading would take the whole
+            # color scale with it.
+            values = values.mask(self._removed_mask("Ozone"))
+        return values, z_label, False
+
+    def _add_colorbar(self, fig, points, axes, z_label, is_time):
+        """The colorbar for a z-colored scatter, styled the same on both
+        figures.
+
+        `axes` is a list because the timeseries can be showing an aux panel
+        that shares its x axis: stealing the width from the main Axes alone
+        would leave the two panels a colorbar's width out of alignment, with
+        the shared time axis reading differently in each.
+        """
+        bar = fig.colorbar(points, ax=axes, pad=0.02)
+        bar.set_label(z_label, color=TEXT_COLOR, fontsize=9)
+        bar.ax.tick_params(colors=MUTED_COLOR, labelsize=8)
+        bar.outline.set_edgecolor(AXIS_COLOR)
+        if is_time:
+            bar.ax.yaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+        return bar
 
     def _corr_axis(self, gas_key):
         """What goes on one correlation axis, as
@@ -5821,20 +6173,9 @@ class UcatsbGui(QMainWindow):
         # has no color, and matplotlib would draw it in the colormap's "bad"
         # color (transparent) -- present in the fit but invisible on the
         # plot. Dropped instead, and counted in the note.
-        z_vals, z_label = None, None
-        if self.corr_color_by in CORR_COLOR_BY:
-            _, z_col, z_label = CORR_COLOR_BY[self.corr_color_by]
-            if z_col is None:
-                # Dates are not numbers; convert once, and format the colorbar
-                # ticks back to clock time below.
-                z_vals = pd.Series(mdates.date2num(self.df["datetime"]),
-                                   index=self.df.index)
-            elif z_col in self.df.columns:
-                z_vals = pd.to_numeric(self.df[z_col], errors="coerce")
-                if self.corr_color_by == "ozone":
-                    z_vals = z_vals.mask(self._removed_mask("Ozone"))
-            if z_vals is not None:
-                keep &= z_vals.notna()
+        z_vals, z_label, z_is_time = self._z_values(self.corr_color_by)
+        if z_vals is not None:
+            keep &= z_vals.notna()
 
         x, y = x_vals[keep], y_vals[keep]
 
@@ -5860,14 +6201,9 @@ class UcatsbGui(QMainWindow):
             # blend with the white surface and with each other, which is the
             # one thing this encoding cannot afford.
             points = ax.scatter(x, y, s=self.corr_marker_size ** 2,
-                                c=z_vals[keep], cmap=CORR_COLORMAP,
+                                c=z_vals[keep], cmap=Z_COLORMAP,
                                 alpha=0.85, edgecolors="none", zorder=2)
-            bar = fig.colorbar(points, ax=ax, pad=0.02)
-            bar.set_label(z_label, color=TEXT_COLOR, fontsize=9)
-            bar.ax.tick_params(colors=MUTED_COLOR, labelsize=8)
-            bar.outline.set_edgecolor(AXIS_COLOR)
-            if CORR_COLOR_BY[self.corr_color_by][1] is None:
-                bar.ax.yaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+            self._add_colorbar(fig, points, [ax], z_label, z_is_time)
 
         # Manually flagged points, struck out where they would have plotted.
         # They are NaN in x_vals/y_vals -- flagging is what blanked them -- so
@@ -5928,7 +6264,7 @@ class UcatsbGui(QMainWindow):
                 extrapolated |= result["extrapolated"]
         extrapolated = extrapolated[keep]
         notes = [f"n = {len(x)} of {len(self.df)} rows (usable data in both tracers"
-                 + (f", and in {CORR_COLOR_BY[self.corr_color_by][0].lower()})"
+                 + (f", and in {COLOR_BY_OPTIONS[self.corr_color_by][0].lower()})"
                     if z_vals is not None else ")")]
         # Said plainly, because the axis label alone is easy to skim past and
         # the consequence -- no gain correction on that axis, so the slope
